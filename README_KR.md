@@ -92,6 +92,9 @@ mo history
 mo history --json
 
 mo clean --dry-run --debug   # 안전 미리보기 + 상세 진단 로그
+mo clean --dry-run --json    # 항목 id가 있는 JSON 계획으로 미리보기
+mo clean --apply <plan_id> --select kept.txt  # 남긴 항목 id만 정리
+mo clean --trash             # 정리한 파일을 휴지통으로 이동
 mo optimize --whitelist      # 보호할 최적화 규칙 관리
 mo clean --whitelist         # 보호할 캐시 화이트리스트 관리
 mo purge --paths             # 프로젝트 검사 디렉터리 구성
@@ -345,6 +348,7 @@ Proxy   HTTP · 192.168.1.100             Chrome     ▮▮▮▯▯  28.3%
 - `mo status | jq '.health_score'`: 출력이 파이프로 연결되면 자동으로 JSON 모드로 전환됩니다
 - `mo status --watch --interval 2s`: NDJSON(줄바꿈 구분 JSON) 형식으로 실시간 스트리밍합니다
 - `mo history --json`: 정리 작업 이력을 JSON으로 출력합니다. 각 세션에는 `run_id`(불투명한 문자열이며 식별 정보가 기록되지 않았으면 빈 값)와 `attribution`이 들어 있으며, 식별된 실행은 `run`, 예전 명령 단위 묶음은 `command`, 예전 마커로 중단과 겹친 실행을 구분할 수 없으면 `ambiguous`입니다. 기록된 작업은 계속 확인할 수 있지만 `ambiguous` 개수는 개별 실행에 정확히 나눌 수 없습니다. `ended_at`이 비어 있으면 종료 마커가 기록되지 않은 것입니다.
+- `mo clean --dry-run --json`: 정리 미리보기를 `plan_id`, `created_at`, `expires_at`(1시간 뒤), `free_bytes`, `total_bytes`, `total_items`, `sections`(`id`, `name`, `bytes`, `items`), `skipped`(`section`, `name`, `reason`) 필드가 있는 JSON 계획으로 출력합니다. 각 항목에는 `id`, `kind` (`path` + `path`, `command` + `name`, `command`), `bytes`, `size_known`, `count`, `covered_by`, `default_selected`가 있으며, `covered_by`는 그 크기를 이미 센 상위 항목의 id입니다. 이어서 `mo clean --apply <plan_id> --select <file>`은 파일에 한 줄씩 적힌 항목 id만 정리하고 미리보기 이후 바뀐 항목은 건너뜁니다. `--trash`를 붙이면 휴지통으로 옮깁니다. `--trash`를 쓰면 영구 삭제만 가능한 단계(`npm cache clean` 같은 도구 자체 명령, Time Machine·시뮬레이터 삭제, root 소유 항목)는 실행하지 않고 요약에 표시합니다. 미리보기가 중간에 멈추거나 취소되면 대신 `{"schema": 1, "command": "clean", "error": {"code": …, "message": …}}`를 출력하고(`code`는 `cancelled`, `incomplete`, `plan_not_saved` 중 하나) 0이 아닌 코드로 종료합니다
 - `mo uninstall --list`: 설치된 앱을 `name`, `bundle_id`, `source`, `uninstall_name`, `path`, `size` 필드가 있는 JSON으로 출력합니다
 
 ```text

@@ -92,6 +92,9 @@ mo history
 mo history --json
 
 mo clean --dry-run --debug   # Preview + detailed logs
+mo clean --dry-run --json    # Preview as a JSON plan with item ids
+mo clean --apply <plan_id> --select kept.txt  # Clean only the kept item ids
+mo clean --trash             # Move cleaned files to the Trash
 mo optimize --whitelist      # Manage protected optimization rules
 mo clean --whitelist         # Manage protected caches
 mo purge --paths             # Configure project scan directories
@@ -345,6 +348,7 @@ The health score combines CPU, memory, disk capacity, SMART status, I/O, thermal
 - `mo status | jq '.health_score'` switches to JSON automatically when output is piped
 - `mo status --watch --interval 2s` streams newline-delimited JSON from a warm collector
 - `mo history --json` returns cleanup activity as JSON. Sessions include `run_id` (an opaque string, empty when no identity was logged) and `attribution`: `run` for identified runs, `command` for legacy command-based grouping, or `ambiguous` when legacy markers cannot distinguish interruption from overlapping runs. Recorded actions remain available; ambiguous counts cannot be assigned reliably to individual runs. An empty `ended_at` means no end marker was recorded
+- `mo clean --dry-run --json` returns the cleanup preview as a JSON plan with `plan_id`, `created_at`, `expires_at` (one hour later), `free_bytes`, `total_bytes`, `total_items`, `sections` (`id`, `name`, `bytes`, `items`) and `skipped` (`section`, `name`, `reason`). Each item has `id`, `kind` (`path` + `path`, `command` + `name`, `command`), `bytes`, `size_known`, `count`, `covered_by`, `default_selected`; `covered_by` is the id of a listed folder whose size already counts it. `mo clean --apply <plan_id> --select <file>` then cleans only the item ids the file lists, one per line, and skips anything that changed since the preview; add `--trash` to move files to the Trash instead; under `--trash`, steps that can only delete permanently (owner commands such as `npm cache clean`, Time Machine and simulator deletes, root-owned items) are kept and listed in the summary. A preview that stops or is cancelled prints `{"schema": 1, "command": "clean", "error": {"code": …, "message": …}}` instead, with `code` `cancelled`, `incomplete` or `plan_not_saved`, and exits non-zero
 - `mo uninstall --list` returns installed apps as JSON with `name`, `bundle_id`, `source`, `uninstall_name`, `path` and `size`
 
 ```text

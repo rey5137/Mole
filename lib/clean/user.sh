@@ -2599,8 +2599,10 @@ clean_tart_caches() {
         fi
         echo -e "    ${GRAY}tart prune --entries caches --older-than ${MOLE_ORPHAN_AGE_DAYS}${NC}"
         note_activity
+        mole_plan_record_command "Tart caches" "tart prune --entries caches --older-than ${MOLE_ORPHAN_AGE_DAYS}"
         return 0
     fi
+    mole_clean_command_allowed "Tart caches" || return 0
 
     if [[ -t 1 ]]; then
         start_section_spinner "Pruning Tart caches..."

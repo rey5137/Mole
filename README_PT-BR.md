@@ -92,6 +92,9 @@ mo history
 mo history --json
 
 mo clean --dry-run --debug   # Pré-visualização + logs detalhados
+mo clean --dry-run --json    # Pré-visualização como plano JSON com ids
+mo clean --apply <plan_id> --select kept.txt  # Limpar só os ids mantidos
+mo clean --trash             # Mover os arquivos limpos para o Lixo
 mo optimize --whitelist      # Gerencia regras de otimização protegidas
 mo clean --whitelist         # Gerencia caches protegidos
 mo purge --paths             # Configura as pastas de busca de projetos
@@ -345,6 +348,7 @@ A nota de saúde combina CPU, memória, capacidade do disco, status SMART, E/S, 
 - `mo status | jq '.health_score'` muda para JSON automaticamente quando a saída é redirecionada por pipe
 - `mo status --watch --interval 2s` transmite JSON delimitado por linha a partir de um coletor já aquecido
 - `mo history --json` retorna a atividade de limpeza em JSON. As sessões incluem `run_id` (uma string opaca, vazia quando nenhuma identidade foi registrada) e `attribution`: `run` para execuções identificadas, `command` para o agrupamento legado por comando, ou `ambiguous` quando os marcadores legados não conseguem distinguir uma interrupção de execuções sobrepostas. As ações registradas continuam disponíveis; contagens ambíguas não podem ser atribuídas com confiança a execuções individuais. Um `ended_at` vazio significa que nenhum marcador de fim foi registrado
+- `mo clean --dry-run --json` retorna a pré-visualização da limpeza como um plano JSON com `plan_id`, `created_at`, `expires_at` (uma hora depois), `free_bytes`, `total_bytes`, `total_items`, `sections` (`id`, `name`, `bytes`, `items`) e `skipped` (`section`, `name`, `reason`). Cada item tem `id`, `kind` (`path` + `path`, `command` + `name`, `command`), `bytes`, `size_known`, `count`, `covered_by`, `default_selected`; `covered_by` é o id de uma pasta listada que já conta o seu tamanho. Depois, `mo clean --apply <plan_id> --select <file>` limpa só os ids listados no arquivo, um por linha, e pula o que mudou desde a pré-visualização; com `--trash` os arquivos vão para o Lixo; com `--trash`, etapas que só podem excluir permanentemente (comandos próprios das ferramentas, como `npm cache clean`, exclusões do Time Machine e de simuladores, itens do root) são mantidas e listadas no resumo. Uma prévia interrompida ou cancelada imprime `{"schema": 1, "command": "clean", "error": {"code": …, "message": …}}` no lugar (`code` é `cancelled`, `incomplete` ou `plan_not_saved`) e sai com código diferente de zero
 - `mo uninstall --list` retorna os apps instalados em JSON com `name`, `bundle_id`, `source`, `uninstall_name`, `path` e `size`
 
 ```text

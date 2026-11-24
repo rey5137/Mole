@@ -82,6 +82,11 @@ clean_tool_cache() {
     fi
 
     if [[ "$DRY_RUN" != "true" ]]; then
+        # A reviewed `--apply` runs an owner command only when its item was
+        # kept, and `--trash` never runs one: it deletes permanently.
+        if [[ "${1:-}" != ":" ]] && ! mole_clean_command_allowed "$description"; then
+            return 0
+        fi
         local command_rc=0
         if [[ -t 1 ]]; then
             start_section_spinner "Cleaning $description..."
@@ -152,6 +157,13 @@ clean_tool_cache() {
     else
         echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} $description · would clean"
         note_activity
+        if [[ "${1:-}" != ":" ]]; then
+            local -a shown_command=("$@")
+            if [[ "${shown_command[0]}" == "run_with_timeout" && ${#shown_command[@]} -gt 2 ]]; then
+                shown_command=("${shown_command[@]:2}")
+            fi
+            mole_plan_record_command "$description" "${shown_command[*]}"
+        fi
     fi
     return 0
 }
@@ -1142,6 +1154,7 @@ clean_go_cache_root() {
     local command_status=0
     local size_before_kb="" size_rc=0 freed_kb=0
     if [[ "$DRY_RUN" != "true" ]]; then
+        mole_clean_command_allowed "$display_name" || return 0
         [[ -t 1 ]] && start_section_spinner "Cleaning $display_name..."
         # Same before/after measurement as clean_tool_cache.
         size_before_kb=$(_owner_cache_size_kb "$cache_root") || size_rc=$?
@@ -1179,6 +1192,7 @@ clean_go_cache_root() {
     if [[ $command_status -eq 0 ]]; then
         if [[ "$DRY_RUN" == "true" ]]; then
             echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} $display_name · would clean"
+            mole_plan_record_command "$display_name" "go clean $clean_flag"
         elif ((freed_kb > 0)); then
             echo -e "  ${GREEN}${ICON_SUCCESS}${NC} $display_name · $(colorize_human_size "$(bytes_to_human_kb "$freed_kb")")"
             mole_add_cleaned_row 0 "$freed_kb"
@@ -1625,12 +1639,15 @@ clean_docker_unused_data() {
     if [[ "${DRY_RUN:-false}" == "true" ]]; then
         if [[ "$steps" == "image" ]]; then
             echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} $description · would prune dangling images"
+            mole_plan_record_command "$description" "docker image prune -f"
         else
             echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} $description · would prune, build cache unused for 7 days"
+            mole_plan_record_command "$description" "docker builder prune -f --filter until=168h; docker image prune -f"
         fi
         note_activity
         return 0
     fi
+    mole_clean_command_allowed "$description" || return 0
 
     [[ -t 1 ]] && start_section_spinner "Pruning Docker build cache..."
     local total_bytes=0 step output rc bytes
@@ -3154,9 +3171,33 @@ clean_dev_mobile() {
                         debug_log "Xcode unavailable simulators already clean"
                     fi
                 else
+                    # `simctl delete unavailable` removes every unavailable
+                    # device at once, so a reviewed `--apply` runs it only when
+                    # each device folder it would remove is a kept plan item.
+                    local simctl_reviewed=true
+                    if [[ -n "${MOLE_APPLY_PLAN:-}" ]]; then
+                        [[ ${#unavailable_udids[@]} -eq $unavailable_before ]] || simctl_reviewed=false
+                        local reviewed_udid
+                        local reviewed_rc
+                        for reviewed_udid in "${unavailable_udids[@]}"; do
+                            [[ "$simctl_reviewed" == "true" ]] || break
+                            reviewed_rc=0
+                            mole_apply_plan_allows "$HOME/Library/Developer/CoreSimulator/Devices/$reviewed_udid" ||
+                                reviewed_rc=$?
+                            if mole_rc_signal "$reviewed_rc"; then
+                                _mole_record_clean_cancellation "$reviewed_rc" "Xcode unavailable simulators"
+                                return "$reviewed_rc"
+                            fi
+                            [[ $reviewed_rc -eq 0 ]] || simctl_reviewed=false
+                        done
+                    fi
                     # Skip if no unavailable simulators
                     if ((unavailable_before == 0)); then
                         debug_log "Xcode unavailable simulators already clean"
+                    elif [[ "$simctl_reviewed" != "true" ]]; then
+                        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "simctl delete unavailable" "not in reviewed plan"
+                    elif mole_clean_trash_skips "simctl delete unavailable"; then
+                        :
                     else
                         start_section_spinner "Checking unavailable simulators..."
 
@@ -4324,13 +4365,30 @@ clean_dev_automation_browsers() {
     if [[ ${#leaked_processes[@]} -gt 0 ]]; then
         if [[ "$DRY_RUN" == "true" ]]; then
             echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Leaked automation browsers · would stop ${#leaked_processes[@]} processes ${YELLOW}dry${NC}"
-        else
+            # The item lists each process as pid|start time, so a reviewed
+            # apply stops only these, never one that leaked after the review.
+            local listed_processes="" listed_record
+            for listed_record in "${leaked_processes[@]}"; do
+                listed_processes+="${listed_processes:+; }$listed_record"
+            done
+            mole_plan_record_command "Leaked automation browsers" "kill -TERM $listed_processes"
+            note_activity
+        elif mole_apply_command_allowed "Leaked automation browsers"; then
+            local reviewed_processes=""
+            if [[ -n "${MOLE_APPLY_PLAN:-}" ]]; then
+                reviewed_processes=$(mole_apply_command_text "Leaked automation browsers") || reviewed_processes=""
+                reviewed_processes="; ${reviewed_processes#kill -TERM }; "
+            fi
             local stopped=0
             local -a term_processes=()
             local pid expected_start match_rc
             for process_record in "${leaked_processes[@]}"; do
                 pid="${process_record%%|*}"
                 expected_start="${process_record#*|}"
+                if [[ -n "$reviewed_processes" && "$reviewed_processes" != *"; $process_record; "* ]]; then
+                    log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "automation browser $pid" "not in reviewed plan"
+                    continue
+                fi
                 match_rc=0
                 _automation_browser_process_matches_record \
                     "$pid" "$expected_start" || match_rc=$?
@@ -4362,8 +4420,8 @@ clean_dev_automation_browsers() {
                 done
             fi
             echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Leaked automation browsers · stopped ${stopped} processes"
+            note_activity
         fi
-        note_activity
     fi
 
     if [[ ${#stale_profiles[@]} -gt 0 ]]; then

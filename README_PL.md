@@ -92,6 +92,9 @@ mo history
 mo history --json
 
 mo clean --dry-run --debug   # Podgląd + szczegółowe logi
+mo clean --dry-run --json    # Podgląd jako plan JSON z identyfikatorami
+mo clean --apply <plan_id> --select kept.txt  # Wyczyść tylko zachowane identyfikatory
+mo clean --trash             # Przenieś czyszczone pliki do Kosza
 mo optimize --whitelist      # Zarządzanie chronionymi regułami optymalizacji
 mo clean --whitelist         # Zarządzanie chronionymi pamięciami podręcznymi
 mo purge --paths             # Konfiguracja katalogów skanowania projektów
@@ -345,6 +348,7 @@ Wskaźnik zdrowia łączy CPU, pamięć, zajętość dysku, status SMART, operac
 - `mo status | jq '.health_score'` automatycznie przełącza się na JSON, gdy wyjście jest przekazywane potokiem
 - `mo status --watch --interval 2s` strumieniuje JSON rozdzielany znakami nowej linii z działającego w tle kolektora
 - `mo history --json` zwraca aktywność czyszczenia w formacie JSON. Sesje zawierają `run_id` (nieprzezroczysty ciąg znaków, pusty, gdy nie zapisano identyfikatora) oraz `attribution`: `run` dla zidentyfikowanych uruchomień, `command` dla starszego grupowania według poleceń lub `ambiguous`, gdy starsze znaczniki nie pozwalają odróżnić przerwania od nakładających się uruchomień. Zapisane akcje pozostają dostępne; niejednoznacznych liczników nie da się wiarygodnie przypisać do poszczególnych uruchomień. Puste `ended_at` oznacza, że nie zapisano znacznika zakończenia
+- `mo clean --dry-run --json` zwraca podgląd czyszczenia jako plan JSON z polami `plan_id`, `created_at`, `expires_at` (godzinę później), `free_bytes`, `total_bytes`, `total_items`, `sections` (`id`, `name`, `bytes`, `items`) i `skipped` (`section`, `name`, `reason`). Każdy element ma `id`, `kind` (`path` + `path`, `command` + `name`, `command`), `bytes`, `size_known`, `count`, `covered_by`, `default_selected`; `covered_by` to identyfikator wymienionego folderu, który już liczy jego rozmiar. `mo clean --apply <plan_id> --select <file>` czyści potem tylko identyfikatory wpisane w pliku, po jednym w wierszu, i pomija to, co zmieniło się od podglądu; z `--trash` pliki trafiają do Kosza; z `--trash` kroki, które mogą usuwać tylko trwale (własne polecenia narzędzi, np. `npm cache clean`, usuwanie kopii Time Machine i symulatorów, elementy należące do roota), są pomijane i wymieniane w podsumowaniu. Podgląd przerwany lub anulowany wypisuje zamiast tego `{"schema": 1, "command": "clean", "error": {"code": …, "message": …}}` (`code`: `cancelled`, `incomplete` lub `plan_not_saved`) i kończy się niezerowym kodem
 - `mo uninstall --list` zwraca zainstalowane aplikacje w formacie JSON z polami `name`, `bundle_id`, `source`, `uninstall_name`, `path` i `size`
 
 ```text

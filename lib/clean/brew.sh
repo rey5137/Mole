@@ -328,13 +328,18 @@ clean_homebrew() {
                 run_brew_cleanup_preview "$cleanup_timeout" "$dry_run_cleanup_file" || dry_run_cleanup_exit=$?
                 if [[ -t 1 ]]; then stop_inline_spinner; fi
                 if [[ $dry_run_cleanup_exit -eq 0 ]]; then
-                    show_brew_cleanup_preview "$dry_run_cleanup_file" && note_activity
+                    if show_brew_cleanup_preview "$dry_run_cleanup_file"; then
+                        note_activity
+                        mole_plan_record_command "Homebrew cleanup" "brew cleanup --prune=30"
+                    fi
                 elif mole_rc_timeout "$dry_run_cleanup_exit"; then
                     echo -e "  ${GRAY}${ICON_WARNING}${NC} Homebrew cleanup preview timed out · run ${GRAY}brew cleanup --dry-run${NC} manually"
                     note_activity
+                    mole_plan_record_command "Homebrew cleanup" "brew cleanup --prune=30"
                 else
                     echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Homebrew · would cleanup"
                     note_activity
+                    mole_plan_record_command "Homebrew cleanup" "brew cleanup --prune=30"
                 fi
                 # Autoremove sits after the window check in the real run too.
                 local dry_run_autoremove_file
@@ -360,6 +365,7 @@ clean_homebrew() {
     fi
     # Skip if cleaned recently to avoid repeated heavy operations.
     brew_cleanup_ran_recently "$brew_cache_file" && return 0
+    mole_clean_command_allowed "Homebrew cleanup" || return 0
     # No size gate on ~/Library/Caches/Homebrew: most of what `brew cleanup`
     # frees is old formula versions in the Cellar, which that cache does not
     # hold. A cache someone already emptied (Mole's Mac app clears downloads)

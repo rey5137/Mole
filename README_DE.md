@@ -92,6 +92,9 @@ mo history
 mo history --json
 
 mo clean --dry-run --debug   # Vorschau + detaillierte Protokolle
+mo clean --dry-run --json    # Vorschau als JSON-Plan mit Element-IDs
+mo clean --apply <plan_id> --select kept.txt  # Nur die behaltenen Element-IDs bereinigen
+mo clean --trash             # Bereinigte Dateien in den Papierkorb legen
 mo optimize --whitelist      # Geschützte Optimierungsregeln verwalten
 mo clean --whitelist         # Geschützte Cache-Pfade verwalten
 mo purge --paths             # Projekt-Suchpfade konfigurieren
@@ -345,6 +348,7 @@ Der Zustandswert fasst CPU, RAM, Festplattenkapazität, SMART-Status, I/O, Tempe
 - `mo status | jq '.health_score'`: Schaltet bei Weiterleitung in Pipes automatisch auf JSON um
 - `mo status --watch --interval 2s`: Streamt NDJSON (durch Zeilenumbrüche getrenntes JSON)
 - `mo history --json`: Gibt die Bereinigungshistorie als JSON aus. Sitzungen enthalten `run_id` (ein undurchsichtiger String, leer, wenn keine Identität protokolliert wurde) und `attribution`: `run` für erkannte Läufe, `command` für die alte Gruppierung nach Befehl oder `ambiguous`, wenn alte Markierungen eine Unterbrechung nicht von überlappenden Läufen unterscheiden können. Aufgezeichnete Aktionen bleiben verfügbar; mehrdeutige Zählungen lassen sich einzelnen Läufen nicht zuverlässig zuordnen. Ein leeres `ended_at` bedeutet, dass keine Endmarkierung aufgezeichnet wurde.
+- `mo clean --dry-run --json`: Gibt die Bereinigungsvorschau als JSON-Plan mit `plan_id`, `created_at`, `expires_at` (eine Stunde später), `free_bytes`, `total_bytes`, `total_items`, `sections` (`id`, `name`, `bytes`, `items`) und `skipped` (`section`, `name`, `reason`) aus. Jedes Element hat `id`, `kind` (`path` + `path`, `command` + `name`, `command`), `bytes`, `size_known`, `count`, `covered_by`, `default_selected`; `covered_by` ist die ID eines aufgeführten Ordners, der seine Größe schon zählt. `mo clean --apply <plan_id> --select <file>` bereinigt danach nur die zeilenweise aufgeführten Element-IDs und überspringt, was sich seit der Vorschau geändert hat; mit `--trash` landen die Dateien im Papierkorb; mit `--trash` werden Schritte, die nur endgültig löschen können (Tool-eigene Befehle wie `npm cache clean`, Time-Machine- und Simulator-Löschungen, root-eigene Objekte), übersprungen und in der Zusammenfassung aufgeführt. Bleibt die Vorschau stehen oder wird sie abgebrochen, gibt sie stattdessen `{"schema": 1, "command": "clean", "error": {"code": …, "message": …}}` aus (`code`: `cancelled`, `incomplete` oder `plan_not_saved`) und endet mit einem Status ungleich null
 - `mo uninstall --list`: Gibt installierte Apps als JSON mit `name`, `bundle_id`, `source`, `uninstall_name`, `path` und `size` aus
 
 ```text

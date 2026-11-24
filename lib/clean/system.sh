@@ -1001,6 +1001,30 @@ time_machine_candidate_still_eligible() {
 }
 
 # Incomplete Time Machine backups.
+# Delete one in-progress Time Machine backup with tmutil. tmutil deletes
+# outside the file funnel, so this asks the reviewed plan itself and keeps the
+# backup under `--trash` (tmutil has no Trash form). Returns 0 when deleted,
+# MOLE_ERR_PROTECTED_PATH when kept (already logged), or tmutil's or the
+# budget's failure status (never MOLE_ERR_PROTECTED_PATH).
+_time_machine_delete_inprogress() {
+    local inprogress_file="$1"
+    local deadline="${2:-}"
+    local rc=0
+    _mole_apply_plan_gate "$inprogress_file" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        mole_rc_signal "$rc" && return "$rc"
+        return "$MOLE_ERR_PROTECTED_PATH"
+    fi
+    if mole_clean_trash_skips "$inprogress_file"; then
+        return "$MOLE_ERR_PROTECTED_PATH"
+    fi
+    local delete_timeout=""
+    delete_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_DISK_VERIFY_SEC" "$deadline") || return $?
+    run_with_timeout "$delete_timeout" tmutil delete "$inprogress_file" 2> /dev/null || rc=$?
+    [[ $rc -ne $MOLE_ERR_PROTECTED_PATH ]] || rc=1
+    return "$rc"
+}
+
 clean_time_machine_failed_backups() {
     local tm_cleaned=0
     if ! command -v tmutil > /dev/null 2>&1; then
@@ -1223,13 +1247,9 @@ clean_time_machine_failed_backups() {
                     debug_log "Keeping changed or active Time Machine candidate: $inprogress_file"
                     continue
                 fi
-                local tm_delete_timeout=""
                 local tm_delete_rc=0
-                tm_delete_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_DISK_VERIFY_SEC" \
-                    "$tm_scan_deadline") || tm_delete_rc=$?
-                if [[ $tm_delete_rc -eq 0 ]]; then
-                    run_with_timeout "$tm_delete_timeout" tmutil delete "$inprogress_file" 2> /dev/null || tm_delete_rc=$?
-                fi
+                _time_machine_delete_inprogress "$inprogress_file" "$tm_scan_deadline" || tm_delete_rc=$?
+                [[ $tm_delete_rc -ne $MOLE_ERR_PROTECTED_PATH ]] || continue
                 if [[ $tm_delete_rc -eq 0 ]]; then
                     local line_color
                     line_color=$(cleanup_result_color_kb "$size_kb")
@@ -1375,13 +1395,9 @@ clean_time_machine_failed_backups() {
                         debug_log "Keeping changed or active Time Machine candidate: $inprogress_file"
                         continue
                     fi
-                    local tm_delete_timeout=""
                     local tm_delete_rc=0
-                    tm_delete_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_DISK_VERIFY_SEC" \
-                        "$tm_scan_deadline") || tm_delete_rc=$?
-                    if [[ $tm_delete_rc -eq 0 ]]; then
-                        run_with_timeout "$tm_delete_timeout" tmutil delete "$inprogress_file" 2> /dev/null || tm_delete_rc=$?
-                    fi
+                    _time_machine_delete_inprogress "$inprogress_file" "$tm_scan_deadline" || tm_delete_rc=$?
+                    [[ $tm_delete_rc -ne $MOLE_ERR_PROTECTED_PATH ]] || continue
                     if [[ $tm_delete_rc -eq 0 ]]; then
                         local line_color
                         line_color=$(cleanup_result_color_kb "$size_kb")

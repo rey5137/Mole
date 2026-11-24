@@ -1059,8 +1059,9 @@ MOCK
 }
 
 @test "mo clean rejects removed cleanup selection flags" {
+    # --select returned as the selection file of --apply (tests/clean_plan.bats).
     local removed_flag
-    for removed_flag in "--select" "--categories" "--exclude"; do
+    for removed_flag in "--categories" "--exclude"; do
         run env HOME="$HOME" MOLE_TEST_MODE=1 "$PROJECT_ROOT/mole" clean "$removed_flag"
         [ "$status" -eq 1 ]
         [[ "$output" == *"was removed in this release"* ]] || return 1

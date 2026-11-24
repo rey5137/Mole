@@ -92,6 +92,9 @@ mo history
 mo history --json
 
 mo clean --dry-run --debug   # 安全預覽 + 詳細診斷日誌
+mo clean --dry-run --json    # 以 JSON 計畫預覽，每項帶 id
+mo clean --apply <plan_id> --select kept.txt  # 只清理保留的項目 id
+mo clean --trash             # 把清理的檔案移到垃圾桶
 mo optimize --whitelist      # 管理受保護的最佳化規則
 mo clean --whitelist         # 管理受保護的快取白名單
 mo purge --paths             # 設定程式碼專案掃描目錄
@@ -345,6 +348,7 @@ Proxy   HTTP · 192.168.1.100             Chrome     ▮▮▮▯▯  28.3%
 - `mo status | jq '.health_score'`：當輸出被管線重定向時自動切換為 JSON 模式
 - `mo status --watch --interval 2s`：持續串流輸出 NDJSON（換行分隔的 JSON）
 - `mo history --json`：以 JSON 格式輸出歷史清理日誌。每個工作階段帶有 `run_id`（不透明字串，沒有記錄身分時為空）和 `attribution`，能識別的執行是 `run`，舊版按指令分組的是 `command`，舊標記分不清中斷和重疊執行時是 `ambiguous`。記錄下來的操作仍然都能看到，但 `ambiguous` 的計數沒辦法可靠地分到單次執行上。`ended_at` 為空表示沒有記錄到結束標記
+- `mo clean --dry-run --json`：以 JSON 計畫輸出清理預覽，欄位為 `plan_id`、`created_at`、`expires_at`（一小時後過期）、`free_bytes`、`total_bytes`、`total_items`、`sections`（`id`、`name`、`bytes`、`items`）與 `skipped`（`section`、`name`、`reason`）。每個項目含 `id`, `kind` (`path` + `path`, `command` + `name`, `command`), `bytes`, `size_known`, `count`, `covered_by`, `default_selected`；`covered_by` 是已計入其大小的上層項目 id。之後 `mo clean --apply <plan_id> --select <file>` 只清理檔案中逐行列出的項目 id，預覽後有變動的項目會被略過；加 `--trash` 則移到垃圾桶；使用 `--trash` 時，只能永久刪除的步驟（如 `npm cache clean` 等工具自帶指令、Time Machine 與模擬器刪除、root 擁有的項目）會被保留並在摘要中列出。預覽中途停止或被取消時，改為輸出 `{"schema": 1, "command": "clean", "error": {"code": …, "message": …}}`，`code` 為 `cancelled`、`incomplete` 或 `plan_not_saved`，並以非零狀態結束
 - `mo uninstall --list`：以 JSON 輸出已安裝的 App，欄位為 `name`、`bundle_id`、`source`、`uninstall_name`、`path` 與 `size`
 
 ```text

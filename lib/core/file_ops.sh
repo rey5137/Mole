@@ -1542,6 +1542,279 @@ _mole_user_sink_refuses_on_ownership() {
     return 1
 }
 
+# Reviewed-plan enforcement for `mo clean --apply` (bin/clean.sh). While
+# MOLE_APPLY_PLAN names the approved-items file that run wrote (NUL records:
+# `P path dev:inode`, `C section name`, then `END`), every clean sink removes a
+# path only when it equals or lies under a kept plan path item whose root
+# still has the dev:inode the dry run recorded. The root's mtime is not
+# compared: caches change between review and apply, and a replacement shows as
+# a new inode. The variable can only narrow what a run deletes, so an
+# inherited value is honored; a missing, foreign or truncated file refuses
+# every path. Paths holding the two separator bytes are never kept.
+_MOLE_APPLY_PLAN_LOADED=""
+_MOLE_APPLY_PLAN_ROOTS=""
+_MOLE_APPLY_PLAN_DESELECTED=""
+_MOLE_APPLY_PLAN_COMMANDS=""
+_MOLE_APPLY_PLAN_REASON=""
+_MOLE_APPLY_PLAN_LOAD_ERROR="reviewed plan unavailable"
+_MOLE_APPLY_PLAN_MATCHED_ID=""
+_MOLE_APPLY_PLAN_MATCHED_SELF=false
+declare -a _MOLE_APPLY_PLAN_COMMAND_KEYS=()
+declare -a _MOLE_APPLY_PLAN_COMMAND_TEXTS=()
+readonly _MOLE_APPLY_PLAN_RS=$'\x1f'
+readonly _MOLE_APPLY_PLAN_FS=$'\x1e'
+
+# The approved-items file holds NUL-separated records of four fields, ended by
+# END: `P path devino ""` for a kept path, `D path "" ""` for an unticked one,
+# `C section name text` for a kept command step.
+_mole_apply_plan_load() {
+    local file="${MOLE_APPLY_PLAN:-}"
+    [[ -n "$file" ]] || return 1
+    [[ "$_MOLE_APPLY_PLAN_LOADED" == "$file" ]] && return 0
+    _MOLE_APPLY_PLAN_LOADED=""
+    _MOLE_APPLY_PLAN_LOAD_ERROR="reviewed plan unavailable"
+    _MOLE_APPLY_PLAN_ROOTS=""
+    _MOLE_APPLY_PLAN_DESELECTED=""
+    _MOLE_APPLY_PLAN_COMMANDS=""
+    _MOLE_APPLY_PLAN_COMMAND_KEYS=()
+    _MOLE_APPLY_PLAN_COMMAND_TEXTS=()
+    [[ -f "$file" && ! -L "$file" && -O "$file" && -r "$file" ]] || return 1
+
+    local rs="$_MOLE_APPLY_PLAN_RS" fs="$_MOLE_APPLY_PLAN_FS"
+    local kind first second third roots="" deselected="" commands="" complete=false
+    local -a command_keys=() command_texts=()
+    while IFS= read -r -d '' kind; do
+        if [[ "$kind" == "END" ]]; then
+            complete=true
+            break
+        fi
+        IFS= read -r -d '' first || return 1
+        IFS= read -r -d '' second || return 1
+        IFS= read -r -d '' third || return 1
+        if [[ "$first" == *"$rs"* || "$first" == *"$fs"* || "$second" == *"$rs"* || "$second" == *"$fs"* ]]; then
+            # A kept item that cannot be matched is simply never removed, but
+            # a dropped unticked path would let a kept ancestor take it.
+            if [[ "$kind" == "D" ]]; then
+                _MOLE_APPLY_PLAN_LOAD_ERROR="reviewed plan unavailable, an unticked path holds a separator byte"
+                return 1
+            fi
+            continue
+        fi
+        case "$kind" in
+            P) roots+="$rs$first$fs$second$rs" ;;
+            D) deselected+="$rs$first$rs" ;;
+            C)
+                commands+="$rs$first$fs$second$rs"
+                command_keys+=("$rs$first$fs$second$rs")
+                command_texts+=("$third")
+                ;;
+            *) return 1 ;;
+        esac
+    done < "$file"
+    [[ "$complete" == "true" ]] || return 1
+
+    _MOLE_APPLY_PLAN_ROOTS="$roots"
+    _MOLE_APPLY_PLAN_DESELECTED="$deselected"
+    _MOLE_APPLY_PLAN_COMMANDS="$commands"
+    if [[ ${#command_keys[@]} -gt 0 ]]; then
+        _MOLE_APPLY_PLAN_COMMAND_KEYS=("${command_keys[@]}")
+        _MOLE_APPLY_PLAN_COMMAND_TEXTS=("${command_texts[@]}")
+    fi
+    _MOLE_APPLY_PLAN_LOADED="$file"
+}
+
+# Returns 0 when no reviewed plan is active or the plan keeps this path.
+# Otherwise sets _MOLE_APPLY_PLAN_REASON and returns 1, or the signal status of
+# an interrupted identity probe. A probe timeout counts as changed. Walking up
+# from the path, the nearest kept or unticked item decides, and a kept path
+# that still holds an unticked item is refused: removing it would take that
+# item too. On success _MOLE_APPLY_PLAN_MATCHED_ID holds the planned dev:inode
+# of the kept item and _MOLE_APPLY_PLAN_MATCHED_SELF says whether the path is
+# that item itself.
+mole_apply_plan_allows() {
+    _MOLE_APPLY_PLAN_REASON=""
+    _MOLE_APPLY_PLAN_MATCHED_ID=""
+    _MOLE_APPLY_PLAN_MATCHED_SELF=false
+    [[ -n "${MOLE_APPLY_PLAN:-}" ]] || return 0
+    if ! _mole_apply_plan_load; then
+        _MOLE_APPLY_PLAN_REASON="$_MOLE_APPLY_PLAN_LOAD_ERROR"
+        return 1
+    fi
+
+    local rs="$_MOLE_APPLY_PLAN_RS" fs="$_MOLE_APPLY_PLAN_FS"
+    local _slash_single="/" _slash_double="//"
+    local target="$1"
+    while [[ "$target" == *"$_slash_double"* ]]; do
+        target="${target//$_slash_double/$_slash_single}"
+    done
+    while [[ ${#target} -gt 1 && "$target" == */ ]]; do
+        target="${target%/}"
+    done
+    if [[ "$target" == *"$rs"* || "$target" == *"$fs"* ]]; then
+        _MOLE_APPLY_PLAN_REASON="not in reviewed plan"
+        return 1
+    fi
+
+    local candidate="$target"
+    while [[ "$candidate" == /?* ]]; do
+        if [[ "$_MOLE_APPLY_PLAN_DESELECTED" == *"$rs$candidate$rs"* ]]; then
+            _MOLE_APPLY_PLAN_REASON="not in reviewed plan"
+            return 1
+        fi
+        if [[ "$_MOLE_APPLY_PLAN_ROOTS" == *"$rs$candidate$fs"* ]]; then
+            local planned_identity="${_MOLE_APPLY_PLAN_ROOTS#*"$rs$candidate$fs"}"
+            planned_identity="${planned_identity%%"$rs"*}"
+            local current_identity="" identity_rc=0
+            current_identity=$(mole_deletion_identity "$candidate") || identity_rc=$?
+            if mole_rc_signal "$identity_rc"; then
+                return "$identity_rc"
+            fi
+            if [[ $identity_rc -ne 0 || -z "$planned_identity" ||
+                "${current_identity%:*}" != "$planned_identity" ]]; then
+                _MOLE_APPLY_PLAN_REASON="changed since review"
+                return 1
+            fi
+            if [[ "$_MOLE_APPLY_PLAN_DESELECTED" == *"$rs$target/"* ]]; then
+                _MOLE_APPLY_PLAN_REASON="holds unticked item"
+                return 1
+            fi
+            _MOLE_APPLY_PLAN_MATCHED_ID="$planned_identity"
+            [[ "$candidate" != "$target" ]] || _MOLE_APPLY_PLAN_MATCHED_SELF=true
+            return 0
+        fi
+        candidate="${candidate%/*}"
+    done
+
+    _MOLE_APPLY_PLAN_REASON="not in reviewed plan"
+    return 1
+}
+
+# Sink form of mole_apply_plan_allows: logs the refusal as a SKIPPED row with
+# its fixed reason. Returns 0 to proceed, 1 for a refusal, or a signal status
+# that the caller hands back as cancellation.
+_mole_apply_plan_gate() {
+    local path="$1"
+    local plan_rc=0
+    mole_apply_plan_allows "$path" || plan_rc=$?
+    [[ $plan_rc -ne 0 ]] || return 0
+    if mole_rc_signal "$plan_rc"; then
+        _mole_record_clean_cancellation "$plan_rc"
+        return "$plan_rc"
+    fi
+    debug_log "Kept outside the reviewed plan (${_MOLE_APPLY_PLAN_REASON}): $path"
+    log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "$_MOLE_APPLY_PLAN_REASON"
+    return 1
+}
+
+# Dry run: list a cleanup step that is not a path (an owner command such as
+# `npm cache clean`) as a reviewable plan item. A no-op outside a full preview.
+mole_plan_record_command() {
+    local name="$1"
+    local command_text="${2:-}"
+    [[ "${MOLE_DRY_RUN:-0}" == "1" ]] || return 0
+    local ledger="${CLEAN_PREVIEW_COMMAND_LEDGER_FILE:-}"
+    [[ -n "$ledger" && -f "$ledger" && ! -L "$ledger" ]] || return 0
+    printf '%s\0%s\0%s\0' "${CURRENT_SECTION:-Uncategorized}" "$name" "$command_text" >> "$ledger"
+}
+
+# A reviewed `--apply` runs a non-path step only when its plan item was kept
+# (matched by section and name); a refusal is logged SKIPPED.
+mole_apply_command_allowed() {
+    [[ -n "${MOLE_APPLY_PLAN:-}" ]] || return 0
+    local name="$1"
+    local section="${CURRENT_SECTION:-Uncategorized}"
+    local rs="$_MOLE_APPLY_PLAN_RS" fs="$_MOLE_APPLY_PLAN_FS"
+    if _mole_apply_plan_load &&
+        [[ "$section$name" != *"$rs"* && "$section$name" != *"$fs"* &&
+            "$_MOLE_APPLY_PLAN_COMMANDS" == *"$rs$section$fs$name$rs"* ]]; then
+        return 0
+    fi
+    debug_log "Owner command kept out of the reviewed plan: $name"
+    log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$name" "not in reviewed plan"
+    return 1
+}
+
+# Print the command text the dry run recorded for a kept command item, so a
+# step can act only on what the review showed (the processes it listed).
+mole_apply_command_text() {
+    local name="$1"
+    local section="${CURRENT_SECTION:-Uncategorized}"
+    _mole_apply_plan_load || return 1
+    local key="$_MOLE_APPLY_PLAN_RS$section$_MOLE_APPLY_PLAN_FS$name$_MOLE_APPLY_PLAN_RS"
+    local idx
+    for ((idx = 0; idx < ${#_MOLE_APPLY_PLAN_COMMAND_KEYS[@]}; idx++)); do
+        if [[ "${_MOLE_APPLY_PLAN_COMMAND_KEYS[$idx]}" == "$key" ]]; then
+            printf '%s\n' "${_MOLE_APPLY_PLAN_COMMAND_TEXTS[$idx]}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# An owner command (npm cache clean, brew cleanup, go clean, docker prune)
+# runs only when the reviewed plan kept it and the run is not `--trash`: it
+# deletes permanently and has no Trash form.
+mole_clean_command_allowed() {
+    mole_apply_command_allowed "$1" || return 1
+    if mole_clean_trash_skips "$1"; then
+        return 1
+    fi
+    return 0
+}
+
+# `mo clean --trash` sends clean deletions to the user's Trash instead.
+_mole_clean_trash_active() {
+    [[ "${MOLE_CLEAN_TRASH:-0}" == "1" && "${MOLE_CURRENT_COMMAND:-}" == "clean" ]]
+}
+
+# Under `mo clean --trash`, a step that cannot move its target to the Trash
+# (an owner command, tmutil, simctl, a privileged sink) is kept instead: it is
+# logged SKIPPED and listed in the run summary. Returns 0 when it skips.
+mole_clean_trash_skips() {
+    _mole_clean_trash_active || return 1
+    local label="$1"
+    debug_log "Kept under --trash, needs a permanent delete: $label"
+    log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$label" "needs permanent delete"
+    MOLE_CLEAN_TRASH_SKIPPED="${MOLE_CLEAN_TRASH_SKIPPED:+$MOLE_CLEAN_TRASH_SKIPPED
+}$label"
+    return 0
+}
+
+# Trash leg of safe_remove under `mo clean --trash`, through mole_delete's
+# Trash routing. Never falls back to a permanent delete.
+_mole_clean_move_to_trash() {
+    local path="$1"
+    local size_human="$2"
+    shift 2
+    local trash_root="${HOME%/}/.Trash"
+    if [[ "$path" == "$trash_root" || "$path" == "$trash_root"/* ]]; then
+        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "already in Trash"
+        return 1
+    fi
+    local trash_rc=0
+    _mole_move_to_trash "$path" false "$@" || trash_rc=$?
+    if [[ $trash_rc -eq 0 ]]; then
+        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "TRASHED" "$path" "$size_human"
+        return 0
+    fi
+    if mole_rc_signal "$trash_rc"; then
+        _mole_record_clean_cancellation "$trash_rc"
+        return "$trash_rc"
+    fi
+    if mole_rc_timeout "$trash_rc"; then
+        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "FAILED" "$path" "move to Trash timed out"
+        MOLE_CLEAN_REMOVAL_TIMEOUTS=$((${MOLE_CLEAN_REMOVAL_TIMEOUTS:-0} + 1))
+        _mole_record_removal_timeout_path "$path"
+        return 124
+    fi
+    if [[ $trash_rc -eq $MOLE_ERR_PRIVACY_DENIED ]]; then
+        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "privacy permission denied"
+    else
+        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "trash-failed"
+    fi
+    return 1
+}
+
 safe_remove() {
     local path="$1"
     local silent="${2:-false}"
@@ -1611,6 +1884,10 @@ safe_remove() {
     if [[ ! -e "$path" ]]; then
         return 0
     fi
+
+    local plan_rc=0
+    _mole_apply_plan_gate "$path" || plan_rc=$?
+    [[ $plan_rc -eq 0 ]] || return "$plan_rc"
 
     # Before the dry-run return, so a preview never lists what the run refuses.
     if _mole_user_sink_refuses_on_ownership "$path"; then
@@ -1881,10 +2158,34 @@ safe_remove() {
             "$deadline_seconds") || rm_exit=$?
         [[ $rm_exit -eq 0 ]] || section_deadline_spent=1
     fi
+    if [[ $rm_exit -eq 0 && -n "${MOLE_APPLY_PLAN:-}" ]]; then
+        # The plan check at entry ran before sizing and the final guards. Ask
+        # again here, and bind a kept root to its planned inode so the rebind
+        # below refuses a replacement made after this check.
+        local final_plan_rc=0
+        _mole_apply_plan_gate "$path" || final_plan_rc=$?
+        [[ $final_plan_rc -eq 0 ]] || return "$final_plan_rc"
+        if [[ -z "$expected_parent" && "$_MOLE_APPLY_PLAN_MATCHED_SELF" == "true" ]]; then
+            if ! _mole_snapshot_path_identity "$path" ||
+                [[ "$_MOLE_PATH_SNAPSHOT_TARGET_ID" != "$_MOLE_APPLY_PLAN_MATCHED_ID" ]]; then
+                log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "changed since review"
+                return 1
+            fi
+            expected_parent="$_MOLE_PATH_SNAPSHOT_PARENT"
+            expected_parent_id="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
+            expected_target_id="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
+        fi
+    fi
     if [[ $rm_exit -eq 0 ]]; then
         _mole_owned_path_still_valid "$path" \
             "$expected_file_sha256" "$expected_absent_path" \
             "$expected_parent" "$expected_parent_id" "$expected_target_id" || return $?
+        if _mole_clean_trash_active; then
+            _mole_clean_move_to_trash "$path" "$size_human" \
+                "$expected_parent" "$expected_parent_id" "$expected_target_id" \
+                "$expected_file_sha256" "$expected_absent_path"
+            return $?
+        fi
         # Use || so set -e does not abort before the failure is classified.
         if [[ "$shell_rm" == true ]]; then
             error_msg=$(rm -rf "$path" 2>&1) || rm_exit=$? # SAFE: safe_remove validated and rebound this exact target above
@@ -2112,6 +2413,15 @@ safe_sudo_remove() {
     if [[ -L "$path" ]]; then
         log_error "Refusing to sudo remove symlink: $path"
         return 1
+    fi
+
+    local plan_rc=0
+    _mole_apply_plan_gate "$path" || plan_rc=$?
+    [[ $plan_rc -lt 128 ]] || return "$plan_rc"
+    [[ $plan_rc -eq 0 ]] || return "$MOLE_ERR_PROTECTED_PATH"
+    # A root-owned item cannot go to the invoking user's Trash.
+    if mole_clean_trash_skips "$path"; then
+        return "$MOLE_ERR_PROTECTED_PATH"
     fi
 
     if declare -f is_path_whitelisted > /dev/null 2>&1 && is_path_whitelisted "$path"; then
@@ -2518,6 +2828,12 @@ mole_delete() {
         _mole_delete_log "$mode" "0" "rejected" "$path"
         log_operation "${MOLE_CURRENT_COMMAND:-uninstall}" "SKIPPED" "$path" "${_MOLE_VALIDATION_REASON:-protected}"
         return 1
+    fi
+    local plan_rc=0
+    _mole_apply_plan_gate "$path" || plan_rc=$?
+    if [[ $plan_rc -ne 0 ]]; then
+        _mole_delete_log "$mode" "0" "rejected" "$path"
+        return "$plan_rc"
     fi
 
     if [[ "$needs_sudo" == "true" ]] && _mole_privileged_path_has_mutable_ancestor "$path"; then
@@ -3959,6 +4275,13 @@ safe_sudo_find_delete() {
             break
         fi
         [[ $validation_rc -eq 0 ]] || continue
+        local plan_rc=0
+        _mole_apply_plan_gate "$match" || plan_rc=$?
+        if [[ $plan_rc -ge 128 ]]; then
+            delete_rc=$plan_rc
+            break
+        fi
+        [[ $plan_rc -eq 0 ]] || continue
         local real_size_kb=0 real_size_rc=0 real_size_raw="" real_size_timeout=""
         if _mole_privileged_path_has_mutable_ancestor "$match"; then
             # A privileged path-based delete cannot safely cross a directory
@@ -4002,6 +4325,10 @@ safe_sudo_find_delete() {
                 debug_log "Skipping sudo delete below mutable parent: $match"
                 [[ $delete_rc -eq 0 ]] && delete_rc=1
             fi
+            continue
+        fi
+        # A root-owned item cannot go to the invoking user's Trash.
+        if mole_clean_trash_skips "$match"; then
             continue
         fi
         if [[ "${MOLE_DRY_RUN:-0}" == "1" ]] && declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then

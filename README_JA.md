@@ -92,6 +92,9 @@ mo history
 mo history --json
 
 mo clean --dry-run --debug   # 安全プレビュー + 詳細ログ
+mo clean --dry-run --json    # 項目 id 付きの JSON プランでプレビュー
+mo clean --apply <plan_id> --select kept.txt  # 残した項目 id だけをクリーン
+mo clean --trash             # クリーンしたファイルをゴミ箱へ移動
 mo optimize --whitelist      # 保護する最適化ルールの管理
 mo clean --whitelist         # 保護するキャッシュホワイトリストの管理
 mo purge --paths             # プロジェクト検索ディレクトリの設定
@@ -345,6 +348,7 @@ Proxy   HTTP · 192.168.1.100             Chrome     ▮▮▮▯▯  28.3%
 - `mo status | jq '.health_score'`：パイプ接続時に自動でJSONモードへ切り替え
 - `mo status --watch --interval 2s`：NDJSON形式でリアルタイムストリーミング
 - `mo history --json`：クリーンアップ履歴をJSONで出力。各セッションには `run_id`（不透明な文字列で、識別情報が記録されていない場合は空）と `attribution` が含まれ、識別できた実行は `run`、旧来のコマンド単位のグループ化は `command`、旧形式のマーカーでは中断と実行の重なりを区別できない場合は `ambiguous` になります。記録されたアクションは引き続き参照できますが、`ambiguous` の件数を個々の実行に正しく割り当てることはできません。`ended_at` が空の場合は終了マーカーが記録されていません。
+- `mo clean --dry-run --json`：クリーンのプレビューを JSON プランとして出力します。フィールドは `plan_id`、`created_at`、`expires_at`（1 時間後）、`free_bytes`、`total_bytes`、`total_items`、`sections`（`id`、`name`、`bytes`、`items`）、`skipped`（`section`、`name`、`reason`）。各項目は `id`, `kind` (`path` + `path`, `command` + `name`, `command`), `bytes`, `size_known`, `count`, `covered_by`, `default_selected` を持ち、`covered_by` はそのサイズを既に数えている上位項目の id です。続く `mo clean --apply <plan_id> --select <file>` はファイルに 1 行ずつ書かれた項目 id だけをクリーンし、プレビュー後に変わったものはスキップします。`--trash` を付けるとゴミ箱へ移動します。`--trash` 指定時、完全削除しかできない手順（`npm cache clean` などのツール付属コマンド、Time Machine とシミュレータの削除、root 所有の項目）は実行せず、サマリーに一覧表示します。プレビューが途中で止まるかキャンセルされた場合は代わりに `{"schema": 1, "command": "clean", "error": {"code": …, "message": …}}` を出力し（`code` は `cancelled`、`incomplete`、`plan_not_saved` のいずれか）、0 以外で終了します
 - `mo uninstall --list`：インストール済みアプリを `name`、`bundle_id`、`source`、`uninstall_name`、`path`、`size` を含むJSONで出力
 
 ```text

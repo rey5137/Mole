@@ -92,6 +92,9 @@ mo history
 mo history --json
 
 mo clean --dry-run --debug   # Aperçu + journaux détaillés
+mo clean --dry-run --json    # Aperçu en plan JSON avec identifiants
+mo clean --apply <plan_id> --select kept.txt  # Nettoyer seulement les identifiants gardés
+mo clean --trash             # Mettre les fichiers nettoyés à la Corbeille
 mo optimize --whitelist      # Gérer les règles d'optimisation protégées
 mo clean --whitelist         # Gérer la liste blanche des caches protégés
 mo purge --paths             # Configurer les dossiers de scan de projets
@@ -345,6 +348,7 @@ Le score de santé combine le CPU, la mémoire, l'espace disque, l'état SMART, 
 - `mo status | jq '.health_score'` : passe automatiquement en mode JSON lorsqu'il est utilisé dans un pipeline
 - `mo status --watch --interval 2s` : transmet un flux NDJSON (JSON délimité par des retours à la ligne)
 - `mo history --json` : affiche l'historique des nettoyages au format JSON. Les sessions incluent `run_id` (une chaîne opaque, vide si aucune identité n'a été enregistrée) et `attribution` : `run` pour les exécutions identifiées, `command` pour l'ancien regroupement par commande, ou `ambiguous` quand les anciens marqueurs ne permettent pas de distinguer une interruption d'exécutions qui se chevauchent. Les actions enregistrées restent disponibles ; les décomptes ambigus ne peuvent pas être attribués de façon fiable à une exécution précise. Un `ended_at` vide signifie qu'aucun marqueur de fin n'a été enregistré.
+- `mo clean --dry-run --json` : renvoie l'aperçu du nettoyage sous forme de plan JSON avec `plan_id`, `created_at`, `expires_at` (une heure plus tard), `free_bytes`, `total_bytes`, `total_items`, `sections` (`id`, `name`, `bytes`, `items`) et `skipped` (`section`, `name`, `reason`). Chaque élément a `id`, `kind` (`path` + `path`, `command` + `name`, `command`), `bytes`, `size_known`, `count`, `covered_by`, `default_selected` ; `covered_by` est l'identifiant d'un dossier listé qui compte déjà sa taille. `mo clean --apply <plan_id> --select <file>` nettoie ensuite seulement les identifiants listés dans le fichier, un par ligne, et ignore ce qui a changé depuis l'aperçu ; ajoutez `--trash` pour mettre les fichiers à la Corbeille; avec `--trash`, les étapes qui ne peuvent que supprimer définitivement (commandes propres aux outils comme `npm cache clean`, suppressions Time Machine et simulateurs, éléments appartenant à root) sont conservées et listées dans le résumé. Un aperçu interrompu ou annulé affiche à la place `{"schema": 1, "command": "clean", "error": {"code": …, "message": …}}` (`code` vaut `cancelled`, `incomplete` ou `plan_not_saved`) et se termine avec un code non nul
 - `mo uninstall --list` : renvoie les apps installées au format JSON avec `name`, `bundle_id`, `source`, `uninstall_name`, `path` et `size`
 
 ```text

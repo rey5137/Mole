@@ -2526,6 +2526,16 @@ _remove_verified_container_stub() {
     # the exact containermanagerd metadata plist, i.e. a stub with no Data/ dir
     # and no user content. rmdir (not rm -r) means a container that gains any
     # file between the check and the removal survives untouched.
+    # Because it bypasses the funnel, it asks the reviewed `--apply` plan
+    # itself, and with `--trash` it keeps the stub: the Trash routing refuses
+    # container paths, and this carve-out never deletes permanently in its place.
+    local stub_plan_rc=0
+    _mole_apply_plan_gate "$container_dir" || stub_plan_rc=$?
+    [[ $stub_plan_rc -lt 128 ]] || return "$stub_plan_rc"
+    [[ $stub_plan_rc -eq 0 ]] || return "$MOLE_ERR_PROTECTED_PATH"
+    if mole_clean_trash_skips "$container_dir"; then
+        return "$MOLE_ERR_PROTECTED_PATH"
+    fi
     command rm -f -- "$metadata_plist" || return 1
     command rmdir -- "$container_dir"
 }
@@ -2614,6 +2624,8 @@ clean_orphaned_container_stubs() {
                 elif [[ $stub_remove_rc -eq 0 ]]; then
                     removed_count=$((removed_count + 1))
                     log_operation "${MOLE_CURRENT_COMMAND:-clean}" "REMOVED" "$container_dir" "stub-container"
+                elif [[ $stub_remove_rc -eq $MOLE_ERR_PROTECTED_PATH ]]; then
+                    debug_log "Keeping stub container outside the reviewed plan or Trash routing: $container_dir"
                 else
                     debug_log "Failed to remove stub container: $container_dir"
                     failed_count=$((failed_count + 1))

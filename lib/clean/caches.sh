@@ -27,6 +27,10 @@ start_legacy_analyzer_cache_sweep() {
     local root="$HOME/.cache/mole"
     [[ -d "$root" && ! -L "$root" ]] || return 0
     [[ -n "$(command find "$root" -mindepth 1 -maxdepth 1 -type f -name '*.cache' -print -quit 2> /dev/null)" ]] || return 0
+    # The sweep unlinks; `mo clean --trash` keeps it for a permanent clean.
+    if mole_clean_trash_skips "$root"; then
+        return 0
+    fi
     (sweep_legacy_analyzer_cache_now "$root") < /dev/null > /dev/null 2>&1 &
     disown 2> /dev/null || true
 }

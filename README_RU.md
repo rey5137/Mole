@@ -92,6 +92,9 @@ mo history
 mo history --json
 
 mo clean --dry-run --debug   # Предпросмотр + подробные журналы
+mo clean --dry-run --json    # Предпросмотр как JSON-план с id пунктов
+mo clean --apply <plan_id> --select kept.txt  # Очистить только оставленные id
+mo clean --trash             # Перемещать очищаемые файлы в Корзину
 mo optimize --whitelist      # Управление защищёнными правилами оптимизации
 mo clean --whitelist         # Управление защищёнными кешами
 mo purge --paths             # Настроить каталоги для поиска проектов
@@ -345,6 +348,7 @@ Proxy   HTTP · 192.168.1.100             Chrome     ▮▮▮▯▯  28.3%
 - `mo status | jq '.health_score'` автоматически переключается на JSON, когда вывод передаётся по конвейеру
 - `mo status --watch --interval 2s` транслирует JSON, разделённый переводами строк (NDJSON), из уже прогретого сборщика данных
 - `mo history --json` возвращает историю очистки в формате JSON. Сессии содержат `run_id` (непрозрачная строка, пустая, если идентификатор не записывался) и `attribution`: `run` для опознанных запусков, `command` для устаревшей группировки по командам или `ambiguous`, когда по старым меткам невозможно отличить прерывание от перекрывающихся запусков. Записанные действия остаются доступными, но неоднозначные счётчики нельзя надёжно отнести к отдельным запускам. Пустое `ended_at` означает, что метка завершения не записана
+- `mo clean --dry-run --json` возвращает предпросмотр очистки как JSON-план с полями `plan_id`, `created_at`, `expires_at` (через час), `free_bytes`, `total_bytes`, `total_items`, `sections` (`id`, `name`, `bytes`, `items`) и `skipped` (`section`, `name`, `reason`). У каждого пункта есть `id`, `kind` (`path` + `path`, `command` + `name`, `command`), `bytes`, `size_known`, `count`, `covered_by`, `default_selected`; `covered_by` — id перечисленной папки, которая уже учитывает его размер. Затем `mo clean --apply <plan_id> --select <file>` очищает только id из файла, по одному в строке, и пропускает то, что изменилось после предпросмотра; с `--trash` файлы перемещаются в Корзину; с `--trash` шаги, которые могут удалять только безвозвратно (собственные команды инструментов вроде `npm cache clean`, удаление копий Time Machine и симуляторов, объекты root), пропускаются и перечисляются в итогах. Если предпросмотр остановился или отменён, вместо плана выводится `{"schema": 1, "command": "clean", "error": {"code": …, "message": …}}` (`code`: `cancelled`, `incomplete` или `plan_not_saved`), а код выхода ненулевой
 - `mo uninstall --list` возвращает установленные приложения в формате JSON с полями `name`, `bundle_id`, `source`, `uninstall_name`, `path` и `size`
 
 ```text

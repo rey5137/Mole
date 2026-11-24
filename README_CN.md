@@ -92,6 +92,9 @@ mo history
 mo history --json
 
 mo clean --dry-run --debug   # 安全预览 + 详细诊断日志
+mo clean --dry-run --json    # 以 JSON 计划预览，每项带 id
+mo clean --apply <plan_id> --select kept.txt  # 只清理保留的项目 id
+mo clean --trash             # 把清理的文件移到废纸篓
 mo optimize --whitelist      # 管理受保护的优化规则
 mo clean --whitelist         # 管理受保护的缓存白名单
 mo purge --paths             # 配置代码项目扫描目录
@@ -345,6 +348,7 @@ Proxy   HTTP · 192.168.1.100             Chrome     ▮▮▮▯▯  28.3%
 - `mo status | jq '.health_score'`：当输出被管道重定向时自动切换为 JSON 模式
 - `mo status --watch --interval 2s`：持续流式输出 NDJSON（换行分隔的 JSON）
 - `mo history --json`：以 JSON 格式输出历史清理日志。每个会话带有 `run_id`（不透明字符串，没有记录身份时为空）和 `attribution`，能识别的运行是 `run`，旧版按命令分组的是 `command`，旧标记分不清中断和重叠运行时是 `ambiguous`。记录下来的操作仍然都能看到，但 `ambiguous` 的计数没法可靠地分到单次运行上。`ended_at` 为空表示没有记录到结束标记
+- `mo clean --dry-run --json`：以 JSON 计划输出清理预览，字段为 `plan_id`、`created_at`、`expires_at`（一小时后过期）、`free_bytes`、`total_bytes`、`total_items`、`sections`（`id`、`name`、`bytes`、`items`）和 `skipped`（`section`、`name`、`reason`）。每个项目含 `id`, `kind` (`path` + `path`, `command` + `name`, `command`), `bytes`, `size_known`, `count`, `covered_by`, `default_selected`；`covered_by` 是已计入其大小的上层项目 id。随后 `mo clean --apply <plan_id> --select <file>` 只清理文件中逐行列出的项目 id，预览后有变化的项目会被跳过；加 `--trash` 则移到废纸篓；使用 `--trash` 时，只能永久删除的步骤（如 `npm cache clean` 等工具自带命令、Time Machine 与模拟器删除、root 拥有的项目）会被保留并在汇总中列出。预览中途停止或被取消时，改为输出 `{"schema": 1, "command": "clean", "error": {"code": …, "message": …}}`，`code` 为 `cancelled`、`incomplete` 或 `plan_not_saved`，并以非零状态退出
 - `mo uninstall --list`：以 JSON 输出已安装应用，字段为 `name`、`bundle_id`、`source`、`uninstall_name`、`path` 和 `size`
 
 ```text

@@ -120,6 +120,16 @@ The allow-then-deny ordering matters: rebuildable system caches we
 first means a maintainer adding a new safe path doesn't have to surgically
 weaken the deny rules.
 
+A reviewed `mo clean --apply <plan_id> --select <file>` adds one more check
+at the same sinks (`mole_apply_plan_allows` in `lib/core/file_ops.sh`, also
+asked by the raw container-stub carve-out and the `tmutil delete` step): a
+path is removed only when it equals or lies under a kept item of the saved
+plan whose root still has the dev:inode the dry run recorded, and holds no item
+the user unticked; anything else is logged `SKIPPED` as `not in reviewed plan`,
+`changed since review` or `holds unticked item`. `safe_remove` asks again right
+before it removes. Owner commands run only when their own plan item was kept,
+and the automation-browser stop signals only the processes the preview listed.
+
 ## Layer 2: `# SAFE: <reason>` contract for raw `rm`
 
 The validator is opt-in: a contributor could bypass it by writing `rm -rf`
@@ -199,7 +209,10 @@ Apple's `/usr/bin/trash` first, then an atomic no-overwrite rename into the
 per-volume Trash, and uses Finder AppleScript only as the last fallback.
 This gives users the standard Apple-native "Put Back" recovery flow.
 `mo clean`'s batched cleanup path, `mo purge`, and `mo installer` delete
-permanently; `mo uninstall --permanent` opts out of Trash, and
+permanently unless `mo clean --trash` routes clean's user-level deletions
+through the same Trash mover (root-owned items, owner commands, `tmutil` and
+`simctl` deletes are then skipped as `needs permanent delete` and listed in the
+summary, never removed); `mo uninstall --permanent` opts out of Trash, and
 `mo analyze` always uses Trash.
 
 The `trash` and `osascript` calls use a 30-second timeout (`trashTimeout`)

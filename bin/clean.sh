@@ -27,6 +27,8 @@ source "$SCRIPT_DIR/../lib/clean/app_caches.sh"
 source "$SCRIPT_DIR/../lib/clean/hints.sh"
 source "$SCRIPT_DIR/../lib/clean/system.sh"
 source "$SCRIPT_DIR/../lib/clean/user.sh"
+source "$SCRIPT_DIR/../lib/core/history.sh"
+source "$SCRIPT_DIR/../lib/clean/plan.sh"
 
 SYSTEM_CLEAN=false
 DRY_RUN=false
@@ -35,6 +37,12 @@ if [[ "${MOLE_DRY_RUN:-0}" == "1" ]]; then
 fi
 PROTECT_FINDER_METADATA=false
 EXTERNAL_VOLUME_TARGET=""
+# Reviewable clean: --json prints the dry-run plan, --apply/--select clean
+# only its kept items, --trash routes deletions to the user's Trash.
+CLEAN_JSON=false
+CLEAN_APPLY_PLAN_ARG=""
+CLEAN_SELECT_FILE=""
+CLEAN_TRASH=false
 IS_M_SERIES=$([[ "$(uname -m)" == "arm64" ]] && echo "true" || echo "false")
 
 # Whitelist and preview belong to the invoking user even when the whole
@@ -49,6 +57,7 @@ load_mole_whitelist "$MOLE_USER_HOME" || exit 1
 CLEAN_PREVIEW_FINAL_FILE="$MOLE_USER_HOME/.config/mole/clean-list.txt"
 CLEAN_PREVIEW_STAGING_FILE=""
 CLEAN_PREVIEW_LEDGER_FILE=""
+CLEAN_PREVIEW_COMMAND_LEDGER_FILE=""
 EXPORT_LIST_FILE="$CLEAN_PREVIEW_FINAL_FILE"
 CURRENT_SECTION=""
 readonly PROTECTED_SW_DOMAINS=(
@@ -96,6 +105,11 @@ prepare_clean_preview_file() {
     CLEAN_PREVIEW_LEDGER_FILE=$(create_temp_file) || return 1
     [[ -f "$CLEAN_PREVIEW_LEDGER_FILE" && ! -L "$CLEAN_PREVIEW_LEDGER_FILE" ]] || return 1
     : > "$CLEAN_PREVIEW_LEDGER_FILE"
+    # Owner-command steps (mole_plan_record_command) for the JSON plan only;
+    # the text preview lists paths.
+    CLEAN_PREVIEW_COMMAND_LEDGER_FILE=$(create_temp_file) || return 1
+    [[ -f "$CLEAN_PREVIEW_COMMAND_LEDGER_FILE" && ! -L "$CLEAN_PREVIEW_COMMAND_LEDGER_FILE" ]] || return 1
+    : > "$CLEAN_PREVIEW_COMMAND_LEDGER_FILE"
 }
 
 run_clean_preview_as_invoking_user() {
@@ -162,6 +176,7 @@ defer_cleanup_family() {
     fi
 
     DEFERRED_CLEANUP_FAMILIES+=("$family")
+    clean_plan_note_skipped "${CURRENT_SECTION:-}" "$family" "in use"
     debug_log "Deferred cleanup while active: $family"
 }
 
@@ -629,6 +644,9 @@ cleanup() {
         return 0
     fi
     CLEANUP_DONE=true
+
+    # A JSON preview that stops or is cancelled still prints one document.
+    [[ "$exit_code" == "0" ]] || clean_plan_emit_json_error "$exit_code"
 
     stop_inline_spinner 2> /dev/null || true
 
@@ -1667,6 +1685,7 @@ start_cleanup() {
     export MOLE_CLEAN_REMOVAL_TIMEOUTS
     MOLE_CLEAN_REMOVAL_TIMEOUT_PATHS=""
     export MOLE_CLEAN_REMOVAL_TIMEOUT_PATHS
+    MOLE_CLEAN_TRASH_SKIPPED=""
     _MOLE_CLEAN_SECTION_DEADLINE=""
     log_operation_session_start "clean"
     DRY_RUN_SEEN_IDENTITIES=()
@@ -1700,7 +1719,12 @@ start_cleanup() {
     echo -e "${PURPLE_BOLD}Clean Your Mac${NC}"
     echo ""
 
-    if [[ "$DRY_RUN" != "true" && -t 0 ]]; then
+    if [[ -n "$CLEAN_PLAN_ID" && "$DRY_RUN" != "true" ]]; then
+        local plan_note="Reviewed plan $CLEAN_PLAN_ID · $CLEAN_APPLY_KEPT_COUNT of $CLEAN_APPLY_ITEM_COUNT items kept"
+        [[ "$CLEAN_TRASH" == "true" ]] && plan_note+=" · to Trash"
+        echo -e "${BLUE}${ICON_ADMIN}${NC} $plan_note"
+        echo ""
+    elif [[ "$DRY_RUN" != "true" && -t 0 ]]; then
         echo -e "${GRAY}${ICON_WARNING} Use --dry-run to preview, --whitelist to manage protected paths${NC}"
     fi
 
@@ -1715,6 +1739,7 @@ start_cleanup() {
             echo ""
         else
             SYSTEM_CLEAN=false
+            clean_plan_note_skipped "System" "System caches" "needs sudo"
             echo -e "${GRAY}${ICON_WARNING} System caches need sudo, run ${NC}sudo -v && mo clean --dry-run${GRAY} for full preview${NC}"
             echo ""
         fi
@@ -1815,10 +1840,14 @@ perform_cleanup() {
         return 0
     fi
 
-    # Pre-check TCC permissions to avoid mid-run prompts.
+    # Pre-check TCC permissions to avoid mid-run prompts. A JSON preview and a
+    # reviewed --apply ask no questions, and an --apply touches nothing the
+    # plan does not list, Mole's own analyzer cache included.
     if [[ -z "$EXTERNAL_VOLUME_TARGET" ]]; then
-        check_tcc_permissions
-        start_legacy_analyzer_cache_sweep
+        if [[ "$CLEAN_JSON" != "true" && -z "${MOLE_APPLY_PLAN:-}" ]]; then
+            check_tcc_permissions
+        fi
+        [[ -n "${MOLE_APPLY_PLAN:-}" ]] || start_legacy_analyzer_cache_sweep
     fi
 
     if [[ ${#WHITELIST_PATTERNS[@]} -gt 0 ]]; then
@@ -1856,6 +1885,13 @@ perform_cleanup() {
             # cleanup rows a screen down. mo clean --whitelist shows them.
             echo -e "${BLUE}${ICON_ADMIN}${NC} Whitelist: $summary"
         fi
+    fi
+
+    # Items left unticked in a reviewed plan act as run-only whitelist
+    # entries, added after the summary above so they are not counted as the
+    # user's own patterns. Nothing is written to the whitelist file.
+    if [[ ${#CLEAN_APPLY_DESELECTED_PATHS[@]} -gt 0 ]]; then
+        WHITELIST_PATTERNS+=("${CLEAN_APPLY_DESELECTED_PATHS[@]}")
     fi
 
     if [[ -t 1 && "$DRY_RUN" != "true" ]]; then
@@ -2221,6 +2257,12 @@ perform_cleanup() {
         fi
     fi
 
+    if [[ -n "${MOLE_CLEAN_TRASH_SKIPPED:-}" ]]; then
+        local trash_skipped_count
+        trash_skipped_count=$(printf '%s\n' "$MOLE_CLEAN_TRASH_SKIPPED" | grep -c .)
+        summary_details+=("Kept, needs a permanent delete · $(mole_count_label "$trash_skipped_count" item): $(format_clean_summary_list "$MOLE_CLEAN_TRASH_SKIPPED")")
+    fi
+
     if [[ ${MOLE_CLEAN_SIZING_TIMEOUTS:-0} -gt 0 ]]; then
         debug_log "Some items exceeded the ${MOLE_TIMEOUT_DISK_VERIFY_SEC}s size-check budget; the tracked total is partially measured."
     fi
@@ -2229,30 +2271,9 @@ perform_cleanup() {
         # Per-item timeouts belong in diagnostics; the operation log retains
         # every failed path. Keep the debug preview bounded too.
         local removal_timeout_note="item(s) exceeded the ${MOLE_TIMEOUT_DISK_VERIFY_SEC}s removal budget and may be only partly removed"
-        local -a removal_timeout_paths=()
-        local removal_timeout_path
-        while IFS= read -r removal_timeout_path; do
-            [[ -n "$removal_timeout_path" ]] && removal_timeout_paths+=("$removal_timeout_path")
-        done <<< "${MOLE_CLEAN_REMOVAL_TIMEOUT_PATHS:-}"
-        if [[ ${#removal_timeout_paths[@]} -gt 0 ]]; then
-            local removal_timeout_show=3
-            [[ ${#removal_timeout_paths[@]} -lt $removal_timeout_show ]] && removal_timeout_show=${#removal_timeout_paths[@]}
-            local removal_timeout_list=""
-            local removal_timeout_idx
-            local removal_timeout_display
-            for ((removal_timeout_idx = 0; removal_timeout_idx < removal_timeout_show; removal_timeout_idx++)); do
-                # Abbreviate $HOME: three absolute paths under
-                # ~/Library/Developer already run past one terminal line, which
-                # is the width this note is capped to keep.
-                removal_timeout_display="${removal_timeout_paths[$removal_timeout_idx]}"
-                [[ -n "$HOME" && "$removal_timeout_display" == "$HOME"/* ]] && removal_timeout_display="~${removal_timeout_display#"$HOME"}"
-                removal_timeout_list+="${removal_timeout_list:+, }${removal_timeout_display}"
-            done
-            if [[ ${#removal_timeout_paths[@]} -gt $removal_timeout_show ]]; then
-                removal_timeout_list+=", +$((${#removal_timeout_paths[@]} - removal_timeout_show)) more"
-            fi
-            removal_timeout_note+=": ${removal_timeout_list}"
-        fi
+        local removal_timeout_list
+        removal_timeout_list=$(format_clean_summary_list "${MOLE_CLEAN_REMOVAL_TIMEOUT_PATHS:-}")
+        [[ -z "$removal_timeout_list" ]] || removal_timeout_note+=": ${removal_timeout_list}"
         debug_log "${MOLE_CLEAN_REMOVAL_TIMEOUTS} ${removal_timeout_note}."
     fi
 
@@ -2267,6 +2288,24 @@ perform_cleanup() {
     printf '\n'
 
     return "$cleanup_cancel_rc"
+}
+
+# Up to three entries of a newline-separated list for a one-line summary note,
+# then ", +N more". Abbreviate $HOME: three absolute paths under
+# ~/Library/Developer already run past one terminal line, which is the width
+# these notes are capped to keep.
+format_clean_summary_list() {
+    local list="" shown=0 total=0 entry
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        total=$((total + 1))
+        [[ $shown -lt 3 ]] || continue
+        [[ -n "$HOME" && "$entry" == "$HOME"/* ]] && entry="~${entry#"$HOME"}"
+        list+="${list:+, }${entry}"
+        shown=$((shown + 1))
+    done <<< "${1:-}"
+    [[ $total -le $shown ]] || list+=", +$((total - shown)) more"
+    printf '%s' "$list"
 }
 
 run_cloud_and_office_cleanup() {
@@ -2333,7 +2372,31 @@ main() {
                 manage_whitelist "clean"
                 exit 0
                 ;;
-            "--select" | "--categories" | "--exclude")
+            "--json")
+                CLEAN_JSON=true
+                ;;
+            "--apply")
+                shift
+                if [[ $# -eq 0 || "$1" == -* ]]; then
+                    echo "Missing plan id for --apply" >&2
+                    echo "Run 'mo clean --dry-run --json' and pass its plan_id." >&2
+                    exit 1
+                fi
+                CLEAN_APPLY_PLAN_ARG="$1"
+                ;;
+            "--select")
+                shift
+                if [[ $# -eq 0 || "$1" == -* ]]; then
+                    echo "Missing file for --select" >&2
+                    echo "Use 'mo clean --apply <plan_id> --select <file>', the file listing the kept item ids." >&2
+                    exit 1
+                fi
+                CLEAN_SELECT_FILE="$1"
+                ;;
+            "--trash")
+                CLEAN_TRASH=true
+                ;;
+            "--categories" | "--exclude")
                 echo "mo clean $1 was removed in this release." >&2
                 echo "Use 'mo clean --dry-run' to preview cleanup and 'mo clean --whitelist' to protect paths." >&2
                 exit 1
@@ -2352,6 +2415,23 @@ main() {
         shift
     done
 
+    validate_clean_mode_flags || exit 1
+
+    # MOLE_APPLY_PLAN and MOLE_CLEAN_TRASH come only from this run's flags.
+    unset MOLE_APPLY_PLAN
+    MOLE_CLEAN_TRASH=0
+    [[ "$CLEAN_TRASH" == "true" ]] && MOLE_CLEAN_TRASH=1
+    export MOLE_CLEAN_TRASH
+    if [[ -n "$CLEAN_APPLY_PLAN_ARG" ]]; then
+        clean_plan_prepare_apply "$CLEAN_APPLY_PLAN_ARG" "$CLEAN_SELECT_FILE" || exit 1
+    fi
+    # The JSON document is the only thing on stdout; every other line of the
+    # preview goes to stderr.
+    if [[ "$CLEAN_JSON" == "true" ]]; then
+        exec 7>&1 1>&2
+        CLEAN_PLAN_JSON_PENDING=true
+    fi
+
     CLEAN_STATUS_ON_SUCCESS="done"
     mole_report_program_status working
     refuse_cleanup_without_write_access || exit 1
@@ -2360,7 +2440,45 @@ main() {
     local cleanup_rc=0
     perform_cleanup || cleanup_rc=$?
     show_cursor
+    if [[ "$CLEAN_JSON" == "true" && $cleanup_rc -eq 0 ]]; then
+        clean_plan_emit_json || cleanup_rc=1
+    fi
     exit "$cleanup_rc"
+}
+
+# Each refusal names the conflict and the command to run instead.
+validate_clean_mode_flags() {
+    if [[ "$CLEAN_JSON" == "true" && "$DRY_RUN" != "true" ]]; then
+        echo "mo clean --json prints a preview plan and needs --dry-run." >&2
+        echo "Run 'mo clean --dry-run --json'." >&2
+        return 1
+    fi
+    if [[ -n "$CLEAN_SELECT_FILE" && -z "$CLEAN_APPLY_PLAN_ARG" ]]; then
+        echo "mo clean --select needs --apply <plan_id>; the plain clean has no selection list." >&2
+        echo "Run 'mo clean --dry-run --json', then 'mo clean --apply <plan_id> --select <file>'." >&2
+        return 1
+    fi
+    if [[ -n "$CLEAN_APPLY_PLAN_ARG" && -z "$CLEAN_SELECT_FILE" ]]; then
+        echo "mo clean --apply needs --select <file> listing the item ids to clean." >&2
+        echo "Run 'mo clean --apply $CLEAN_APPLY_PLAN_ARG --select <file>'." >&2
+        return 1
+    fi
+    if [[ -n "$CLEAN_APPLY_PLAN_ARG" && "$DRY_RUN" == "true" ]]; then
+        echo "mo clean --apply runs a reviewed plan and cannot be combined with --dry-run." >&2
+        echo "Run 'mo clean --dry-run --json' to preview, then --apply without --dry-run." >&2
+        return 1
+    fi
+    if [[ "$CLEAN_TRASH" == "true" && "$DRY_RUN" == "true" ]]; then
+        echo "mo clean --trash changes where a real clean sends files; a dry run removes nothing." >&2
+        echo "Run 'mo clean --dry-run' to preview, then 'mo clean --trash'." >&2
+        return 1
+    fi
+    if [[ -n "$EXTERNAL_VOLUME_TARGET" && ("$CLEAN_JSON" == "true" || -n "$CLEAN_APPLY_PLAN_ARG" || "$CLEAN_TRASH" == "true") ]]; then
+        echo "mo clean --external does not support --json, --apply or --trash." >&2
+        echo "Run 'mo clean --external <volume> --dry-run' to preview it." >&2
+        return 1
+    fi
+    return 0
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
