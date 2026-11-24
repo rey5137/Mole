@@ -95,6 +95,9 @@ mo clean --dry-run --debug   # Preview + detailed logs
 mo clean --dry-run --json    # Preview as a JSON plan with item ids
 mo clean --apply <plan_id> --select kept.txt  # Clean only the kept item ids
 mo clean --trash             # Move cleaned files to the Trash
+mo purge --dry-run --json    # Preview as a JSON plan with item ids
+mo purge --apply <plan_id> --select kept.txt  # Purge only the kept item ids
+mo purge --trash             # Move purged artifacts to the Trash
 mo optimize --whitelist      # Manage protected optimization rules
 mo clean --whitelist         # Manage protected caches
 mo purge --paths             # Configure project scan directories

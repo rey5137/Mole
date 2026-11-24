@@ -22,13 +22,22 @@ source "$SCRIPT_DIR/../lib/core/common.sh"
 
 # Restores cursor and clears temp files even when set -e aborts (#915).
 cleanup() {
+    local exit_code="${1:-$?}"
+    # A JSON preview that stops or is cancelled still prints one document.
+    if [[ "$exit_code" != "0" && "${CLEAN_PLAN_JSON_PENDING:-false}" == "true" ]]; then
+        clean_plan_emit_json_error "$exit_code"
+    fi
     show_cursor 2> /dev/null || true
     cleanup_temp_files
 }
 trap cleanup EXIT
-trap 'trap - EXIT; cleanup; exit 130' INT TERM
+trap 'trap - EXIT; cleanup 130; exit 130' INT TERM
 source "$SCRIPT_DIR/../lib/core/log.sh"
 source "$SCRIPT_DIR/../lib/clean/project.sh"
+source "$SCRIPT_DIR/../lib/core/history.sh"
+source "$SCRIPT_DIR/../lib/clean/plan.sh"
+source "$SCRIPT_DIR/../lib/clean/purge_plan.sh"
+CLEAN_PLAN_COMMAND="purge"
 
 # Purge ends at safe_remove just like clean, so initialize the invoking user's
 # whitelist before project discovery or the interactive selection begins.
@@ -242,6 +251,31 @@ perform_purge() {
     trap - INT TERM
     cleanup_monitor
 
+    if [[ -n "$PURGE_PLAN_RECORDS_FILE" ]]; then
+        log_operation_session_end "purge" 0 0
+        purge_plan_finish_json "$purge_outcome"
+        return $?
+    fi
+    finish_purge_run "$purge_outcome"
+}
+
+# Apply a reviewed plan (`mo purge --apply <plan_id> --select <file>`): no
+# scan and no menu; only the kept artifacts are rechecked and removed.
+perform_purge_apply() {
+    echo -e "${PURPLE_BOLD}Purge Project Artifacts${NC}"
+    local plan_note="Reviewed plan $CLEAN_PLAN_ID · $CLEAN_APPLY_KEPT_COUNT of $CLEAN_APPLY_ITEM_COUNT items kept"
+    [[ "${MOLE_CLEAN_TRASH:-0}" == "1" ]] && plan_note+=" · to Trash"
+    echo -e "${BLUE}${ICON_ADMIN}${NC} $plan_note"
+    echo ""
+    purge_plan_apply
+    finish_purge_run "${PURGE_RUN_OUTCOME:-scan_failed}"
+}
+
+# Log the session end and print the summary of a finished purge run.
+finish_purge_run() {
+    local purge_outcome="$1"
+    local stats_dir="${XDG_CACHE_HOME:-$HOME/.cache}/mole"
+
     case "$purge_outcome" in
         no_candidates | cancelled | scan_failed)
             # start_purge already wrote the start marker; without the end
@@ -288,6 +322,9 @@ perform_purge() {
         freed_size_human=$(bytes_to_human_kb "$total_size_cleaned")
 
         local summary_line="Estimated space freed: ${GREEN}${freed_size_human}${NC}"
+        if [[ "${MOLE_CLEAN_TRASH:-0}" == "1" ]]; then
+            summary_line="Moved to Trash: ${GREEN}${freed_size_human}${NC}"
+        fi
         if [[ "${MOLE_DRY_RUN:-0}" == "1" ]]; then
             summary_line="Would free approximately: ${GREEN}${freed_size_human}${NC}"
         fi
@@ -303,6 +340,9 @@ perform_purge() {
     fi
     if [[ "$purge_outcome" == "incomplete" ]]; then
         summary_details+=("Some artifacts were skipped or could not be processed.")
+    fi
+    if [[ -n "$PURGE_APPLY_SKIPPED" ]]; then
+        summary_details+=("Kept · $(mole_count_label "$(printf '%s\n' "$PURGE_APPLY_SKIPPED" | grep -c .)" item): $(format_clean_summary_list "$PURGE_APPLY_SKIPPED")")
     fi
 
     # Log session end
@@ -324,6 +364,9 @@ show_help() {
     echo "  --dry-run       Preview purge actions without making changes"
     echo "  --include-empty Show zero-size project artifact directories"
     echo "  --yes           Confirm unattended cleanup of eligible artifacts"
+    echo "  --json          With --dry-run, print the preview as a JSON plan"
+    echo "  --apply ID --select FILE  Purge only the item ids FILE lists, from plan ID"
+    echo "  --trash         Move purged artifacts to the Trash instead of deleting them"
     echo "  --debug         Enable debug logging"
     echo "  -h, --help      Show this help message"
     echo ""
@@ -335,9 +378,13 @@ show_help() {
 
 # Main entry point
 main() {
+    local purge_json=false
+    local purge_trash=false
+    local purge_apply_arg=""
+    local purge_select_file=""
     # Parse arguments
-    for arg in "$@"; do
-        case "$arg" in
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
             "--paths")
                 source "$SCRIPT_DIR/../lib/manage/purge_paths.sh"
                 manage_purge_paths
@@ -359,13 +406,57 @@ main() {
             "--include-empty")
                 export MOLE_PURGE_INCLUDE_EMPTY=1
                 ;;
+            "--json")
+                purge_json=true
+                ;;
+            "--apply")
+                shift
+                if [[ $# -eq 0 || "$1" == -* ]]; then
+                    echo "Missing plan id for --apply" >&2
+                    echo "Run 'mo purge --dry-run --json' and pass its plan_id." >&2
+                    exit 1
+                fi
+                purge_apply_arg="$1"
+                ;;
+            "--select")
+                shift
+                if [[ $# -eq 0 || "$1" == -* ]]; then
+                    echo "Missing file for --select" >&2
+                    echo "Use 'mo purge --apply <plan_id> --select <file>', the file listing the kept item ids." >&2
+                    exit 1
+                fi
+                purge_select_file="$1"
+                ;;
+            "--trash")
+                purge_trash=true
+                ;;
             *)
-                echo "Unknown option: $arg" >&2
+                echo "Unknown option: $1" >&2
                 echo "Use 'mo purge --help' for usage information" >&2
                 exit 1
                 ;;
         esac
+        shift
     done
+
+    validate_purge_mode_flags "$purge_json" "$purge_trash" "$purge_apply_arg" "$purge_select_file" || exit 1
+
+    # MOLE_APPLY_PLAN and MOLE_CLEAN_TRASH come only from this run's flags.
+    unset MOLE_APPLY_PLAN
+    MOLE_CLEAN_TRASH=0
+    [[ "$purge_trash" == "true" ]] && MOLE_CLEAN_TRASH=1
+    export MOLE_CLEAN_TRASH
+    if [[ -n "$purge_apply_arg" ]]; then
+        clean_plan_load_selection "$purge_apply_arg" "$purge_select_file" || exit 1
+        PURGE_APPLY_PLAN_ID="$CLEAN_PLAN_ID"
+    fi
+    # The JSON document is the only thing on stdout; every other line of the
+    # preview goes to stderr.
+    if [[ "$purge_json" == "true" ]]; then
+        exec 7>&1 1>&2
+        CLEAN_PLAN_JSON_PENDING=true
+        PURGE_PLAN_RECORDS_FILE=$(create_temp_file) || exit 1
+    fi
 
     start_purge
     if [[ "${MOLE_DRY_RUN:-0}" == "1" ]]; then
@@ -373,7 +464,42 @@ main() {
         printf '\n'
     fi
     hide_cursor
-    perform_purge
+    if [[ -n "$PURGE_APPLY_PLAN_ID" ]]; then
+        perform_purge_apply
+    else
+        perform_purge
+    fi
+}
+
+# Each refusal names the conflict and the command to run instead.
+validate_purge_mode_flags() {
+    local json="$1" trash="$2" apply_arg="$3" select_file="$4"
+    if [[ "$json" == "true" && "${MOLE_DRY_RUN:-0}" != "1" ]]; then
+        echo "mo purge --json prints a preview plan and needs --dry-run." >&2
+        echo "Run 'mo purge --dry-run --json'." >&2
+        return 1
+    fi
+    if [[ -n "$select_file" && -z "$apply_arg" ]]; then
+        echo "mo purge --select needs --apply <plan_id>; the plain purge has no selection list." >&2
+        echo "Run 'mo purge --dry-run --json', then 'mo purge --apply <plan_id> --select <file>'." >&2
+        return 1
+    fi
+    if [[ -n "$apply_arg" && -z "$select_file" ]]; then
+        echo "mo purge --apply needs --select <file> listing the item ids to purge." >&2
+        echo "Run 'mo purge --apply $apply_arg --select <file>'." >&2
+        return 1
+    fi
+    if [[ -n "$apply_arg" && "${MOLE_DRY_RUN:-0}" == "1" ]]; then
+        echo "mo purge --apply runs a reviewed plan and cannot be combined with --dry-run." >&2
+        echo "Run 'mo purge --dry-run --json' to preview, then --apply without --dry-run." >&2
+        return 1
+    fi
+    if [[ "$trash" == "true" && "${MOLE_DRY_RUN:-0}" == "1" ]]; then
+        echo "mo purge --trash changes where a real purge sends artifacts; a dry run removes nothing." >&2
+        echo "Run 'mo purge --dry-run' to preview, then 'mo purge --trash'." >&2
+        return 1
+    fi
+    return 0
 }
 
 if [[ "${MOLE_SKIP_MAIN:-0}" == "1" ]]; then

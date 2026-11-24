@@ -95,6 +95,9 @@ mo clean --dry-run --debug   # 安全预览 + 详细诊断日志
 mo clean --dry-run --json    # 以 JSON 计划预览，每项带 id
 mo clean --apply <plan_id> --select kept.txt  # 只清理保留的项目 id
 mo clean --trash             # 把清理的文件移到废纸篓
+mo purge --dry-run --json    # 以 JSON 计划预览构建产物，每项带 id
+mo purge --apply <plan_id> --select kept.txt  # 只清除保留的产物 id
+mo purge --trash             # 把清除的构建产物移到废纸篓
 mo optimize --whitelist      # 管理受保护的优化规则
 mo clean --whitelist         # 管理受保护的缓存白名单
 mo purge --paths             # 配置代码项目扫描目录

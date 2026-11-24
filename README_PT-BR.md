@@ -95,6 +95,9 @@ mo clean --dry-run --debug   # Pré-visualização + logs detalhados
 mo clean --dry-run --json    # Pré-visualização como plano JSON com ids
 mo clean --apply <plan_id> --select kept.txt  # Limpar só os ids mantidos
 mo clean --trash             # Mover os arquivos limpos para o Lixo
+mo purge --dry-run --json    # Pré-visualização como plano JSON com ids
+mo purge --apply <plan_id> --select kept.txt  # Remover só os ids mantidos
+mo purge --trash             # Mover os artefatos removidos para o Lixo
 mo optimize --whitelist      # Gerencia regras de otimização protegidas
 mo clean --whitelist         # Gerencia caches protegidos
 mo purge --paths             # Configura as pastas de busca de projetos

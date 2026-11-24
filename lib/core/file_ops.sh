@@ -1703,6 +1703,7 @@ _mole_apply_plan_gate() {
     fi
     debug_log "Kept outside the reviewed plan (${_MOLE_APPLY_PLAN_REASON}): $path"
     log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "$_MOLE_APPLY_PLAN_REASON"
+    _MOLE_SAFE_REMOVE_SKIP_REASON="$_MOLE_APPLY_PLAN_REASON"
     return 1
 }
 
@@ -1762,9 +1763,11 @@ mole_clean_command_allowed() {
     return 0
 }
 
-# `mo clean --trash` sends clean deletions to the user's Trash instead.
+# `mo clean --trash` and `mo purge --trash` send safe_remove deletions to the
+# user's Trash instead. Each command sets MOLE_CLEAN_TRASH from its own flags.
 _mole_clean_trash_active() {
-    [[ "${MOLE_CLEAN_TRASH:-0}" == "1" && "${MOLE_CURRENT_COMMAND:-}" == "clean" ]]
+    [[ "${MOLE_CLEAN_TRASH:-0}" == "1" ]] || return 1
+    [[ "${MOLE_CURRENT_COMMAND:-}" == "clean" || "${MOLE_CURRENT_COMMAND:-}" == "purge" ]]
 }
 
 # Under `mo clean --trash`, a step that cannot move its target to the Trash
@@ -1789,6 +1792,7 @@ _mole_clean_move_to_trash() {
     local trash_root="${HOME%/}/.Trash"
     if [[ "$path" == "$trash_root" || "$path" == "$trash_root"/* ]]; then
         log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "already in Trash"
+        _MOLE_SAFE_REMOVE_SKIP_REASON="already in Trash"
         return 1
     fi
     local trash_rc=0
@@ -1812,10 +1816,16 @@ _mole_clean_move_to_trash() {
     else
         log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "trash-failed"
     fi
+    _MOLE_SAFE_REMOVE_SKIP_REASON="trash-failed"
     return 1
 }
 
+# Why the last safe_remove refused, when its caller words that cause itself:
+# a reviewed-plan refusal or a failed Trash move. Empty for every other cause.
+_MOLE_SAFE_REMOVE_SKIP_REASON=""
+
 safe_remove() {
+    _MOLE_SAFE_REMOVE_SKIP_REASON=""
     local path="$1"
     local silent="${2:-false}"
     local precomputed_size_kb="${3:-}"
@@ -4388,7 +4398,7 @@ safe_sudo_find_delete() {
                 fi
                 batch_files+=("$match")
                 batch_identities+=("${match_identity%:*}")
-                batch_sizes+=("$(( (${match_identity##*:} + 1) / 2 ))")
+                batch_sizes+=("$(((${match_identity##*:} + 1) / 2))")
             elif [[ $delete_rc -eq 0 ]]; then
                 delete_rc=${identity_rc:-1}
                 [[ $delete_rc -ne 0 ]] || delete_rc=1

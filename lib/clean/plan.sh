@@ -1,9 +1,11 @@
 #!/bin/bash
-# Mole - Reviewable clean plans.
+# Mole - Reviewable clean and purge plans.
 # `mo clean --dry-run --json` prints the preview as one JSON document and saves
 # the same candidate ledger as a plan; `mo clean --apply <plan_id> --select
 # <file>` cleans only the plan items the user kept. Mole reads the saved ledger
 # back, never the JSON. The sinks in lib/core/file_ops.sh enforce the selection.
+# `mo purge` saves its plans here too (lib/clean/purge_plan.sh); each ledger
+# records the command that made it, and only that command applies it.
 
 set -euo pipefail
 
@@ -11,6 +13,8 @@ readonly CLEAN_PLAN_SCHEMA=1
 readonly CLEAN_PLAN_TTL_SEC=3600
 readonly CLEAN_PLAN_MAGIC="MOLEPLAN"
 
+# The command whose plans this run saves and applies: clean or purge.
+CLEAN_PLAN_COMMAND="clean"
 CLEAN_PLAN_ID=""
 # Set once `--json` has moved stdout to fd 7, cleared once a document starts.
 CLEAN_PLAN_JSON_PENDING=false
@@ -22,9 +26,12 @@ declare -a CLEAN_APPLY_DESELECTED_PATHS=()
 CLEAN_APPLY_KEPT_COUNT=0
 CLEAN_APPLY_ITEM_COUNT=0
 
-# Records read back from a plan file by _clean_plan_read.
+# Records read back from a plan file by _clean_plan_read. A record of a kind
+# other than P and C carries a counted list of command-specific fields, kept
+# in CLEAN_PLAN_R_AUX from offset CLEAN_PLAN_R_AUX_AT[record].
 CLEAN_PLAN_R_CREATED=""
 CLEAN_PLAN_R_UID=""
+CLEAN_PLAN_R_COMMAND=""
 declare -a CLEAN_PLAN_R_KIND=()
 declare -a CLEAN_PLAN_R_ID=()
 declare -a CLEAN_PLAN_R_SECTION=()
@@ -35,6 +42,10 @@ declare -a CLEAN_PLAN_R_COUNT=()
 declare -a CLEAN_PLAN_R_KNOWN=()
 declare -a CLEAN_PLAN_R_COVERED=()
 declare -a CLEAN_PLAN_R_EXTRA=()
+declare -a CLEAN_PLAN_R_AUX_AT=()
+declare -a CLEAN_PLAN_R_AUX=()
+# Item ids the --select file kept, as $'\x1f'id$'\x1f' entries.
+CLEAN_PLAN_SELECTED_IDS=""
 
 clean_plan_dir() {
     printf '%s\n' "${MOLE_USER_HOME:-$HOME}/.config/mole/plans"
@@ -50,7 +61,7 @@ clean_plan_note_skipped() {
 
 # One cause line and one next action, then a nonzero status.
 _clean_plan_refuse() {
-    printf 'mo clean: %s\n%s\n' "$1" "$2" >&2
+    printf 'mo %s: %s\n%s\n' "$CLEAN_PLAN_COMMAND" "$1" "$2" >&2
     return 1
 }
 
@@ -75,7 +86,7 @@ _clean_plan_prepare_dir() {
     dir=$(clean_plan_dir)
     if [[ -L "$dir" || (-e "$dir" && ! -d "$dir") || (-d "$dir" && ! -O "$dir") ]]; then
         _clean_plan_refuse "the plans folder $dir is a link, not a folder, or belongs to another user." \
-            "Remove it, then run 'mo clean --dry-run --json' again."
+            "Remove it, then run 'mo $CLEAN_PLAN_COMMAND --dry-run --json' again."
         return 1
     fi
     if [[ ! -d "$dir" ]]; then
@@ -84,7 +95,7 @@ _clean_plan_prepare_dir() {
     fi
     if [[ ! -d "$dir" || -L "$dir" || ! -O "$dir" ]] || ! chmod 700 "$dir" 2> /dev/null; then
         _clean_plan_refuse "the plans folder $dir could not be created." \
-            "Check that ~/.config/mole is writable, then run 'mo clean --dry-run --json' again."
+            "Check that ~/.config/mole is writable, then run 'mo $CLEAN_PLAN_COMMAND --dry-run --json' again."
         return 1
     fi
     printf '%s\n' "$dir"
@@ -135,28 +146,68 @@ _clean_plan_lstat_identities() {
     done
 }
 
-# Save the finished dry-run ledger as a plan. Prints the plan file path.
-clean_plan_save() {
+# First half of saving a plan, shared by clean and purge: refuse a root run,
+# prepare the plans folder, prune expired plans and draw a plan id. Sets
+# _CLEAN_PLAN_SAVE_DIR and _CLEAN_PLAN_SAVE_ID.
+_CLEAN_PLAN_SAVE_DIR=""
+_CLEAN_PLAN_SAVE_ID=""
+_clean_plan_save_begin() {
     if is_root_user; then
         _clean_plan_refuse "a reviewable plan is not saved for a root run." \
-            "Run 'mo clean --dry-run --json' as your own user."
+            "Run 'mo $CLEAN_PLAN_COMMAND --dry-run --json' as your own user."
         return 1
     fi
-    local dir
-    dir=$(_clean_plan_prepare_dir) || return 1
-    clean_plan_prune_expired "$dir"
+    _CLEAN_PLAN_SAVE_DIR=$(_clean_plan_prepare_dir) || return 1
+    clean_plan_prune_expired "$_CLEAN_PLAN_SAVE_DIR"
 
-    local plan_id
-    if ! plan_id=$(_clean_plan_new_id); then
+    if ! _CLEAN_PLAN_SAVE_ID=$(_clean_plan_new_id); then
         _clean_plan_refuse "no random plan id could be read from /dev/urandom." \
-            "Run 'mo clean --dry-run --json' again."
+            "Run 'mo $CLEAN_PLAN_COMMAND --dry-run --json' again."
         return 1
     fi
+}
 
-    local records_file paths_file ids_file stage
+# Second half: write the header (magic, schema, created, uid, command), the
+# records in $1 and the END mark to a 0600 scratch file in the plans folder,
+# then move it into place without replacing anything. Prints the plan path.
+_clean_plan_save_finish() {
+    local body_file="$1"
+    local dir="$_CLEAN_PLAN_SAVE_DIR" plan_id="$_CLEAN_PLAN_SAVE_ID" stage created
+    stage=$(umask 077 && mktemp "$dir/.plan.XXXXXX") || {
+        _clean_plan_refuse "the plan could not be written to $dir." \
+            "Check that the folder is writable, then run 'mo $CLEAN_PLAN_COMMAND --dry-run --json' again."
+        return 1
+    }
+    created=$(date +%s)
+    local write_ok=true
+    {
+        printf '%s\0%s\0%s\0%s\0%s\0' "$CLEAN_PLAN_MAGIC" "$CLEAN_PLAN_SCHEMA" "$created" "$(id -u)" \
+            "$CLEAN_PLAN_COMMAND"
+        cat "$body_file"
+        printf 'END\0'
+    } > "$stage" || write_ok=false
+
+    local plan_file="$dir/$plan_id.ledger"
+    if [[ "$write_ok" != "true" || -e "$plan_file" || -L "$plan_file" ]] ||
+        ! mv -n "$stage" "$plan_file" 2> /dev/null || [[ -e "$stage" ]]; then
+        rm -f -- "$stage" 2> /dev/null || true # SAFE: exact mktemp plan scratch file created above
+        _clean_plan_refuse "the plan could not be saved as $plan_file." \
+            "Run 'mo $CLEAN_PLAN_COMMAND --dry-run --json' again."
+        return 1
+    fi
+    CLEAN_PLAN_ID="$plan_id"
+    printf '%s\n' "$plan_file"
+}
+
+# Save the finished dry-run ledger as a plan. Prints the plan file path.
+clean_plan_save() {
+    _clean_plan_save_begin || return 1
+
+    local records_file paths_file ids_file body_file
     records_file=$(create_temp_file) || return 1
     paths_file=$(create_temp_file) || return 1
     ids_file=$(create_temp_file) || return 1
+    body_file=$(create_temp_file) || return 1
     emit_deduplicated_dry_run_ledger > "$records_file"
 
     local identity size_kb count size_known section path covered_by
@@ -171,20 +222,12 @@ clean_plan_save() {
     done < "$records_file" > "$paths_file"
     if ! _clean_plan_lstat_identities < "$paths_file" > "$ids_file"; then
         _clean_plan_refuse "the file identities of the preview could not be read in time." \
-            "Run 'mo clean --dry-run --json' again."
+            "Run 'mo $CLEAN_PLAN_COMMAND --dry-run --json' again."
         return 1
     fi
 
-    stage=$(umask 077 && mktemp "$dir/.plan.XXXXXX") || {
-        _clean_plan_refuse "the plan could not be written to $dir." \
-            "Check that the folder is writable, then run 'mo clean --dry-run --json' again."
-        return 1
-    }
-
-    local created index=0 devino seen_commands="" rs=$'\x1f' fs=$'\x1e'
-    created=$(date +%s)
+    local index=0 devino seen_commands="" rs=$'\x1f' fs=$'\x1e'
     {
-        printf '%s\0%s\0%s\0%s\0' "$CLEAN_PLAN_MAGIC" "$CLEAN_PLAN_SCHEMA" "$created" "$(id -u)"
         while IFS= read -r -d '' identity &&
             IFS= read -r -d '' size_kb &&
             IFS= read -r -d '' count &&
@@ -212,25 +255,21 @@ clean_plan_save() {
                     "$index" "$section" "$name" 0 1 false "$command_text"
             done < "$CLEAN_PREVIEW_COMMAND_LEDGER_FILE"
         fi
-        printf 'END\0'
-    } > "$stage"
+    } > "$body_file"
 
-    local plan_file="$dir/$plan_id.ledger"
-    if [[ -e "$plan_file" || -L "$plan_file" ]] || ! mv -n "$stage" "$plan_file" 2> /dev/null ||
-        [[ -e "$stage" ]]; then
-        rm -f -- "$stage" 2> /dev/null || true # SAFE: exact mktemp plan scratch file created above
-        _clean_plan_refuse "the plan could not be saved as $plan_file." \
-            "Run 'mo clean --dry-run --json' again."
-        return 1
-    fi
-    CLEAN_PLAN_ID="$plan_id"
-    printf '%s\n' "$plan_file"
+    _clean_plan_save_finish "$body_file"
 }
 
 # Load a plan file into the CLEAN_PLAN_R_* arrays. 1 when it is damaged.
+# The header is magic, schema, created, uid and command. Every record has a
+# kind and nine fields (id, section, target, devino, size_kb,
+# count, size_known, covered_by, extra). Clean writes P (path) and C (command)
+# records; purge writes A (whole artifact folder) records, which add a count
+# and that many purge fields, so a later purge kind can carry its own.
 _clean_plan_read() {
     local file="$1"
     CLEAN_PLAN_R_CREATED=""
+    CLEAN_PLAN_R_COMMAND=""
     CLEAN_PLAN_R_KIND=()
     CLEAN_PLAN_R_ID=()
     CLEAN_PLAN_R_SECTION=()
@@ -241,22 +280,41 @@ _clean_plan_read() {
     CLEAN_PLAN_R_KNOWN=()
     CLEAN_PLAN_R_COVERED=()
     CLEAN_PLAN_R_EXTRA=()
+    CLEAN_PLAN_R_AUX_AT=()
+    CLEAN_PLAN_R_AUX=()
 
-    local magic schema created uid complete=false
-    local kind id section target devino size_kb count known covered extra
+    local magic schema created uid command complete=false
+    local kind id section target devino size_kb count known covered extra aux_count aux_value aux_index
     {
         IFS= read -r -d '' magic || return 1
         IFS= read -r -d '' schema || return 1
         IFS= read -r -d '' created || return 1
         IFS= read -r -d '' uid || return 1
+        IFS= read -r -d '' command || return 1
         [[ "$magic" == "$CLEAN_PLAN_MAGIC" && "$schema" == "$CLEAN_PLAN_SCHEMA" ]] || return 1
         [[ "$created" =~ ^[0-9]+$ && "$uid" =~ ^[0-9]+$ ]] || return 1
-        while IFS= read -r -d '' kind; do
+        # A ledger saved before plans named their command has its first
+        # record kind here; it is a clean plan.
+        local first_kind=""
+        if [[ "$command" != "clean" && "$command" != "purge" ]]; then
+            first_kind="$command"
+            command="clean"
+        fi
+        while true; do
+            if [[ -n "$first_kind" ]]; then
+                kind="$first_kind"
+                first_kind=""
+            else
+                IFS= read -r -d '' kind || break
+            fi
             if [[ "$kind" == "END" ]]; then
                 complete=true
                 break
             fi
-            [[ "$kind" == "P" || "$kind" == "C" ]] || return 1
+            case "$command:$kind" in
+                clean:P | clean:C | purge:A) ;;
+                *) return 1 ;;
+            esac
             IFS= read -r -d '' id &&
                 IFS= read -r -d '' section &&
                 IFS= read -r -d '' target &&
@@ -266,6 +324,15 @@ _clean_plan_read() {
                 IFS= read -r -d '' known &&
                 IFS= read -r -d '' covered &&
                 IFS= read -r -d '' extra || return 1
+            CLEAN_PLAN_R_AUX_AT+=("${#CLEAN_PLAN_R_AUX[@]}")
+            if [[ "$kind" != "P" && "$kind" != "C" ]]; then
+                IFS= read -r -d '' aux_count || return 1
+                [[ "$aux_count" =~ ^[0-9]{1,2}$ ]] || return 1
+                for ((aux_index = 0; aux_index < aux_count; aux_index++)); do
+                    IFS= read -r -d '' aux_value || return 1
+                    CLEAN_PLAN_R_AUX+=("$aux_value")
+                done
+            fi
             CLEAN_PLAN_R_KIND+=("$kind")
             CLEAN_PLAN_R_ID+=("$id")
             CLEAN_PLAN_R_SECTION+=("$section")
@@ -281,6 +348,7 @@ _clean_plan_read() {
     [[ "$complete" == "true" ]] || return 1
     CLEAN_PLAN_R_CREATED="$created"
     CLEAN_PLAN_R_UID="$uid"
+    CLEAN_PLAN_R_COMMAND="$command"
 }
 
 _clean_plan_section_slug() {
@@ -293,12 +361,14 @@ _clean_plan_section_slug() {
 
 # Print the JSON document of a saved plan. Totals follow the text preview:
 # a row counted under a measured ancestor (covered_by) stays listed but adds
-# nothing, and command items carry no bytes.
+# nothing, and command items carry no bytes. A record of a command's own kind
+# (purge's A) is printed by <command>_plan_render_item after its id.
 clean_plan_render_json() {
     local plan_file="$1"
     local plan_id="$2"
     local free_kb="${3:-}"
     _clean_plan_read "$plan_file" || return 1
+    local item_renderer="${CLEAN_PLAN_R_COMMAND}_plan_render_item"
 
     local rs=$'\x1f' fs=$'\x1e'
     local -a section_names=()
@@ -318,7 +388,7 @@ clean_plan_render_json() {
             section_bytes+=(0)
             found=$((${#section_names[@]} - 1))
         fi
-        [[ "${CLEAN_PLAN_R_KIND[$idx]}" == "P" ]] || continue
+        [[ "${CLEAN_PLAN_R_KIND[$idx]}" != "C" ]] || continue
         path_ids+="$rs${CLEAN_PLAN_R_TARGET[$idx]}$fs${CLEAN_PLAN_R_ID[$idx]}$rs"
         [[ -z "${CLEAN_PLAN_R_COVERED[$idx]}" ]] || continue
         bytes=$((${CLEAN_PLAN_R_SIZE[$idx]} * 1024))
@@ -333,7 +403,7 @@ clean_plan_render_json() {
 
     printf '{\n'
     printf '  "schema": %s,\n' "$CLEAN_PLAN_SCHEMA"
-    printf '  "command": "clean",\n'
+    printf '  "command": "%s",\n' "$CLEAN_PLAN_R_COMMAND"
     printf '  "plan_id": "%s",\n' "$plan_id"
     printf '  "created_at": "%s",\n' "$(_clean_plan_iso_time "$created")"
     printf '  "expires_at": "%s",\n' "$(_clean_plan_iso_time "$((created + CLEAN_PLAN_TTL_SEC))")"
@@ -370,6 +440,11 @@ clean_plan_render_json() {
                 printf ', "command": '
                 history_json_string "${CLEAN_PLAN_R_EXTRA[$idx]}"
                 printf ', "bytes": 0, "size_known": false, "count": 1, "covered_by": null, "default_selected": true}'
+                continue
+            fi
+            if [[ "${CLEAN_PLAN_R_KIND[$idx]}" != "P" ]]; then
+                declare -F "$item_renderer" > /dev/null || return 1
+                "$item_renderer" "$idx" || return 1
                 continue
             fi
             printf '"kind": "path", "path": '
@@ -419,11 +494,12 @@ clean_plan_render_json() {
     printf '}\n'
 }
 
-# Save the plan of the finished dry run and print its JSON to fd 7, the
-# command's real stdout (bin/clean.sh sends everything else to stderr).
+# Save the plan of the finished dry run (<command>_plan_save) and print its
+# JSON to fd 7, the command's real stdout (bin/clean.sh and bin/purge.sh send
+# everything else to stderr).
 clean_plan_emit_json() {
     local plan_file
-    if ! plan_file=$(clean_plan_save); then
+    if ! plan_file=$("${CLEAN_PLAN_COMMAND}_plan_save"); then
         CLEAN_PLAN_SAVE_FAILED=true
         return 1
     fi
@@ -451,8 +527,26 @@ clean_plan_emit_json_error() {
         code="incomplete"
         message="The preview stopped before it finished (exit $exit_code); no plan was saved."
     fi
-    printf '{"schema":%s,"command":"clean","error":{"code":%s,"message":%s}}\n' "$CLEAN_PLAN_SCHEMA" \
+    printf '{"schema":%s,"command":"%s","error":{"code":%s,"message":%s}}\n' "$CLEAN_PLAN_SCHEMA" "$CLEAN_PLAN_COMMAND" \
         "$(history_json_string "$code")" "$(history_json_string "$message")" >&7 2> /dev/null || true
+}
+
+# Up to three entries of a newline-separated list for a one-line summary note
+# of clean or purge, then ", +N more". Abbreviate $HOME: three absolute paths under
+# ~/Library/Developer already run past one terminal line, which is the width
+# these notes are capped to keep.
+format_clean_summary_list() {
+    local list="" shown=0 total=0 entry
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        total=$((total + 1))
+        [[ $shown -lt 3 ]] || continue
+        [[ -n "$HOME" && "$entry" == "$HOME"/* ]] && entry="~${entry#"$HOME"}"
+        list+="${list:+, }${entry}"
+        shown=$((shown + 1))
+    done <<< "${1:-}"
+    [[ $total -le $shown ]] || list+=", +$((total - shown)) more"
+    printf '%s' "$list"
 }
 
 _clean_plan_normalize_path() {
@@ -466,20 +560,20 @@ _clean_plan_normalize_path() {
     printf '%s' "$path"
 }
 
-# Check a plan and a selection for `--apply`, then write the approved-items
-# file the sinks read (MOLE_APPLY_PLAN: kept paths, unticked paths and kept
-# commands with their recorded text) and collect the deselected paths that
-# become run-only whitelist entries. Refuses with a cause and a next action.
-clean_plan_prepare_apply() {
+# Check a plan and a selection for `--apply`: a plan of this user and command,
+# not expired, and a selection that names only its item ids. Sets
+# CLEAN_PLAN_SELECTED_IDS, CLEAN_PLAN_ID and the kept and item counts, with
+# the plan's records in CLEAN_PLAN_R_*. Refuses with a cause and a next action.
+clean_plan_load_selection() {
     local plan_id="$1"
     local select_file="$2"
-    local rerun="Run 'mo clean --dry-run --json' to create a new plan, then apply its plan_id."
+    local rerun="Run 'mo $CLEAN_PLAN_COMMAND --dry-run --json' to create a new plan, then apply its plan_id."
 
     # Plans are saved per user and never for a root run, so a root apply has
     # no plan of its own to read.
     if is_root_user; then
         _clean_plan_refuse "a reviewed plan is not applied by a root run." \
-            "Run 'mo clean --apply <plan_id> --select <file>' as your own user."
+            "Run 'mo $CLEAN_PLAN_COMMAND --apply <plan_id> --select <file>' as your own user."
         return 1
     fi
     if ! _clean_plan_valid_id "$plan_id"; then
@@ -491,42 +585,48 @@ clean_plan_prepare_apply() {
     plan_file="$dir/$plan_id.ledger"
     if [[ -L "$dir" || (-d "$dir" && ! -O "$dir") ]]; then
         _clean_plan_refuse "the plans folder $dir is a link or belongs to another user." \
-            "Remove it, then run 'mo clean --dry-run --json' again."
-        log_operation "clean" "SKIPPED" "$plan_file" "plan folder not owned"
+            "Remove it, then run 'mo $CLEAN_PLAN_COMMAND --dry-run --json' again."
+        log_operation "$CLEAN_PLAN_COMMAND" "SKIPPED" "$plan_file" "plan folder not owned"
         return 1
     fi
     if [[ -L "$plan_file" ]]; then
         _clean_plan_refuse "plan $plan_id is a symbolic link, not a plan Mole saved." \
             "Remove $plan_file. $rerun"
-        log_operation "clean" "SKIPPED" "$plan_file" "plan is a symlink"
+        log_operation "$CLEAN_PLAN_COMMAND" "SKIPPED" "$plan_file" "plan is a symlink"
         return 1
     fi
     if [[ ! -e "$plan_file" ]]; then
         _clean_plan_refuse "no plan $plan_id in $dir; it may have expired and been removed." "$rerun"
-        log_operation "clean" "SKIPPED" "$plan_file" "plan missing"
+        log_operation "$CLEAN_PLAN_COMMAND" "SKIPPED" "$plan_file" "plan missing"
         return 1
     fi
     if [[ ! -O "$plan_file" ]]; then
         _clean_plan_refuse "plan $plan_id belongs to another user." "$rerun"
-        log_operation "clean" "SKIPPED" "$plan_file" "plan owned by another user"
+        log_operation "$CLEAN_PLAN_COMMAND" "SKIPPED" "$plan_file" "plan owned by another user"
         return 1
     fi
     if [[ ! -f "$plan_file" ]] || ! _clean_plan_read "$plan_file"; then
         _clean_plan_refuse "plan $plan_id is not a complete Mole plan." "$rerun"
-        log_operation "clean" "SKIPPED" "$plan_file" "plan damaged"
+        log_operation "$CLEAN_PLAN_COMMAND" "SKIPPED" "$plan_file" "plan damaged"
+        return 1
+    fi
+    if [[ "$CLEAN_PLAN_R_COMMAND" != "$CLEAN_PLAN_COMMAND" ]]; then
+        _clean_plan_refuse "plan $plan_id was made by 'mo $CLEAN_PLAN_R_COMMAND --dry-run --json', not by mo $CLEAN_PLAN_COMMAND." \
+            "Apply it with 'mo $CLEAN_PLAN_R_COMMAND --apply $plan_id --select <file>', or run 'mo $CLEAN_PLAN_COMMAND --dry-run --json' for a $CLEAN_PLAN_COMMAND plan."
+        log_operation "$CLEAN_PLAN_COMMAND" "SKIPPED" "$plan_file" "plan of another command"
         return 1
     fi
     if [[ "$CLEAN_PLAN_R_UID" != "$(id -u)" ]]; then
         _clean_plan_refuse "plan $plan_id was saved by another user." "$rerun"
-        log_operation "clean" "SKIPPED" "$plan_file" "plan owned by another user"
+        log_operation "$CLEAN_PLAN_COMMAND" "SKIPPED" "$plan_file" "plan owned by another user"
         return 1
     fi
     local now
     now=$(date +%s)
     if ((now < CLEAN_PLAN_R_CREATED || now - CLEAN_PLAN_R_CREATED >= CLEAN_PLAN_TTL_SEC)); then
         _clean_plan_refuse "plan $plan_id expired at $(_clean_plan_iso_time "$((CLEAN_PLAN_R_CREATED + CLEAN_PLAN_TTL_SEC))"); plans last one hour." \
-            "Run 'mo clean --dry-run --json' again and review the new plan."
-        log_operation "clean" "SKIPPED" "$plan_file" "plan expired"
+            "Run 'mo $CLEAN_PLAN_COMMAND --dry-run --json' again and review the new plan."
+        log_operation "$CLEAN_PLAN_COMMAND" "SKIPPED" "$plan_file" "plan expired"
         return 1
     fi
 
@@ -563,9 +663,29 @@ clean_plan_prepare_apply() {
     done < "$select_file"
     if [[ $kept -eq 0 ]]; then
         _clean_plan_refuse "the selection file $select_file lists no items." \
-            "List the item ids to clean, one per line, or skip the clean."
+            "List the item ids to $CLEAN_PLAN_COMMAND, one per line, or skip the $CLEAN_PLAN_COMMAND."
         return 1
     fi
+    CLEAN_PLAN_SELECTED_IDS="$selected"
+    CLEAN_PLAN_ID="$plan_id"
+    CLEAN_APPLY_KEPT_COUNT=$kept
+    CLEAN_APPLY_ITEM_COUNT=$record_count
+}
+
+# Check a plan and a selection for `mo clean --apply`, then write the
+# approved-items file the sinks read (MOLE_APPLY_PLAN: kept paths, unticked
+# paths and kept commands with their recorded text) and collect the deselected
+# paths that become run-only whitelist entries. Refuses with a cause and a
+# next action.
+clean_plan_prepare_apply() {
+    local plan_id="$1"
+    local select_file="$2"
+    local rerun="Run 'mo $CLEAN_PLAN_COMMAND --dry-run --json' to create a new plan, then apply its plan_id."
+    clean_plan_load_selection "$plan_id" "$select_file" || return 1
+
+    local rs=$'\x1f'
+    local selected="$CLEAN_PLAN_SELECTED_IDS" idx
+    local record_count=${#CLEAN_PLAN_R_ID[@]}
 
     # Ancestors of kept paths stay out of the run-only whitelist: a whitelist
     # entry protects the children of a path too, which would keep a kept child.
@@ -603,9 +723,6 @@ clean_plan_prepare_apply() {
         printf 'END\0'
     } > "$approved"
 
-    CLEAN_PLAN_ID="$plan_id"
-    CLEAN_APPLY_KEPT_COUNT=$kept
-    CLEAN_APPLY_ITEM_COUNT=$record_count
     MOLE_APPLY_PLAN="$approved"
     export MOLE_APPLY_PLAN
     _mole_apply_plan_load || {

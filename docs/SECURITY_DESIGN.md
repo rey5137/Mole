@@ -130,6 +130,21 @@ the user unticked; anything else is logged `SKIPPED` as `not in reviewed plan`,
 before it removes. Owner commands run only when their own plan item was kept,
 and the automation-browser stop signals only the processes the preview listed.
 
+A reviewed `mo purge --apply <plan_id> --select <file>` reads a plan that
+`mo purge --dry-run --json` saved (the ledger names its command, so a clean
+plan is refused by purge and a purge plan by clean). It builds the removal
+list from the kept items only, refusing any whose recorded scan root is no
+longer a configured purge path, then runs each through the menu run's own
+rechecks (`_purge_remove_selected_items` in `lib/clean/project.sh`): the scan
+root's and the artifact's recorded dev:inode, containment in that recorded
+scan root (and, at the final guard, in the current purge paths),
+`is_protected_purge_artifact` (in use included), the activity recheck and
+`_mole_purge_final_remove_guard` at `safe_remove`, which also asks the same
+reviewed-plan gate. A refusal is logged `SKIPPED` with a fixed reason and
+listed in the summary, naming a failed Trash move as such; an unticked
+artifact is never handed to a sink. An artifact counts as already removed
+only while its scan root and reviewed parent folder are unchanged.
+
 ## Layer 2: `# SAFE: <reason>` contract for raw `rm`
 
 The validator is opt-in: a contributor could bypass it by writing `rm -rf`
@@ -209,8 +224,9 @@ Apple's `/usr/bin/trash` first, then an atomic no-overwrite rename into the
 per-volume Trash, and uses Finder AppleScript only as the last fallback.
 This gives users the standard Apple-native "Put Back" recovery flow.
 `mo clean`'s batched cleanup path, `mo purge`, and `mo installer` delete
-permanently unless `mo clean --trash` routes clean's user-level deletions
-through the same Trash mover (root-owned items, owner commands, `tmutil` and
+permanently unless `mo purge --trash` routes purge's removals, or
+`mo clean --trash` clean's user-level deletions,
+through the same Trash mover (under clean, root-owned items, owner commands, `tmutil` and
 `simctl` deletes are then skipped as `needs permanent delete` and listed in the
 summary, never removed); `mo uninstall --permanent` opts out of Trash, and
 `mo analyze` always uses Trash.

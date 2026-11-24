@@ -95,6 +95,9 @@ mo clean --dry-run --debug   # Vorschau + detaillierte Protokolle
 mo clean --dry-run --json    # Vorschau als JSON-Plan mit Element-IDs
 mo clean --apply <plan_id> --select kept.txt  # Nur die behaltenen Element-IDs bereinigen
 mo clean --trash             # Bereinigte Dateien in den Papierkorb legen
+mo purge --dry-run --json    # Vorschau als JSON-Plan mit Element-IDs
+mo purge --apply <plan_id> --select kept.txt  # Nur die behaltenen Element-IDs entfernen
+mo purge --trash             # Entfernte Build-Artefakte in den Papierkorb legen
 mo optimize --whitelist      # Geschützte Optimierungsregeln verwalten
 mo clean --whitelist         # Geschützte Cache-Pfade verwalten
 mo purge --paths             # Projekt-Suchpfade konfigurieren

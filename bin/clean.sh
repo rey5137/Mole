@@ -2290,24 +2290,6 @@ perform_cleanup() {
     return "$cleanup_cancel_rc"
 }
 
-# Up to three entries of a newline-separated list for a one-line summary note,
-# then ", +N more". Abbreviate $HOME: three absolute paths under
-# ~/Library/Developer already run past one terminal line, which is the width
-# these notes are capped to keep.
-format_clean_summary_list() {
-    local list="" shown=0 total=0 entry
-    while IFS= read -r entry; do
-        [[ -n "$entry" ]] || continue
-        total=$((total + 1))
-        [[ $shown -lt 3 ]] || continue
-        [[ -n "$HOME" && "$entry" == "$HOME"/* ]] && entry="~${entry#"$HOME"}"
-        list+="${list:+, }${entry}"
-        shown=$((shown + 1))
-    done <<< "${1:-}"
-    [[ $total -le $shown ]] || list+=", +$((total - shown)) more"
-    printf '%s' "$list"
-}
-
 run_cloud_and_office_cleanup() {
     local cleanup_rc=0
     local pending_clean_cancel=0

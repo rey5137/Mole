@@ -2433,6 +2433,43 @@ confirm_purge_cleanup() {
     esac
 }
 
+# Set by bin/purge.sh: PURGE_PLAN_RECORDS_FILE for `mo purge --dry-run --json`,
+# PURGE_APPLY_PLAN_ID for a reviewed `mo purge --apply`.
+PURGE_PLAN_RECORDS_FILE=""
+PURGE_APPLY_PLAN_ID=""
+PURGE_PLAN_SCAN_INCOMPLETE=false
+PURGE_APPLY_SKIPPED=""
+
+# A `--dry-run --json` preview lists an artifact it could not review as a
+# skipped row of the plan.
+_purge_plan_note_skipped() {
+    [[ -n "${PURGE_PLAN_RECORDS_FILE:-}" ]] || return 0
+    clean_plan_note_skipped "Project artifacts" "$1" "$2"
+}
+
+# A reviewed `--apply` logs each refusal as a SKIPPED row with a fixed reason
+# (unless the sink already logged it, $3) and lists it in the summary. The
+# menu run keeps its own output.
+_purge_note_review_skip() {
+    [[ -n "${PURGE_APPLY_PLAN_ID:-}" ]] || return 0
+    [[ "${3:-}" == "logged" ]] || log_operation "purge" "SKIPPED" "$1" "$2"
+    PURGE_APPLY_SKIPPED="${PURGE_APPLY_SKIPPED:+$PURGE_APPLY_SKIPPED
+}$(mole_tilde_path "$1") ($2)"
+}
+
+# The lexical parent of $1 still resolves to the physical folder $2 with the
+# dev:inode $3 recorded at review.
+_purge_reviewed_parent_unchanged() {
+    local path="$1" expected_parent="$2" expected_parent_id="$3"
+    [[ -n "$expected_parent" && -n "$expected_parent_id" ]] || return 1
+    local lexical_parent="${path%/*}" physical_parent="" parent_id=""
+    [[ -n "$lexical_parent" ]] || lexical_parent="/"
+    physical_parent=$(cd -P "$lexical_parent" 2> /dev/null && pwd -P) || return 1
+    [[ "$physical_parent" == "$expected_parent" ]] || return 1
+    parent_id=$("$STAT_BSD" -f '%d:%i' "$physical_parent" 2> /dev/null) || return 1
+    [[ "$parent_id" == "$expected_parent_id" ]]
+}
+
 # Main cleanup function - scans and prompts user to select artifacts to clean.
 # Normal outcomes return zero; the command renders the outcome and maps incomplete
 # work to failure. Signals and deletion-phase timeouts stop the run immediately.
@@ -2444,7 +2481,11 @@ clean_project_artifacts() {
         return 1
     fi
     PURGE_RUN_OUTCOME="completed"
-    [[ ${PURGE_DISCOVERY_STATUS:-0} -eq 0 ]] || PURGE_RUN_OUTCOME="incomplete"
+    PURGE_PLAN_SCAN_INCOMPLETE=false
+    if [[ ${PURGE_DISCOVERY_STATUS:-0} -ne 0 ]]; then
+        PURGE_RUN_OUTCOME="incomplete"
+        PURGE_PLAN_SCAN_INCOMPLETE=true
+    fi
     PURGE_UNKNOWN_SIZE_COUNT=0
     local -a all_found_items=()
     local -a safe_to_clean=()
@@ -2816,6 +2857,7 @@ clean_project_artifacts() {
     _restore_purge_scan_traps
     if [[ $failed_scan_count -gt 0 ]]; then
         PURGE_RUN_OUTCOME="incomplete"
+        PURGE_PLAN_SCAN_INCOMPLETE=true
         local root_text="root"
         [[ $failed_scan_count -ne 1 ]] && root_text="roots"
         echo ""
@@ -2983,6 +3025,7 @@ clean_project_artifacts() {
     fi
     for item in "${uninspected_paths[@]+"${uninspected_paths[@]}"}"; do
         echo -e "${YELLOW}${ICON_WARNING}${NC} Could not inspect $(mole_tilde_path "$item"); kept" >&2
+        _purge_plan_note_skipped "$item" "could not inspect"
     done
     if [[ ${#safe_to_clean[@]} -eq 0 ]]; then
         echo -e "${GRAY}No eligible project artifacts to purge${NC}"
@@ -3492,6 +3535,7 @@ clean_project_artifacts() {
     fi
     for item in "${size_failed_paths[@]+"${size_failed_paths[@]}"}"; do
         echo -e "${YELLOW}${ICON_WARNING}${NC} Could not measure $(mole_tilde_path "$item"); skipped" >&2
+        _purge_plan_note_skipped "$item" "could not measure"
     done
     # Exit early if no artifacts were found to avoid unbound variable errors
     # when expanding empty arrays with set -u active.
@@ -3505,6 +3549,13 @@ clean_project_artifacts() {
         fi
         printf '\n'
         return 0
+    fi
+    # `mo purge --dry-run --json` saves these rows as a reviewable plan
+    # (lib/clean/purge_plan.sh) instead of opening the menu or previewing
+    # removals.
+    if [[ -n "${PURGE_PLAN_RECORDS_FILE:-}" ]]; then
+        purge_plan_record_items
+        return $?
     fi
     # Set global vars for selector
     export PURGE_CATEGORY_SIZES=$(
@@ -3605,8 +3656,18 @@ clean_project_artifacts() {
 
     # Clean selected items
     echo ""
+    _purge_remove_selected_items
+}
+
+# Remove the selected rows of a purge review. Reads the caller's arrays
+# (selected_indices, item_*, scan_root*) through dynamic scope: the menu run
+# above and a reviewed `mo purge --apply` (lib/clean/purge_plan.sh) both end
+# here, so both pass the same scan-root, identity, protection, in-use and
+# activity rechecks and the same final sink.
+_purge_remove_selected_items() {
     local stats_dir="${XDG_CACHE_HOME:-$HOME/.cache}/mole"
     local cleaned_count=0
+    local already_removed_count=0
     local dry_run_mode="${MOLE_DRY_RUN:-0}"
     for idx in "${selected_indices[@]}"; do
         local item_path="${item_paths[idx]}"
@@ -3632,6 +3693,7 @@ clean_project_artifacts() {
             "${scan_root_parent_ids[$expected_scan_root_index]}" \
             "${scan_root_target_ids[$expected_scan_root_index]}"; then
             echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (scan root changed after review)"
+            _purge_note_review_skip "$item_path" "scan root changed since review"
             continue
         fi
         if ! _mole_path_matches_identity \
@@ -3640,17 +3702,30 @@ clean_project_artifacts() {
             "${scan_root_physical_parent_ids[$expected_scan_root_index]}" \
             "${scan_root_physical_target_ids[$expected_scan_root_index]}"; then
             echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (scan root target changed after review)"
+            _purge_note_review_skip "$item_path" "scan root changed since review"
+            continue
+        fi
+        # A reviewed plan applied twice finds its artifact already gone. Only
+        # when its scan root and its reviewed parent are both still in place:
+        # an artifact whose project was renamed or whose disk is gone was not
+        # removed, and falls through to the identity refusal below.
+        if [[ -n "${PURGE_APPLY_PLAN_ID:-}" && ! -e "$item_path" && ! -L "$item_path" ]] &&
+            _purge_reviewed_parent_unchanged "$item_path" "$expected_parent" "$expected_parent_id"; then
+            echo -e "${GRAY}${ICON_SUCCESS} $display_item_path already removed${NC}"
+            already_removed_count=$((already_removed_count + 1))
             continue
         fi
         if ! _mole_path_matches_identity \
             "$item_path" "$expected_parent" "$expected_parent_id" "$expected_target_id"; then
             echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (path changed after review)"
+            _purge_note_review_skip "$item_path" "changed since review"
             continue
         fi
         local current_item_physical_path="${_MOLE_PATH_SNAPSHOT_PARENT%/}/${item_path##*/}"
         [[ "$_MOLE_PATH_SNAPSHOT_PARENT" == "/" ]] && current_item_physical_path="/${item_path##*/}"
         if ! is_safe_project_artifact_under_root "$current_item_physical_path" "$expected_scan_root_physical"; then
             debug_log "Skipping purge target outside configured safe roots: ${item_path:-<empty>}"
+            _purge_note_review_skip "$item_path" "outside purge paths"
             continue
         fi
         local protection_rc=0
@@ -3663,10 +3738,13 @@ clean_project_artifacts() {
         if [[ $protection_rc -eq 0 ]]; then
             if [[ "$PURGE_PROTECTION_UNVERIFIED" == "true" ]]; then
                 echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (could not inspect contents; re-run mo purge to review it again)"
+                _purge_note_review_skip "$item_path" "could not inspect"
             elif [[ "${PURGE_PROTECTION_REASON:-}" == "in_use" ]]; then
                 echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (in use; stop what has it open, then run mo purge again)"
+                _purge_note_review_skip "$item_path" "in use"
             else
                 debug_log "Skipping purge target that became protected after review: $item_path"
+                _purge_note_review_skip "$item_path" "protected"
             fi
             continue
         fi
@@ -3679,6 +3757,7 @@ clean_project_artifacts() {
         fi
         if [[ $activity_status -ne 0 ]]; then
             echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (activity changed after review)"
+            _purge_note_review_skip "$item_path" "modified since review"
             continue
         fi
         if [[ -t 1 ]]; then
@@ -3721,10 +3800,22 @@ clean_project_artifacts() {
                     fi
                     return "$removal_status"
                 fi
-                if [[ "${PURGE_PROTECTION_REASON:-}" == "in_use" ]]; then
+                # safe_remove already logged its own SKIPPED or FAILED row.
+                if [[ "${_MOLE_SAFE_REMOVE_SKIP_REASON:-}" == "trash-failed" ]]; then
+                    echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (could not move to Trash; run without --trash, or give your terminal Full Disk Access)"
+                    _purge_note_review_skip "$item_path" "could not move to Trash" logged
+                elif [[ "${_MOLE_SAFE_REMOVE_SKIP_REASON:-}" == "already in Trash" ]]; then
+                    echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (already in the Trash; empty the Trash to free it)"
+                    _purge_note_review_skip "$item_path" "already in Trash" logged
+                elif [[ -n "${_MOLE_SAFE_REMOVE_SKIP_REASON:-}" ]]; then
+                    echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (${_MOLE_SAFE_REMOVE_SKIP_REASON}; run mo purge --dry-run --json again to review it)"
+                    _purge_note_review_skip "$item_path" "$_MOLE_SAFE_REMOVE_SKIP_REASON" logged
+                elif [[ "${PURGE_PROTECTION_REASON:-}" == "in_use" ]]; then
                     echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (in use; stop what has it open, then run mo purge again)"
+                    _purge_note_review_skip "$item_path" "in use" logged
                 else
                     echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (final removal check failed; re-run mo purge to review it again)"
+                    _purge_note_review_skip "$item_path" "final removal check failed" logged
                 fi
             fi
         fi
@@ -3741,7 +3832,7 @@ clean_project_artifacts() {
     done
     # Update count
     echo "$cleaned_count" > "$stats_dir/purge_count"
-    if [[ $cleaned_count -lt ${#selected_indices[@]} ]]; then
+    if [[ $((cleaned_count + already_removed_count)) -lt ${#selected_indices[@]} ]]; then
         PURGE_RUN_OUTCOME="incomplete"
     fi
     unset PURGE_CATEGORY_SIZES PURGE_RECENT_CATEGORIES PURGE_AGE_LABELS PURGE_SELECTION_RESULT

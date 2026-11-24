@@ -95,6 +95,9 @@ mo clean --dry-run --debug   # Попередній перегляд + докл�
 mo clean --dry-run --json    # Попередній перегляд як JSON-план з id
 mo clean --apply <plan_id> --select kept.txt  # Очистити лише залишені id
 mo clean --trash             # Переміщати очищені файли в Кошик
+mo purge --dry-run --json    # Попередній перегляд як JSON-план з id
+mo purge --apply <plan_id> --select kept.txt  # Видалити лише залишені id
+mo purge --trash             # Переміщати видалені артефакти в Кошик
 mo optimize --whitelist      # Керувати захищеними правилами оптимізації
 mo clean --whitelist         # Керувати захищеними кешами
 mo purge --paths             # Налаштувати теки для пошуку проєктів
