@@ -1710,7 +1710,7 @@ clean_dev_nix() {
 # of assumed roles and SSO sessions, and removing it signs the user out.
 clean_dev_cloud() {
     clean_github_cli_cache || return $?
-    safe_clean ~/.kube/cache/* "Kubernetes cache"
+    safe_clean ~/.kube/cache/discovery ~/.kube/cache/http "Kubernetes cache"
     safe_clean ~/.local/share/containers/storage/tmp/* "Container storage temp"
     safe_clean ~/.config/gcloud/logs/* "Google Cloud logs"
     safe_clean ~/.azure/logs/* "Azure CLI logs"

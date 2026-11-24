@@ -172,9 +172,57 @@ clean_trash() {
 # symlinked DENO_DIR retargeted afterwards makes the sink delete whatever the
 # root points at now. Failing closed here costs one skipped cache directory;
 # guessing costs the user's Deno state.
+# Brave cache and Dia HTTP/code cache rows own these roots, like Google.
+# Other Chromium roots remain sweepable once their SingletonLock owner exits;
+# keep Mole Mac's coveredCachePrefixes policy in mind when changing this table.
+_user_cache_browser_allowed() {
+    local candidate="${1:-}" root support policy entry rest
+    local -a browser_roots=(
+        'BraveSoftware|BraveSoftware/Brave-Browser|row'
+        'Dia|Dia/User Data|row'
+        'Microsoft Edge|Microsoft Edge|lock'
+        'Vivaldi|Vivaldi|lock'
+        'Arc|Arc/User Data|lock'
+        'Chromium|Chromium|lock'
+    )
+    for entry in "${browser_roots[@]}"; do
+        root="${entry%%|*}"
+        rest="${entry#*|}"
+        support="${rest%%|*}"
+        policy="${rest#*|}"
+        [[ "$candidate" == "$HOME/Library/Caches/$root" ]] || continue
+        if [[ "$policy" == row ]] || app_support_path_held_by_singleton "$HOME/Library/Application Support/$support"; then
+            return 1
+        fi
+        break
+    done
+    return 0
+}
+
+_user_chromium_cache_delete_guard() {
+    local candidate="${1:-}"
+    _MOLE_SAFE_CLEAN_SKIP_PATH=""
+    if app_support_path_held_by_singleton "$HOME/Library/Application Support/Chromium"; then
+        _MOLE_SAFE_CLEAN_SKIP_PATH="$candidate"
+        return 1
+    fi
+    return 0
+}
+
+_user_clean_chromium_cache() {
+    [[ -d "$HOME/Library/Caches/Chromium" ]] || return 0
+    local _MOLE_SAFE_REMOVE_FINAL_GUARD=_user_chromium_cache_delete_guard
+    safe_clean_guarded _user_chromium_cache_delete_guard ~/Library/Caches/Chromium/* "Chromium cache"
+}
+
 _user_cache_deno_delete_guard() {
     local candidate="${1:-}"
     [[ -n "$candidate" ]] || return 1
+    _MOLE_SAFE_CLEAN_SKIP_PATH=""
+    if ! _user_cache_browser_allowed "$candidate"; then
+        _MOLE_SAFE_CLEAN_SKIP_PATH="$candidate"
+        return 1
+    fi
 
     local deno_root=""
     deno_root=$(mole_deno_cache_root 2> /dev/null) || return 1
@@ -299,6 +347,7 @@ clean_user_essentials() {
             case "${user_cache_target##*/}" in
                 Google | mbx) continue ;;
             esac
+            _user_cache_browser_allowed "$user_cache_target" || continue
             case "$deno_cache_root" in
                 "$user_cache_target" | "$user_cache_target"/*) continue ;;
             esac
@@ -2191,7 +2240,7 @@ clean_browsers() {
     done
     safe_clean ~/Library/Application\ Support/Google/GoogleUpdater/crx_cache/* "GoogleUpdater CRX cache"
     safe_clean ~/Library/Application\ Support/Google/GoogleUpdater/*.old "GoogleUpdater old files"
-    safe_clean ~/Library/Caches/Chromium/* "Chromium cache"
+    _user_clean_chromium_cache
     safe_clean ~/Library/Caches/com.microsoft.edgemac/* "Edge cache"
     # Arc Browser.
     if [[ -d ~/Library/Application\ Support/Arc ]]; then

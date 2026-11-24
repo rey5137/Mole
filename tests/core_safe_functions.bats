@@ -187,14 +187,15 @@ if [[ "$HELPER" == sudo ]]; then
             "$STAT_BSD")
                 [[ "$STAGE" != identity ]] || return "$PROBE_RC"
                 printf 'IDENTITY:%s\n' "${*: -1}" >> "$TARGET_DIR/trace"
-                printf '1:2:3\n'
+                printf '1:2:3:8\n'
                 ;;
             xargs)
                 printf 'BATCH\n' >> "$TARGET_DIR/trace"
                 # Consume the producer's pipe before returning, like xargs.
                 cat > /dev/null
-                # Acknowledge the mocked batch without executing its command.
-                printf '%s\0%s\0' "$TARGET_DIR/first.log" "$TARGET_DIR/last.log"
+                # Acknowledge already-absent fixture paths without deleting
+                # the files this cancellation test checks after the call.
+                printf '1:%s\0' "$TARGET_DIR/first.log.removed" "$TARGET_DIR/last.log.removed"
                 ;;
             *) return 99 ;;
         esac
@@ -2044,6 +2045,132 @@ SCRIPT
     [ -f "$projects/-Users-me-app/0b6c9f0e-1111-4222-8333-944455556666.jsonl" ]
 }
 
+@test "#2092 privileged find totals include only removed matches and match preview" {
+    local target_dir="$TEST_DIR/issue2092"
+    mkdir -p "$target_dir"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" TARGET_DIR="$target_dir" /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/bin/clean.sh"
+helper_source=$(declare -f safe_sudo_find_delete)
+# shellcheck disable=SC2016 # Match the literal production guard.
+test_guard='[[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]]'
+helper_source=${helper_source/"$test_guard"/false}
+eval "$helper_source"
+_mole_privileged_path_has_mutable_ancestor() { return 1; }
+sudo() {
+    [[ "${1:-}" == -n ]] && shift
+    case "${1:-}" in
+        true) return 0 ;;
+        test) shift; command test "$@" ;;
+        find) printf '%s\0%s\0' "$TARGET_DIR/a.log" "$TARGET_DIR/b.log" ;;
+        du) [[ "${SIZE_TIMEOUT:-0}" != 1 ]] || return 124; printf '4\t%s\n' "${@: -1}" ;;
+        */stat) local identity; identity=$("$STAT_BSD" -f%d:%i:%m "${@: -1}"); printf '%s:8\n' "$identity" ;;
+        xargs)
+            local record rest path
+            while IFS= read -r -d '' record; do
+                rest="${record#*:}"; rest="${rest#*:}"; rest="${rest#*:}"
+                path="$rest"
+                case "$rest" in [0-9]*:* | unknown:*) path="${rest#*:}" ;; esac
+                if [[ "${SURVIVE:-0}" != 1 || "$path" != */b.log ]]; then
+                    /bin/rm -f -- "$path"
+                fi
+                printf '%s\0' "$rest"
+            done
+            ;;
+        *) "$@" ;;
+    esac
+}
+record_dry_run_cleanup_target() { files_cleaned=$((files_cleaned + $3)); total_size_cleaned=$((total_size_cleaned + $2)); }
+touch "$TARGET_DIR/a.log" "$TARGET_DIR/b.log"
+export MOLE_DRY_RUN=1
+safe_sudo_find_delete "$TARGET_DIR" '*.log' 0 f 1
+printf 'PREVIEW:%s:%s\n' "$files_cleaned" "$total_size_cleaned"
+export MOLE_DRY_RUN=0
+files_cleaned=0; total_size_cleaned=0; total_items=0
+safe_sudo_find_delete "$TARGET_DIR" '*.log' 0 f 1
+mole_add_cleaned_row "$MOLE_SAFE_SUDO_FIND_DELETE_COUNT" "$MOLE_SAFE_SUDO_FIND_DELETE_KB"
+printf 'REAL:%s:%s\n' "$files_cleaned" "$total_size_cleaned"
+touch "$TARGET_DIR/a.log" "$TARGET_DIR/b.log"
+export SURVIVE=1
+safe_sudo_find_delete "$TARGET_DIR" '*.log' 0 f 1 || :
+printf 'PARTIAL:%s:%s\n' "$MOLE_SAFE_SUDO_FIND_DELETE_COUNT" "$MOLE_SAFE_SUDO_FIND_DELETE_KB"
+[[ -e "$TARGET_DIR/b.log" ]] || exit 1
+touch "$TARGET_DIR/a.log" "$TARGET_DIR/b.log"
+export SURVIVE=0 SIZE_TIMEOUT=1
+safe_sudo_remove() { /bin/rm -f -- "$1"; }
+safe_sudo_find_delete "$TARGET_DIR" '*.log' 0 d 1
+printf 'TIMEOUT:%s:%s:%s\n' "$MOLE_SAFE_SUDO_FIND_DELETE_COUNT" "$MOLE_SAFE_SUDO_FIND_DELETE_KB" "$MOLE_CLEAN_SIZING_TIMEOUTS"
+SCRIPT
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *'TIMEOUT:2:0:2'* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *'PREVIEW:2:8'* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *'REAL:2:8'* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *'PARTIAL:1:4'* ]] || { echo "$output"; return 1; }
+}
+
+@test "#2092 system rows account partial searches once and do not double count previews" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/system.sh"
+files_cleaned=0; total_size_cleaned=0; total_items=0
+system_find_row_recorded=false
+safe_sudo_find_delete() {
+    MOLE_SAFE_SUDO_FIND_DELETE_COUNT=2
+    MOLE_SAFE_SUDO_FIND_DELETE_KB=7
+    [[ "$1" != partial ]]
+}
+_system_accounted_sudo_find_delete complete
+_system_accounted_sudo_find_delete partial || :
+printf 'ROW:%s:%s:%s\n' "$files_cleaned" "$total_size_cleaned" "$total_items"
+system_find_row_recorded=false
+_system_accounted_sudo_find_delete complete
+printf 'ROWS:%s:%s:%s\n' "$files_cleaned" "$total_size_cleaned" "$total_items"
+export MOLE_DRY_RUN=1
+_system_accounted_sudo_find_delete complete
+printf 'PREVIEW:%s:%s:%s\n' "$files_cleaned" "$total_size_cleaned" "$total_items"
+SCRIPT
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *'ROW:4:14:1'* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *'ROWS:6:21:2'* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *'PREVIEW:6:21:2'* ]] || { echo "$output"; return 1; }
+}
+
+@test "#2092 system cleanup adds find results to real totals" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/system.sh"
+files_cleaned=0; total_size_cleaned=0; total_items=0
+safe_sudo_find_delete() {
+    MOLE_SAFE_SUDO_FIND_DELETE_COUNT=0; MOLE_SAFE_SUDO_FIND_DELETE_KB=0
+    case "$1" in
+        /Library/Caches | /Library/Logs/DiagnosticReports | /private/var/log | /Library/Logs/Adobe | /Library/Logs/CreativeCloud | /Library/Logs | /private/var/db/diagnostics | /private/var/db/DiagnosticPipeline | /private/var/db/powerlog)
+            MOLE_SAFE_SUDO_FIND_DELETE_COUNT=2; MOLE_SAFE_SUDO_FIND_DELETE_KB=4 ;;
+    esac
+}
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+log_success() { :; }
+show_large_active_powerlog_notice() { :; }
+clean_browser_code_sign_clones() { :; }
+safe_sudo_remove() { return 1; }
+sudo() { return 1; }
+find() { return 0; }
+_mole_materialize_bounded_sudo_find() { : > "$1"; }
+run_with_timeout() {
+    shift
+    if [[ "${1:-}" == /usr/bin/find && "${2:-}" == /private/var/folders ]]; then return 0; fi
+    "$@"
+}
+clean_deep_system
+printf 'TOTAL:%s:%s:%s\n' "$files_cleaned" "$total_size_cleaned" "$total_items"
+SCRIPT
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *'TOTAL:18:36:6'* ]] || { echo "$output"; return 1; }
+}
+
 @test "safe_sudo_find_delete dry run records targets once and tracks count (#1865)" {
     local target_dir="$TEST_DIR/sudo-find-dry-run-once"
     mkdir -p "$target_dir"
@@ -3000,9 +3127,11 @@ case "${1:-}" in
         IFS= read -r -d '' record || exit 1
         rest=${record#*:}
         rest=${rest#*:}
+        rest=${rest#*:}
+        size=${rest%%:*}
         path=${rest#*:}
         /bin/rm -f -- "$path" || exit 1
-        printf '%s\0' "$path"
+        printf '%s:%s\0' "$size" "$path"
         exec sleep 4
         ;;
     *) exit 99 ;;
@@ -3059,7 +3188,7 @@ sudo() {
                 i=$((i + 1))
             done
             ;;
-        */stat) printf '1:2:3\n' ;;
+        */stat) printf '1:2:3:8\n' ;;
         xargs)
             printf 'UNEXPECTED_BATCH:%s\n' "$*"
             return 99
@@ -3109,7 +3238,7 @@ sudo() {
             printf '%s\0' "$active_db" "$active_db-wal" "$active_db-shm" "$active_dot_alias" "$active_case_alias" "$archived_db" "$xcode_db"
             ;;
         */stat)
-            printf '1:2:3\n'
+            printf '1:2:3:8\n'
             ;;
         xargs)
             while IFS= read -r -d '' record; do
@@ -4204,4 +4333,74 @@ done
 EOF
 
     [[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+}
+
+check_2092_review() {
+    local scenario="$1" fixture="$TEST_DIR/review-$1"
+    mkdir -p "$fixture"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" TARGET_DIR="$fixture" SCENARIO="$scenario" /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+helper_source=$(declare -f safe_sudo_find_delete)
+# shellcheck disable=SC2016 # Match the literal production guard.
+test_guard='[[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]]'
+helper_source=${helper_source/"$test_guard"/false}
+eval "$helper_source"
+_mole_privileged_path_has_mutable_ancestor() { [[ "$SCENARIO" == mutable ]]; }
+get_path_size_kb() { [[ "$3" == readable ]]; printf '4\n'; }
+safe_remove() { /bin/rm -f -- "$1"; }
+oplog_enabled() { return 0; }
+get_timestamp() { printf now; }
+append_log_lines() { shift; printf '%s\n' "$@" >> "$TARGET_DIR/log"; }
+log_operation() { printf '%s\n' "$*" >> "$TARGET_DIR/log"; }
+sudo() {
+    [[ "${1:-}" == -n ]] && shift
+    printf '%s\n' "${1:-}" >> "$TARGET_DIR/calls"
+    case "${1:-}" in
+        true) return 0 ;;
+        test) shift; command test "$@" ;;
+        find) printf '%s\0%s\0' "$TARGET_DIR/a.log" "$TARGET_DIR/b.log" ;;
+        du) printf '4\t%s\n' "${@: -1}" ;;
+        */stat) "$@" ;;
+        xargs)
+            local record rest path
+            while IFS= read -r -d '' record; do
+                rest="${record#*:}"; rest="${rest#*:}"; rest="${rest#*:}"
+                path="${rest#*:}"
+                /bin/rm -f -- "$path"
+                [[ "$SCENARIO" != recreated ]] || touch "$path"
+                printf '%s\0' "$rest"
+            done ;;
+        *) "$@" ;;
+    esac
+}
+dd if=/dev/zero of="$TARGET_DIR/a.log" bs=4096 count=1 2>/dev/null
+dd if=/dev/zero of="$TARGET_DIR/b.log" bs=4096 count=1 2>/dev/null
+blocks_a=$(/usr/bin/stat -f%b "$TARGET_DIR/a.log")
+blocks_b=$(/usr/bin/stat -f%b "$TARGET_DIR/b.log")
+printf 'EXPECTED:%s\n' "$(( (blocks_a + 1) / 2 + (blocks_b + 1) / 2 ))"
+rc=0
+safe_sudo_find_delete "$TARGET_DIR" '*.log' 0 f 1 || rc=$?
+printf 'RESULT:%s:%s:%s\n' "$rc" "$MOLE_SAFE_SUDO_FIND_DELETE_COUNT" "$MOLE_SAFE_SUDO_FIND_DELETE_KB"
+printf 'DU:%s\n' "$(grep -c '^du$' "$TARGET_DIR/calls" || :)"
+if [[ -f "$TARGET_DIR/log" ]]; then cat "$TARGET_DIR/log"; fi
+SCRIPT
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "#2092 review: mutable ancestors are sized without sudo" {
+    check_2092_review mutable
+    [[ "$output" == *'DU:0'* && "$output" == *'RESULT:0:2:8'* ]] || { echo "$output"; return 1; }
+}
+
+@test "#2092 review: recreated acknowledged files retain removal logs" {
+    check_2092_review recreated
+    [[ "$output" == *'RESULT:0:0:0'* && "$output" == *'/a.log (batch)'* && "$output" == *'/b.log (batch)'* && "$output" != *'FAILED '* ]] || { echo "$output"; return 1; }
+}
+
+@test "#2092 review: batch sizes use identity blocks without du" {
+    check_2092_review batch
+    local expected
+    expected=$(printf '%s\n' "$output" | sed -n 's/^EXPECTED://p')
+    [[ -n "$expected" && "$output" == *"RESULT:0:2:$expected"* && "$output" == *'DU:0'* ]] || { echo "$output"; return 1; }
 }

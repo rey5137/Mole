@@ -3709,6 +3709,7 @@ safe_sudo_find_delete() {
     # cleanup. It is reset for every invocation and updated only for confirmed
     # removals or accepted dry-run previews.
     MOLE_SAFE_SUDO_FIND_DELETE_COUNT=0
+    MOLE_SAFE_SUDO_FIND_DELETE_KB=0
 
     local pending_clean_cancel="${MOLE_CLEAN_CANCEL_STATUS:-0}"
     if [[ "${MOLE_CURRENT_COMMAND:-}" == "clean" ]] && mole_rc_timeout_or_signal "$pending_clean_cancel"; then
@@ -3921,10 +3922,12 @@ safe_sudo_find_delete() {
     # and preview output stay unchanged.
     local -a batch_files=()
     local -a batch_identities=()
+    local -a batch_sizes=()
     local max_batch_items=""
     max_batch_items=$(_mole_privileged_batch_max_items)
     [[ "$max_batch_items" =~ ^[1-9][0-9]*$ ]] || max_batch_items=4096
     local removed_count=0
+    local removed_kb=0
     local delete_rc=0
     local deadline_reached=false
     local batch_aborted=false
@@ -3956,6 +3959,7 @@ safe_sudo_find_delete() {
             break
         fi
         [[ $validation_rc -eq 0 ]] || continue
+        local real_size_kb=0 real_size_rc=0 real_size_raw="" real_size_timeout=""
         if _mole_privileged_path_has_mutable_ancestor "$match"; then
             # A privileged path-based delete cannot safely cross a directory
             # the invoking user can rename or replace. Delete only with the
@@ -3963,9 +3967,31 @@ safe_sudo_find_delete() {
             # they have no unprivileged identity to fall back to.
             if [[ ${EUID:-0} -ne 0 ]]; then
                 local mutable_rc=0
-                safe_remove "$match" true "" "$deadline_seconds" || mutable_rc=$?
-                if [[ $mutable_rc -eq 0 ]]; then
+                if [[ "${MOLE_DRY_RUN:-0}" != 1 ]]; then
+                    real_size_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_DISK_VERIFY_SEC" "$deadline_seconds") || real_size_rc=$?
+                    if [[ $real_size_rc -eq 0 ]]; then
+                        real_size_raw=$(get_path_size_kb "$match" "$real_size_timeout" readable 2> /dev/null) || real_size_rc=$?
+                    fi
+                    if [[ $real_size_rc -ge 128 ]]; then
+                        delete_rc=$real_size_rc
+                        break
+                    elif mole_rc_timeout "$real_size_rc"; then
+                        real_size_kb=unknown
+                    elif [[ $real_size_rc -eq 0 && "$real_size_raw" =~ ^[0-9]+$ ]]; then
+                        real_size_kb="$real_size_raw"
+                    fi
+                fi
+                local mutable_size="$real_size_kb"
+                [[ "${MOLE_DRY_RUN:-0}" != 1 ]] || mutable_size=""
+                [[ "$mutable_size" != unknown ]] || mutable_size=0
+                safe_remove "$match" true "$mutable_size" "$deadline_seconds" || mutable_rc=$?
+                if [[ $mutable_rc -eq 0 ]] && { [[ "${MOLE_DRY_RUN:-0}" == 1 ]] || [[ ! -e "$match" && ! -L "$match" ]]; }; then
                     removed_count=$((removed_count + 1))
+                    if [[ "$real_size_kb" == unknown ]]; then
+                        mole_item_size_continues 124
+                    else
+                        removed_kb=$((removed_kb + real_size_kb))
+                    fi
                 elif mole_rc_timeout_or_signal "$mutable_rc"; then
                     delete_rc=$mutable_rc
                     break
@@ -4020,13 +4046,13 @@ safe_sudo_find_delete() {
                 "$deadline_seconds") || identity_rc=$?
             if [[ $identity_rc -eq 0 ]]; then
                 match_identity=$(_mole_bounded_sudo "$identity_timeout" \
-                    -n "$STAT_BSD" -f%d:%i:%m "$match" < /dev/null 2> /dev/null) || identity_rc=$?
+                    -n "$STAT_BSD" -f%d:%i:%m:%b "$match" < /dev/null 2> /dev/null) || identity_rc=$?
             fi
             if mole_rc_timeout_or_signal "$identity_rc"; then
                 delete_rc=$identity_rc
                 break
             fi
-            if [[ $identity_rc -eq 0 && "$match_identity" =~ ^[0-9]+:[0-9]+:[0-9]+$ ]]; then
+            if [[ $identity_rc -eq 0 && "$match_identity" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+$ ]]; then
                 if [[ ${#batch_files[@]} -ge $max_batch_items ]]; then
                     debug_log "Privileged cleanup candidate limit reached for $base_dir"
                     delete_rc=1
@@ -4034,17 +4060,42 @@ safe_sudo_find_delete() {
                     break
                 fi
                 batch_files+=("$match")
-                batch_identities+=("$match_identity")
+                batch_identities+=("${match_identity%:*}")
+                batch_sizes+=("$(( (${match_identity##*:} + 1) / 2 ))")
             elif [[ $delete_rc -eq 0 ]]; then
                 delete_rc=${identity_rc:-1}
                 [[ $delete_rc -ne 0 ]] || delete_rc=1
             fi
             continue
         fi
+        if [[ "${MOLE_DRY_RUN:-0}" != "1" ]]; then
+            real_size_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_DISK_VERIFY_SEC" "$deadline_seconds") || real_size_rc=$?
+            if [[ $real_size_rc -eq 0 ]]; then
+                real_size_raw=$(_mole_bounded_sudo "$real_size_timeout" -n du -skP "$match" < /dev/null 2> /dev/null) || real_size_rc=$?
+            fi
+            if [[ $real_size_rc -ge 128 ]]; then
+                delete_rc=$real_size_rc
+                break
+            fi
+            if mole_rc_timeout "$real_size_rc"; then
+                debug_log "Sizing timed out: $match"
+                real_size_kb=unknown
+            elif [[ $real_size_rc -eq 0 ]]; then
+                real_size_raw="${real_size_raw%%[[:space:]]*}"
+                [[ "$real_size_raw" =~ ^[0-9]+$ ]] && real_size_kb="$real_size_raw"
+            fi
+        fi
         local single_rc=0
-        safe_sudo_remove "$match" "" "$deadline_seconds" || single_rc=$?
-        if [[ $single_rc -eq 0 ]]; then
+        local single_size="$real_size_kb"
+        [[ "$single_size" != unknown ]] || single_size=0
+        safe_sudo_remove "$match" "$single_size" "$deadline_seconds" || single_rc=$?
+        if [[ $single_rc -eq 0 && ! -e "$match" && ! -L "$match" ]]; then
             removed_count=$((removed_count + 1))
+            if [[ "$real_size_kb" == unknown ]]; then
+                mole_item_size_continues 124
+            else
+                removed_kb=$((removed_kb + real_size_kb))
+            fi
         elif mole_rc_timeout_or_signal "$single_rc"; then
             delete_rc=$single_rc
             break
@@ -4077,7 +4128,7 @@ safe_sudo_find_delete() {
             local -a batch_worker_records=()
             local batch_index=0
             for ((batch_index = 0; batch_index < ${#batch_files[@]}; batch_index++)); do
-                batch_worker_records+=("${batch_identities[$batch_index]}:${batch_files[$batch_index]}")
+                batch_worker_records+=("${batch_identities[$batch_index]}:${batch_sizes[$batch_index]}:${batch_files[$batch_index]}")
             done
             # shellcheck disable=SC2016 # $path expands inside privileged /bin/sh.
             printf '%s\0' "${batch_worker_records[@]}" |
@@ -4093,6 +4144,8 @@ safe_sudo_find_delete() {
                             ino=${rest%%:*}
                             rest=${rest#*:}
                             mtime=${rest%%:*}
+                            rest=${rest#*:}
+                            size=${rest%%:*}
                             path=${rest#*:}
                             expected=$dev:$ino:$mtime
                             if [ "$age_value" -gt 0 ]; then
@@ -4103,7 +4156,7 @@ safe_sudo_find_delete() {
                             fi
                             [ "$actual" = "$expected" ] || continue
                             /bin/rm -f -- "$path" || exit 1
-                            printf "%s\0" "$path"
+                            printf "%s:%s\0" "$size" "$path"
                         done
                     ' sh "$STAT_BSD" "$age_test" "$age_value" > "$batch_result_file" 2> /dev/null || batch_rc=$?
 
@@ -4116,15 +4169,21 @@ safe_sudo_find_delete() {
             local batch_ack_count=0
             local -a removed_lines=()
             local batch_file=""
+            local batch_size=""
             while IFS= read -r -d '' batch_file; do
+                batch_size="${batch_file%%:*}"
+                batch_file="${batch_file#*:}"
                 batch_ack_count=$((batch_ack_count + 1))
+                if [[ ! -e "$batch_file" && ! -L "$batch_file" ]]; then
+                    removed_count=$((removed_count + 1))
+                    removed_kb=$((removed_kb + batch_size))
+                fi
                 if [[ -n "$batch_ts" ]]; then
                     removed_lines+=("[$batch_ts] [$batch_command] REMOVED $batch_file (batch)")
                 fi
             done < "$batch_result_file"
             rm -f -- "$batch_result_file" 2> /dev/null || true # SAFE: exact tracked temp file created above
 
-            removed_count=$((removed_count + batch_ack_count))
             if [[ ${#removed_lines[@]} -gt 0 ]]; then
                 append_log_lines "$OPERATIONS_LOG_FILE" "${removed_lines[@]}"
             fi
@@ -4141,6 +4200,7 @@ safe_sudo_find_delete() {
     fi
 
     MOLE_SAFE_SUDO_FIND_DELETE_COUNT=$removed_count
+    MOLE_SAFE_SUDO_FIND_DELETE_KB=$removed_kb
 
     [[ $delete_rc -lt 128 ]] || _mole_record_clean_cancellation "$delete_rc"
     if [[ $restore_errexit -eq 1 ]]; then

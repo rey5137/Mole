@@ -306,6 +306,60 @@ EOF
     rm -rf "$test_home"
 }
 
+@test "#2094 browser cache roots respect dedicated rows and live singleton locks" {
+    local test_home="$HOME/browser-roots-home"
+    mkdir -p "$test_home/Library/Caches" "$test_home/Library/Application Support"
+    run env HOME="$test_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+clean_trash() { :; }
+_clean_recent_items() { :; }
+_clean_mail_downloads() { :; }
+safe_clean() {
+    local description="${!#}"
+    while [[ $# -gt 1 ]]; do
+        [[ "$description" != "User app cache" ]] || printf 'CLEAN:%s\n' "${1##*/}"
+        shift
+    done
+}
+safe_clean_guarded() { shift; safe_clean "$@"; }
+for root in BraveSoftware Dia 'Microsoft Edge' Vivaldi Arc Chromium; do
+    mkdir -p "$HOME/Library/Caches/$root"
+done
+for mode in live stopped; do
+    for support in 'Microsoft Edge' Vivaldi 'Arc/User Data' Chromium; do
+        mkdir -p "$HOME/Library/Application Support/$support"
+        if [[ "$mode" == live ]]; then
+            ln -s "host-$$" "$HOME/Library/Application Support/$support/SingletonLock"
+        else
+            rm -f "$HOME/Library/Application Support/$support/SingletonLock"
+        fi
+    done
+    printf 'MODE:%s\n' "$mode"
+    clean_user_essentials
+done
+ln -s "host-$$" "$HOME/Library/Application Support/Chromium/SingletonLock"
+if _user_cache_deno_delete_guard "$HOME/Library/Caches/Chromium"; then exit 1; fi
+if _user_chromium_cache_delete_guard "$HOME/Library/Caches/Chromium/file"; then exit 1; fi
+printf 'FINAL-GUARDS:kept\n'
+SCRIPT
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *'FINAL-GUARDS:kept'* ]] || return 1
+    local live="${output%%MODE:stopped*}" stopped="${output#*MODE:stopped}"
+    for root in BraveSoftware Dia 'Microsoft Edge' Vivaldi Arc Chromium; do
+        [[ "$live" != *"CLEAN:$root"* ]] || { echo "$output"; return 1; }
+    done
+    for root in BraveSoftware Dia; do
+        [[ "$stopped" != *"CLEAN:$root"* ]] || { echo "$output"; return 1; }
+    done
+    for root in 'Microsoft Edge' Vivaldi Arc Chromium; do
+        [[ "$stopped" == *"CLEAN:$root"* ]] || { echo "$output"; return 1; }
+    done
+}
+
 @test "clean_user_essentials leaves Caches/Google to the Chrome and Android Studio rows" {
     # Swept whole, the folder took Chrome's live cache while Chrome ran and
     # failed every run (2026-10-28 diagnose bundle).

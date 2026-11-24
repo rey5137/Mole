@@ -264,21 +264,38 @@ macos_installer_candidate_still_eligible() {
 }
 
 # System caches, logs, and temp files.
+# One displayed system row can run several bounded searches. Account each
+# completed prefix, including on interruption, while counting the row once.
+_system_accounted_sudo_find_delete() {
+    local rc=0
+    safe_sudo_find_delete "$@" || rc=$?
+    if [[ "${MOLE_DRY_RUN:-0}" != 1 && "${DRY_RUN:-false}" != true && ${MOLE_SAFE_SUDO_FIND_DELETE_COUNT:-0} -gt 0 ]]; then
+        mole_add_cleaned_row "$MOLE_SAFE_SUDO_FIND_DELETE_COUNT" "${MOLE_SAFE_SUDO_FIND_DELETE_KB:-0}"
+        if [[ "$system_find_row_recorded" == true ]]; then
+            total_items=$((total_items - 1))
+        fi
+        system_find_row_recorded=true
+    fi
+    return "$rc"
+}
+
 clean_deep_system() {
     stop_section_spinner
     # Keep the section bounded as a whole as well as at each inner scan. A
     # single slow filesystem may consume one inner timeout, but later families
     # stop once the two-minute section budget is exhausted.
     local system_cleanup_deadline=$((SECONDS + 120))
+    local system_find_row_recorded=false
     local cache_cleaned=0
     local cache_status=0
+    system_find_row_recorded=false
     start_section_spinner "Cleaning system caches..."
     local -a cache_extra_patterns=("*.tmp")
     if [[ "$MOLE_LOG_AGE_DAYS" -eq "$MOLE_TEMP_FILE_AGE_DAYS" ]]; then
         cache_extra_patterns+=("*.log")
     fi
     local cache_rc=0
-    safe_sudo_find_delete "/Library/Caches" "*.cache" "$MOLE_TEMP_FILE_AGE_DAYS" "f" "5" \
+    _system_accounted_sudo_find_delete "/Library/Caches" "*.cache" "$MOLE_TEMP_FILE_AGE_DAYS" "f" "5" \
         "$system_cleanup_deadline" "${cache_extra_patterns[@]}" || cache_rc=$?
     if [[ $cache_rc -ge 128 ]]; then
         stop_section_spinner
@@ -294,7 +311,7 @@ clean_deep_system() {
     if [[ "$MOLE_LOG_AGE_DAYS" -ne "$MOLE_TEMP_FILE_AGE_DAYS" && $cache_rc -eq 0 ]] &&
         ! system_cleanup_budget_reached "$system_cleanup_deadline"; then
         cache_rc=0
-        safe_sudo_find_delete "/Library/Caches" "*.log" "$MOLE_LOG_AGE_DAYS" "f" "5" \
+        _system_accounted_sudo_find_delete "/Library/Caches" "*.log" "$MOLE_LOG_AGE_DAYS" "f" "5" \
             "$system_cleanup_deadline" || cache_rc=$?
         if [[ $cache_rc -ge 128 ]]; then
             stop_section_spinner
@@ -319,9 +336,10 @@ clean_deep_system() {
     # Do not sweep generic /private/tmp or /private/var/tmp contents here.
     # Age and a bounded scan do not prove third-party runtime state is
     # disposable, and large shared temp roots made this section look hung.
+    system_find_row_recorded=false
     start_section_spinner "Cleaning system crash reports..."
     local crash_rc=0
-    safe_sudo_find_delete "/Library/Logs/DiagnosticReports" "*" \
+    _system_accounted_sudo_find_delete "/Library/Logs/DiagnosticReports" "*" \
         "$MOLE_CRASH_REPORT_AGE_DAYS" "f" "1" "$system_cleanup_deadline" || crash_rc=$?
     if [[ $crash_rc -ge 128 ]]; then
         stop_section_spinner
@@ -339,11 +357,12 @@ clean_deep_system() {
         report_system_cleanup_budget_reached
         return 0
     fi
+    system_find_row_recorded=false
     start_section_spinner "Cleaning system logs..."
     local system_logs_cleaned=0
     local system_logs_status=0
     local system_log_rc=0
-    safe_sudo_find_delete "/private/var/log" "*.log" "$MOLE_LOG_AGE_DAYS" \
+    _system_accounted_sudo_find_delete "/private/var/log" "*.log" "$MOLE_LOG_AGE_DAYS" \
         "f" "3" "$system_cleanup_deadline" "*.gz" "*.asl" || system_log_rc=$?
     if [[ $system_log_rc -ge 128 ]]; then
         stop_section_spinner
@@ -365,6 +384,7 @@ clean_deep_system() {
         report_system_cleanup_budget_reached
         return 0
     fi
+    system_find_row_recorded=false
     start_section_spinner "Cleaning third-party system logs..."
     local -a third_party_log_dirs=(
         "/Library/Logs/Adobe"
@@ -379,7 +399,7 @@ clean_deep_system() {
             break
         fi
         local third_party_rc=0
-        safe_sudo_find_delete "$third_party_log_dir" "*" "$MOLE_LOG_AGE_DAYS" "f" "5" \
+        _system_accounted_sudo_find_delete "$third_party_log_dir" "*" "$MOLE_LOG_AGE_DAYS" "f" "5" \
             "$system_cleanup_deadline" || third_party_rc=$?
         if [[ $third_party_rc -ge 128 ]]; then
             stop_section_spinner
@@ -398,7 +418,7 @@ clean_deep_system() {
         fi
     else
         local adobegc_rc=0
-        safe_sudo_find_delete "/Library/Logs" "adobegc.log" "$MOLE_LOG_AGE_DAYS" "f" "1" \
+        _system_accounted_sudo_find_delete "/Library/Logs" "adobegc.log" "$MOLE_LOG_AGE_DAYS" "f" "1" \
             "$system_cleanup_deadline" || adobegc_rc=$?
         if [[ $adobegc_rc -ge 128 ]]; then
             stop_section_spinner
@@ -727,6 +747,7 @@ clean_deep_system() {
     # re-fetches assets on demand, so the removal is non-destructive. The locator
     # needs sudo because the whole tree is root-owned; safe_sudo_find_delete then
     # re-applies the shared protection and whitelist gates per file.
+    system_find_row_recorded=false
     start_section_spinner "Scanning stale wallpaper downloads..."
     local idle_tmp_cleaned=0
     local idle_tmp_status=0
@@ -747,7 +768,7 @@ clean_deep_system() {
                     break
                 fi
                 local idle_tmp_rc=0
-                safe_sudo_find_delete "$idle_tmp_dir" "CFNetworkDownload_*.tmp" \
+                _system_accounted_sudo_find_delete "$idle_tmp_dir" "CFNetworkDownload_*.tmp" \
                     "60m" "f" "5" "$system_cleanup_deadline" || idle_tmp_rc=$?
                 if [[ $idle_tmp_rc -ge 128 ]]; then
                     idle_tmp_status=$idle_tmp_rc
@@ -780,11 +801,12 @@ clean_deep_system() {
     fi
 
     local diag_base="/private/var/db/diagnostics"
+    system_find_row_recorded=false
     start_section_spinner "Cleaning system diagnostic logs..."
     local diag_cleaned=0
     local diag_status=0
     local diag_rc=0
-    safe_sudo_find_delete "$diag_base" "*" "$MOLE_LOG_AGE_DAYS" "f" "5" \
+    _system_accounted_sudo_find_delete "$diag_base" "*" "$MOLE_LOG_AGE_DAYS" "f" "5" \
         "$system_cleanup_deadline" || diag_rc=$?
     if [[ $diag_rc -ge 128 ]]; then
         stop_section_spinner
@@ -801,7 +823,7 @@ clean_deep_system() {
         fi
     else
         diag_rc=0
-        safe_sudo_find_delete "/private/var/db/DiagnosticPipeline" "*" \
+        _system_accounted_sudo_find_delete "/private/var/db/DiagnosticPipeline" "*" \
             "$MOLE_LOG_AGE_DAYS" "f" "5" "$system_cleanup_deadline" || diag_rc=$?
         if [[ $diag_rc -ge 128 ]]; then
             stop_section_spinner
@@ -825,9 +847,10 @@ clean_deep_system() {
         return 0
     fi
 
+    system_find_row_recorded=false
     start_section_spinner "Cleaning power logs..."
     local power_rc=0
-    safe_sudo_find_delete "/private/var/db/powerlog" "*" "$MOLE_LOG_AGE_DAYS" "f" "5" \
+    _system_accounted_sudo_find_delete "/private/var/db/powerlog" "*" "$MOLE_LOG_AGE_DAYS" "f" "5" \
         "$system_cleanup_deadline" || power_rc=$?
     if [[ $power_rc -ge 128 ]]; then
         stop_section_spinner
@@ -850,6 +873,7 @@ clean_deep_system() {
     if [[ $power_notice_rc -ge 128 ]]; then
         return "$power_notice_rc"
     fi
+    system_find_row_recorded=false
     start_section_spinner "Cleaning memory exception reports..."
     local mem_reports_dir="/private/var/db/reportmemoryexception/MemoryLimitViolations"
     local mem_cleaned=0
@@ -886,7 +910,7 @@ clean_deep_system() {
     if system_cleanup_budget_reached "$system_cleanup_deadline"; then
         mem_rc=124
     else
-        safe_sudo_find_delete "$mem_reports_dir" "*" "30" "f" "5" \
+        _system_accounted_sudo_find_delete "$mem_reports_dir" "*" "30" "f" "5" \
             "$system_cleanup_deadline" || mem_rc=$?
     fi
     if [[ $mem_rc -ge 128 ]]; then

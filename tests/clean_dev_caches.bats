@@ -5587,3 +5587,37 @@ EOF
     # The first cache's command ran; the interrupt stops the second one.
     [[ "$output" == *"RAN=1"* ]] || { echo "$output"; return 1; }
 }
+
+@test "#2096 Kubernetes cleanup keeps credential plugin caches in preview and real runs" {
+    local cache="$HOME/.kube/cache" mode
+    mkdir -p "$cache"/{discovery,http,oidc-login,kubelogin,aws-iam-authenticator}
+    for mode in preview real; do
+        run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" CLEAN_MODE="$mode" /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+source "$PROJECT_ROOT/bin/clean.sh"
+clean_github_cli_cache() { :; }
+if [[ "$CLEAN_MODE" == preview ]]; then
+    DRY_RUN=true
+    MOLE_DRY_RUN=1
+    record_dry_run_cleanup_target() { printf 'TARGET:%s\n' "${1##*/}"; }
+else
+    DRY_RUN=false
+    MOLE_DRY_RUN=0
+fi
+safe_clean() {
+    [[ "${!#}" == "Kubernetes cache" ]] || return 0
+    _safe_clean_impl "" "$@"
+}
+clean_dev_cloud
+SCRIPT
+        [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+        if [ "$mode" = preview ]; then
+            [[ "$output" == *"TARGET:discovery"* && "$output" == *"TARGET:http"* ]] || { echo "$output"; return 1; }
+            [[ "$output" != *"TARGET:oidc-login"* && "$output" != *"TARGET:kubelogin"* && "$output" != *"TARGET:aws-iam-authenticator"* ]] || return 1
+        fi
+    done
+    [ ! -e "$cache/discovery" ] && [ ! -e "$cache/http" ]
+    [ -d "$cache/oidc-login" ] && [ -d "$cache/kubelogin" ] && [ -d "$cache/aws-iam-authenticator" ]
+}
