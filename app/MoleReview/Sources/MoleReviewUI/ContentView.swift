@@ -8,6 +8,8 @@ public struct ContentView: View {
 
     public var body: some View {
         VStack(spacing: 0) {
+            TabBar()
+            Divider()
             switch model.phase {
             case .idle: IdleView()
             case .scanning, .applying: ProgressPane()
@@ -19,14 +21,52 @@ public struct ContentView: View {
     }
 }
 
+/// Clean / Purge / Installer. Each tab keeps its own plan, selection and result.
+struct TabBar: View {
+    @EnvironmentObject var model: AppModel
+    @Environment(\.renderStandIn) private var standIn
+    private func label(_ c: MoleCommand) -> String {
+        model.tabs[c]?.busy == true ? c.title + " •" : c.title
+    }
+    var body: some View {
+        HStack {
+            Spacer()
+            if standIn {
+                HStack(spacing: 2) {
+                    ForEach(MoleCommand.allCases) { c in
+                        Text(label(c)).padding(.horizontal, 14).padding(.vertical, 3)
+                            .background(RoundedRectangle(cornerRadius: 5)
+                                .fill(c == model.command ? Color.gray.opacity(0.45) : Color.clear))
+                    }
+                }.padding(2).background(RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.2)))
+            } else {
+                Picker("Command", selection: $model.command) {
+                    ForEach(MoleCommand.allCases) { c in Text(label(c)).tag(c) }
+                }.pickerStyle(.segmented).labelsHidden().fixedSize()
+            }
+            Spacer()
+        }.padding(.vertical, 8)
+    }
+}
+
+extension MoleCommand {
+    var blurb: String {
+        switch self {
+        case .clean: return "Scan, tick what to clean, confirm. Nothing is deleted until you confirm."
+        case .purge: return "Find build folders (node_modules, target, dist…) in your purge paths, tick, confirm. Nothing is deleted until you confirm."
+        case .installer: return "Find installer files (.dmg, .pkg, .iso…) in Downloads and similar folders, tick, confirm. Nothing is deleted until you confirm."
+        }
+    }
+}
+
 struct IdleView: View {
     @EnvironmentObject var model: AppModel
     var body: some View {
         VStack(spacing: 12) {
             Spacer()
-            Text("Mole Review").font(.largeTitle)
-            Text("Scan, tick what to clean, confirm. Nothing is deleted until you confirm.")
-                .foregroundStyle(.secondary)
+            Text("Mole Review: \(model.command.title)").font(.largeTitle)
+            Text(model.command.blurb)
+                .foregroundStyle(.secondary).multilineTextAlignment(.center)
             if let e = model.errorText {
                 Text(e).foregroundStyle(.red).textSelection(.enabled).multilineTextAlignment(.center).padding(.horizontal)
             }
@@ -64,7 +104,7 @@ struct ProgressPane: View {
         VStack(spacing: 12) {
             Spacer()
             Spinner()
-            Text(model.phase == .scanning ? "Scanning…" : "Cleaning…").font(.title2)
+            Text(model.phase == .scanning ? "Scanning…" : model.command.progress).font(.title2)
             Text("Elapsed \(Format.countdown(model.elapsed))").foregroundStyle(.secondary)
             Button("Cancel") { model.cancel() }.modifier(ButtonLook())
             Spacer()
@@ -111,7 +151,7 @@ struct HeaderBar: View {
         HStack(alignment: .firstTextBaseline, spacing: 16) {
             VStack(alignment: .leading) {
                 Text("\(Format.bytes(state.selectedBytes)) of \(Format.bytes(state.plan.totalBytes)) selected").font(.headline)
-                Text("\(state.selectedItems) of \(state.plan.totalItems) items" +
+                Text("\(state.itemCounts.selected) of \(state.itemCounts.total) items" +
                      (state.plan.freeBytes.map { " · \(Format.bytes($0)) free" } ?? ""))
                     .font(.caption).foregroundStyle(.secondary)
             }
@@ -120,11 +160,14 @@ struct HeaderBar: View {
                 Text("Plan expired").foregroundStyle(.red)
                 Button("Scan again") { model.scan() }.modifier(ButtonLook())
             } else {
+                if let other = model.applyingCommand, other != model.command {
+                    Text("Waiting for mo \(other.rawValue) to finish").font(.caption).foregroundStyle(.orange)
+                }
                 Text("Expires in \(Format.countdown(state.remaining(now: model.now)))").font(.caption).foregroundStyle(.secondary)
                 Button("Scan again") { model.scan() }.modifier(ButtonLook())
-                Button("Clean…") { model.showConfirm = true }
+                Button("\(model.command.action)…") { model.showConfirm = true }
                     .modifier(ButtonLook(prominent: true))
-                    .disabled(!state.canClean(now: model.now))
+                    .disabled(!model.canApply)
             }
         }.padding()
     }
@@ -172,21 +215,26 @@ struct ItemRow: View {
 
     var body: some View {
         let item = row.item
-        let on = model.review?.isSelected(item) ?? false
+        let state = model.review
+        let on = state?.isSelected(item) ?? false
+        let supported = state?.isSupported(item) ?? false
         HStack {
             if row.indented { Spacer().frame(width: 24) }
-            if item.isCovered {
-                Image(systemName: on ? "checkmark.square" : "square").foregroundStyle(.secondary)
-            } else {
+            if state?.isTickable(item) == true {
                 Button { model.review?.toggle(item.id) } label: {
                     Image(systemName: on ? "checkmark.square.fill" : "square")
                 }.buttonStyle(.plain)
+            } else {
+                Image(systemName: on ? "checkmark.square" : "square").foregroundStyle(.secondary)
             }
-            VStack(alignment: .leading) {
-                Text(item.isCommand ? item.title : Format.abbreviate(item.title))
+            VStack(alignment: .leading, spacing: 1) {
+                Text(primary(item))
                     .lineLimit(1).truncationMode(.middle)
-                    .foregroundStyle(item.isCovered ? .secondary : .primary)
-                if item.isCovered { Text("covered by the folder above, not counted").font(.caption2).foregroundStyle(.secondary) }
+                    .foregroundStyle(item.followsParent || !supported ? .secondary : .primary)
+                ForEach(notes(item, state: state), id: \.text) { n in
+                    Text(n.text).font(.caption2).foregroundStyle(n.warn ? Color.orange : Color.secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                }
             }
             Spacer()
             if item.count > 1 { Text("\(item.count) items").font(.caption).foregroundStyle(.secondary) }
@@ -204,6 +252,37 @@ struct ItemRow: View {
             }
         }
     }
+
+    private func primary(_ item: PlanItem) -> String {
+        if item.isTrim { return PlanItem.trimLabel }
+        if let name = item.name, item.type != nil { return name }
+        return item.isCommand ? item.title : Format.abbreviate(item.title)
+    }
+
+    private struct Note { let text: String; var warn = false }
+
+    private func notes(_ item: PlanItem, state: ReviewState?) -> [Note] {
+        var out: [Note] = []
+        if state?.isSupported(item) == false {
+            out.append(Note(text: "\(item.kind) item: not supported by this app version", warn: true))
+            return out
+        }
+        if item.followsParent { out.append(Note(text: "covered by the folder above, not counted")) }
+        if item.isTrim {
+            out.append(Note(text: state?.isIncludedByParent(item) == true
+                            ? "included: the whole folder above is ticked"
+                            : "keeps the folder; \(Format.abbreviate(item.title))"))
+        } else if let artifact = item.artifact {
+            out.append(Note(text: [artifact, item.age.map { "last used \($0)" }].compactMap { $0 }.joined(separator: " · ")))
+        }
+        if let type = item.type {
+            out.append(Note(text: type.uppercased() + " · " + Format.abbreviate((item.path ?? "") as String)))
+        }
+        if item.isCloud && !item.isTrim {
+            out.append(Note(text: "In a cloud-synced folder: removing it also removes it from the cloud copy", warn: true))
+        }
+        return out
+    }
 }
 
 public struct ConfirmSheet: View {
@@ -213,10 +292,15 @@ public struct ConfirmSheet: View {
         let s = model.review
         let bytes = Format.bytes(s?.selectedBytes ?? 0)
         let cmds = s?.selectedCommandCount ?? 0
+        let cloud = s?.selectedCloudCount ?? 0
         VStack(alignment: .leading, spacing: 12) {
-            Text("Clean \(s?.selectedRowCount ?? 0) items?").font(.title2)
-            Text("\(s?.selectedItems ?? 0) files, \(bytes) in total")
+            Text("\(model.command.action) \(s?.selectedRowCount ?? 0) items?").font(.title2)
+            Text(model.command == .clean ? "\(s?.selectedItems ?? 0) files, \(bytes) in total" : "\(bytes) in total")
             CheckToggle("Move to Trash (recoverable)", isOn: $model.useTrash)
+            if cloud > 0 {
+                Text("\(cloud) of them \(cloud == 1 ? "is" : "are") in a cloud-synced folder; removing \(cloud == 1 ? "it" : "them") also removes \(cloud == 1 ? "it" : "them") from the cloud copy.")
+                    .font(.callout).foregroundStyle(.orange)
+            }
             if cmds > 0 {
                 let names = (s?.selectedCommandNames ?? []).joined(separator: ", ")
                 Text(model.useTrash
@@ -235,7 +319,7 @@ public struct ConfirmSheet: View {
                 Button("Cancel", role: .cancel) { model.showConfirm = false }.keyboardShortcut(.cancelAction).modifier(ButtonLook())
                 Button(model.useTrash ? "Move \(bytes) to Trash" : "Delete \(bytes) permanently", role: .destructive) { model.apply() }
                     .keyboardShortcut(.defaultAction).modifier(ButtonLook(prominent: true, destructive: true))
-                    .disabled(!(s?.canClean(now: model.now) ?? false))
+                    .disabled(!model.canApply)
             }
         }.padding(20).frame(width: 460)
     }
@@ -249,7 +333,8 @@ struct ResultView: View {
             Text(r?.exitCode == 0 ? "Done" : "Finished with errors (exit \(r?.exitCode ?? -1))").font(.title)
             if let n = r?.failureNote { Text(n).foregroundStyle(.red) }
             if let s = r?.session {
-                Text("\(s.sizeBytes.map(Format.bytes) ?? s.sizeText) over \(s.items) items: \(s.removed) removed, \(s.trashed) moved to Trash, \(s.skipped) skipped, \(s.failed) failed")
+                let counts = "\(s.removed) removed, \(s.trashed) moved to Trash, \(s.skipped) skipped, \(s.failed) failed"
+                Text(s.sizeText.isEmpty ? counts : "\(s.sizeBytes.map(Format.bytes) ?? s.sizeText) over \(s.items) items: " + counts)
             } else if (r?.notes ?? []).isEmpty {
                 Text("No history session matched this run; see Details.").foregroundStyle(.secondary)
             }

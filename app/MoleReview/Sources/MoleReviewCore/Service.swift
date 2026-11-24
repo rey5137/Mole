@@ -50,22 +50,31 @@ public enum ScanOutcome: Equatable {
 }
 
 public enum MoleService {
-    public static let scanArguments = ["clean", "--dry-run", "--json"]
-
-    public static func applyArguments(planId: String, selectFile: String, trash: Bool) -> [String] {
-        ["clean", "--apply", planId, "--select", selectFile] + (trash ? ["--trash"] : [])
+    public static func scanArguments(_ command: MoleCommand) -> [String] {
+        [command.rawValue, "--dry-run", "--json"]
     }
 
-    public static func interpretScan(_ r: RunResult) -> ScanOutcome {
+    public static func applyArguments(_ command: MoleCommand, planId: String, selectFile: String, trash: Bool) -> [String] {
+        [command.rawValue, "--apply", planId, "--select", selectFile] + (trash ? ["--trash"] : [])
+    }
+
+    /// A plan made by another command is refused: its ids name another command's items.
+    public static func interpretScan(_ r: RunResult, command: MoleCommand) -> ScanOutcome {
         if let e = r.launchError { return .failed(e) }
         if r.cancelled { return .cancelled }
         switch try? PlanDocument.decode(r.stdout) {
-        case .plan(let p)?: return .plan(p)
+        case .plan(let p)?:
+            guard p.command == command.rawValue else { return .failed(planMismatch(p.command, command)) }
+            return .plan(p)
         case .error(let e)?: return .failed("\(e.code): \(e.message)")
         case nil:
             let tail = r.stderrTail
             return .failed("Mole printed no plan (exit \(r.exitCode))." + (tail.isEmpty ? "" : "\n" + tail))
         }
+    }
+
+    public static func planMismatch(_ got: String, _ want: MoleCommand) -> String {
+        "Mole printed a plan for `mo \(got.isEmpty ? "?" : got)`, not `mo \(want.rawValue)`, so it was not loaded. Nothing was removed."
     }
 }
 
@@ -85,17 +94,23 @@ public struct ApplyResult {
 }
 
 extension MoleService {
-    public static let ambiguousRunNote = "Couldn't tell this run apart from another mo clean, so no totals are shown."
+    public static let ambiguousRunNote = ambiguousRunNote(.clean)
+    public static func ambiguousRunNote(_ command: MoleCommand) -> String {
+        "Couldn't tell this run apart from another mo \(command.rawValue), so no totals are shown."
+    }
 
     /// Runs `--apply` (never retried), then reads what happened. Mole prints no run id,
-    /// so the history session is the one real clean that started after the process was
+    /// so the history session is the one real session of `command` (never its
+    /// `-dry-run` preview, never another command) that started after the process was
     /// spawned and ended before it exited; none or several shows a note instead of a
     /// guess, with skip reasons from the run's own output. With one session, its
     /// `run_id` selects the rows of the operations log named by `history --json`.
-    public static func runApply(runner: MoleRunner, planId: String, selectFile: String, trash: Bool,
-                                planSkipped: [SkippedEntry], extraEnvironment: [String: String] = [:],
+    /// A command that writes no run markers (installer) is read from the log rows it
+    /// wrote while the process ran (`History.windowSession`).
+    public static func runApply(_ command: MoleCommand = .clean, runner: MoleRunner, planId: String, selectFile: String,
+                                trash: Bool, planSkipped: [SkippedEntry], extraEnvironment: [String: String] = [:],
                                 onStderrLine: ((String) -> Void)? = nil) -> ApplyResult {
-        let res = runner.run(arguments: applyArguments(planId: planId, selectFile: selectFile, trash: trash),
+        let res = runner.run(arguments: applyArguments(command, planId: planId, selectFile: selectFile, trash: trash),
                              extraEnvironment: extraEnvironment, onStderrLine: onStderrLine)
         if res.spawnedAt == nil {
             let why = res.launchError ?? "Cancelled before cleaning started; nothing was cleaned."
@@ -103,15 +118,30 @@ extension MoleService {
         }
         let hist = MoleRunner(executable: runner.executable).run(arguments: ["history", "--json"],
                                                                   extraEnvironment: extraEnvironment, timeout: 30)
-        let sessions = History.sessions(from: hist.stdout)
-        let session = History.attributed(sessions, spawnedAt: res.spawnedAt!, exitedAt: res.exitedAt ?? Date())
+        let spawnedAt = res.spawnedAt!, exitedAt = res.exitedAt ?? Date()
         var notes: [String] = []
         var groups: [SkippedGroup]
         let fromOutput = SkippedReport.group(stderr: res.stderrLines, planSkipped: planSkipped)
+        let logPath = History.operationsLogPath(from: hist.stdout)
+        let logText = logPath.flatMap { try? Data(contentsOf: URL(fileURLWithPath: $0)) }.map { String(decoding: $0, as: UTF8.self) }
+        if !command.writesRunMarkers {
+            let note = res.launchError ?? (res.cancelled ? "Cancelled; some items may already be removed." : nil)
+            guard let logText else {
+                notes.append("The operations log (\(logPath ?? "path unknown")) could not be read, so no totals are shown and skip reasons come from the run's output.")
+                return ApplyResult(exitCode: res.exitCode, session: nil, skipped: fromOutput, failureNote: note, notes: notes)
+            }
+            let rows = OperationRow.parse(logText, command: command.rawValue)
+                .filter { $0.runId == nil && History.inWindow($0.time, spawnedAt: spawnedAt, exitedAt: exitedAt) }
+            let session = History.windowSession(command.rawValue, rows: rows)
+            let skipped = rows.compactMap { r in r.action == "SKIPPED" ? r.skipped : nil }
+            return ApplyResult(exitCode: res.exitCode, session: session,
+                               skipped: SkippedReport.group(rows: skipped, planSkipped: planSkipped), failureNote: note)
+        }
+        let session = History.attributed(History.sessions(from: hist.stdout), command: command.rawValue,
+                                         spawnedAt: spawnedAt, exitedAt: exitedAt)
         if let session, !session.runId.isEmpty {
-            let logPath = History.operationsLogPath(from: hist.stdout)
-            if let logPath, let data = try? Data(contentsOf: URL(fileURLWithPath: logPath)) {
-                let rows = SkippedReport.rows(operationLog: String(decoding: data, as: UTF8.self), runId: session.runId)
+            if let logText {
+                let rows = SkippedReport.rows(operationLog: logText, command: command.rawValue, runId: session.runId)
                 if rows.isEmpty && session.skipped > 0 {
                     notes.append("The operations log has no rows for this run (rotated?), so skip reasons come from the run's output.")
                     groups = fromOutput
@@ -123,7 +153,7 @@ extension MoleService {
                 groups = fromOutput
             }
         } else {
-            if session == nil { notes.append(ambiguousRunNote) }
+            if session == nil { notes.append(ambiguousRunNote(command)) }
             groups = fromOutput
         }
         let note = res.launchError ?? (res.cancelled ? "Cancelled; some items may already be cleaned." : nil)
@@ -152,7 +182,7 @@ public struct HistorySession: Equatable {
 }
 
 public enum History {
-    private static func parseTime(_ s: String) -> Date? {
+    static func parseTime(_ s: String) -> Date? {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         f.dateFormat = "yyyy-MM-dd HH:mm:ss"
@@ -182,18 +212,38 @@ public enum History {
         return (obj?["logs"] as? [String: Any])?["operations"] as? String
     }
 
-    /// The one real clean session that started after `spawnedAt` and ended before
+    /// The one real session of `command` that started after `spawnedAt` and ended before
     /// `exitedAt` (history times have whole-second resolution, so the window is widened
-    /// to whole seconds). Nil when none or more than one qualifies.
-    public static func attributed(_ sessions: [HistorySession], spawnedAt: Date, exitedAt: Date) -> HistorySession? {
-        let lo = spawnedAt.timeIntervalSince1970.rounded(.down)
-        let hi = exitedAt.timeIntervalSince1970.rounded(.up)
+    /// to whole seconds). The command must match exactly: a session field is
+    /// `<command>` for a real run and `<command>-dry-run` for a preview (log.sh
+    /// `operation_log_command`). Nil when none or more than one qualifies.
+    public static func attributed(_ sessions: [HistorySession], command: String = "clean",
+                                  spawnedAt: Date, exitedAt: Date) -> HistorySession? {
         let hits = sessions.filter { s in
-            guard s.command.hasPrefix("clean"), !s.command.contains("dry-run"),
-                  let a = s.startedAt, let b = s.endedAt else { return false }
-            return a.timeIntervalSince1970 >= lo && b.timeIntervalSince1970 <= hi
+            guard s.command == command, let a = s.startedAt, let b = s.endedAt else { return false }
+            return inWindow(a, spawnedAt: spawnedAt, exitedAt: exitedAt) && inWindow(b, spawnedAt: spawnedAt, exitedAt: exitedAt)
         }
         return hits.count == 1 ? hits[0] : nil
+    }
+
+    public static func inWindow(_ t: Date, spawnedAt: Date, exitedAt: Date) -> Bool {
+        let s = t.timeIntervalSince1970
+        return s >= spawnedAt.timeIntervalSince1970.rounded(.down) && s <= exitedAt.timeIntervalSince1970.rounded(.up)
+    }
+
+    /// Totals of a run that wrote no session markers, from its own log rows. Nil when
+    /// the run wrote none. The size is the sum of the REMOVED/TRASHED rows' sizes (a
+    /// symlink is 0 bytes), or unknown ("") when one of them carries none.
+    public static func windowSession(_ command: String, rows: [OperationRow]) -> HistorySession? {
+        guard let first = rows.first else { return nil }
+        func n(_ a: String) -> Int { rows.filter { $0.action == a }.count }
+        let gone = rows.filter { $0.action == "REMOVED" || $0.action == "TRASHED" }
+        // A removed symlink logs `symlink` instead of a size (file_ops.sh `REMOVED ... symlink`): 0 bytes.
+        let sizes = gone.map { $0.detail == "symlink" ? 0 : $0.detail.flatMap(parseSize) }
+        let sizeText = sizes.contains(where: { $0 == nil }) ? "" : "\(sizes.reduce(Int64(0)) { $0 + $1! })B"
+        return HistorySession(command: command, runId: "", startedAt: first.time, endedAt: rows.last!.time,
+                              items: gone.count, sizeText: sizeText, removed: n("REMOVED"), trashed: n("TRASHED"),
+                              skipped: n("SKIPPED"), failed: n("FAILED"))
     }
 
     /// `1.20GB`, `512KB`, `3B` (history.sh's size text; decimal units like ByteCountFormatter's file style).
@@ -204,6 +254,41 @@ public enum History {
         let mult: [String: Double] = ["B": 1, "KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12]
         guard let m = mult[unit] else { return nil }
         return Int64(v * m)
+    }
+}
+
+/// One row of the operations log written by `command` (exactly; never its
+/// `-dry-run` preview): `[<timestamp>] [<command>( run=<id>)?] <ACTION> <rest>`,
+/// where `rest` ends in ` (<detail>)` when the row has one.
+public struct OperationRow: Equatable {
+    public let time: Date
+    public let runId: String?
+    public let action: String
+    public let subject: String
+    public let detail: String?
+
+    /// SKIPPED rows as (reason, name).
+    public var skipped: (reason: String, name: String)? { detail.map { ($0, subject) } }
+
+    public static func parse(_ log: String, command: String) -> [OperationRow] {
+        let cmd = NSRegularExpression.escapedPattern(for: command)
+        let row = try! NSRegularExpression(pattern: #"^\[([^\]]*)\] \["# + cmd + #"(?: run=([^\]\s]+))?\] ([A-Z_]+) (.+)$"#)
+        let tail = try! NSRegularExpression(pattern: #"^(.+) \(([^()]*)\)$"#)
+        var out: [OperationRow] = []
+        for line in log.components(separatedBy: "\n") {
+            let ns = line as NSString
+            guard let m = row.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)),
+                  let time = History.parseTime(ns.substring(with: m.range(at: 1))) else { continue }
+            let id = m.range(at: 2).location == NSNotFound ? nil : ns.substring(with: m.range(at: 2))
+            let rest = ns.substring(with: m.range(at: 4)) as NSString
+            var subject = rest as String, detail: String?
+            if let t = tail.firstMatch(in: rest as String, range: NSRange(location: 0, length: rest.length)) {
+                subject = rest.substring(with: t.range(at: 1)); detail = rest.substring(with: t.range(at: 2))
+            }
+            out.append(OperationRow(time: time, runId: id, action: ns.substring(with: m.range(at: 3)),
+                                    subject: subject, detail: detail))
+        }
+        return out
     }
 }
 
@@ -219,30 +304,26 @@ public enum SkippedReport {
     /// Skip reasons of one apply run, from its operation-log rows. Row grammar,
     /// log.sh:336-340 (`log_operation`) with the command field from
     /// log.sh:303-310 (`operation_log_command`):
-    ///   `[<timestamp>] [clean run=<run id>] SKIPPED <path or name> (<reason>)`
-    /// A dry run writes `clean-dry-run run=<id>` and is never counted. Reasons
-    /// come from file_ops.sh:1654/1661/1674/1678/1688 ("not in reviewed plan",
-    /// "changed since review", "holds unticked item"), :1705 and :1733 (same
-    /// refusals, logged SKIPPED), :1777 ("needs permanent delete" under
-    /// --trash) and :1791 ("already in Trash"). `runId` (the matched history
-    /// session's `run_id`) keeps other runs' rows out; without one, every
-    /// real `clean` row in `operationLog` counts, so pass only the rows
-    /// appended since the apply started.
-    public static func group(operationLog: String, runId: String? = nil, planSkipped: [SkippedEntry]) -> [SkippedGroup] {
-        group(rows: rows(operationLog: operationLog, runId: runId), planSkipped: planSkipped)
+    ///   `[<timestamp>] [<command> run=<run id>] SKIPPED <path or name> (<reason>)`
+    /// A dry run writes `<command>-dry-run run=<id>` and is never counted, nor is
+    /// another command's row. Reasons come from file_ops.sh:1654/1661/1674/1678/1688
+    /// ("not in reviewed plan", "changed since review", "holds unticked item"), :1705
+    /// and :1733 (same refusals, logged SKIPPED), :1777 ("needs permanent delete"
+    /// under --trash) and :1791 ("already in Trash"). `runId` (the matched history
+    /// session's `run_id`) keeps other runs' rows out; without one, every real
+    /// `command` row in `operationLog` counts, so pass only the rows appended since
+    /// the apply started.
+    public static func group(operationLog: String, command: String = "clean", runId: String? = nil,
+                             planSkipped: [SkippedEntry]) -> [SkippedGroup] {
+        group(rows: rows(operationLog: operationLog, command: command, runId: runId), planSkipped: planSkipped)
     }
 
-    public static func rows(operationLog: String, runId: String?) -> [(reason: String, name: String)] {
-        let row = try! NSRegularExpression(pattern: #"^\[[^\]]*\] \[clean(?: run=([^\]\s]+))?\] SKIPPED (.+) \(([^()]*)\)$"#)
-        var out: [(reason: String, name: String)] = []
-        for line in operationLog.components(separatedBy: "\n") {
-            let ns = line as NSString
-            guard let m = row.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)) else { continue }
-            let id = m.range(at: 1).location == NSNotFound ? nil : ns.substring(with: m.range(at: 1))
-            if let want = runId, !want.isEmpty, id != want { continue }
-            out.append((ns.substring(with: m.range(at: 3)), ns.substring(with: m.range(at: 2))))
+    public static func rows(operationLog: String, command: String = "clean", runId: String?) -> [(reason: String, name: String)] {
+        OperationRow.parse(operationLog, command: command).compactMap { r in
+            guard r.action == "SKIPPED", let s = r.skipped else { return nil }
+            if let want = runId, !want.isEmpty, r.runId != want { return nil }
+            return s
         }
-        return out
     }
 
     /// Fallback when the log is unusable: the run's own summary line, bin/clean.sh:2263,

@@ -509,6 +509,8 @@ The launchers auto-detect Terminal, iTerm2, Alacritty, kitty, WezTerm, Ghostty, 
 
 `app/MoleReview/` holds a small native macOS app (SwiftUI, macOS 13+) over the plan-based CLI: scan with `mo clean --dry-run --json`, tick items, confirm, then `mo clean --apply <plan_id> --select <file> --trash`. It needs only the Command Line Tools and sends nothing over the network.
 
+Its Purge and Installer tabs review `mo purge` and `mo installer` plans the same way, each with its own plan and selection; a Rust `target` can be trimmed instead of removed whole.
+
 ```bash
 cd app/MoleReview
 swift build && swift run MoleReviewChecks   # checks use Fixtures/fake-mo.sh, never a real clean

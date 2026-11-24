@@ -1,0 +1,12 @@
+
+# ========== purge-dry-run run=DRYRUN session started at 2026-11-24 14:49:00 ==========
+[2026-11-24 14:49:01] [purge-dry-run run=DRYRUN] SKIPPED /Users/sample/www/preview/dist (recently modified)
+# ========== purge-dry-run session ended at 2026-11-24 14:49:05, 0 items, 0B ==========
+
+# ========== purge run=RUNID session started at 2026-11-24 14:50:00 ==========
+[2026-11-24 14:50:01] [purge run=RUNID] TRASHED /Users/sample/www/webapp/node_modules (905KB)
+[2026-11-24 14:50:02] [purge run=RUNID] SKIPPED /Users/sample/www/fresh/dist (changed since review)
+[2026-11-24 14:50:02] [purge run=RUNID] SKIPPED /Users/sample/www/rusty/target/debug/incremental (in use)
+[2026-11-24 14:50:03] [clean run=OTHERCMD] SKIPPED /Users/sample/Library/Caches/NotMine (not in reviewed plan)
+[2026-11-24 14:50:03] [purge run=OTHERRUN] SKIPPED /Users/sample/www/other/dist (not in reviewed plan)
+# ========== purge run=RUNID session ended at 2026-11-24 14:50:09, 1 items, 905KB ==========

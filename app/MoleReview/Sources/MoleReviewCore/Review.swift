@@ -10,74 +10,124 @@ public struct ReviewRow: Equatable {
 
 /// Selection, totals, search and sort for one plan. Pure value logic so the
 /// checks can drive it without a UI.
+///
+/// `selected` holds the rows ticked on their own. A covered row of clean follows
+/// its folder's tick and is sent with it, never counted. A purge trim row
+/// (covered by its whole `target` item) is ticked on its own instead: while its
+/// whole item is ticked it shows as included, adds nothing and is not sent, and
+/// unticking the whole item brings its own tick back. A kind the plan's command
+/// does not produce is shown but never ticked, counted or sent.
 public struct ReviewState {
     public let plan: Plan
     public private(set) var selected: Set<String>
     public var searchText = ""
+    private let kinds: Set<String>
 
     public init(plan: Plan) {
         self.plan = plan
-        selected = Set(plan.allItems.filter { !$0.isCovered && $0.defaultSelected }.map { $0.id })
+        let kinds = MoleCommand(rawValue: plan.command)?.kinds ?? []
+        self.kinds = kinds
+        selected = Set(plan.allItems.filter { !$0.isCovered && !$0.isTrim && $0.defaultSelected && kinds.contains($0.kind) }
+            .map { $0.id })
     }
 
     // MARK: selection
 
-    private func items(of section: PlanSection) -> [PlanItem] { section.items.filter { !$0.isCovered } }
+    public func isSupported(_ item: PlanItem) -> Bool { kinds.contains(item.kind) }
+
+    /// Rows the section checkbox ticks: whole items, never covered or trim rows.
+    private func items(of section: PlanSection) -> [PlanItem] { section.items.filter { !$0.isCovered && isSupported($0) } }
+
+    /// A trim whose whole item is ticked: shown as included, disabled, not sent.
+    public func isIncludedByParent(_ item: PlanItem) -> Bool {
+        item.isTrim && item.coveredBy.map { selected.contains($0) } == true
+    }
+
+    /// Whether the row's own checkbox can be clicked.
+    public func isTickable(_ item: PlanItem) -> Bool {
+        isSupported(item) && !item.followsParent && !isIncludedByParent(item)
+    }
 
     public func isSelected(_ item: PlanItem) -> Bool {
-        if let parent = item.coveredBy { return selected.contains(parent) }
-        return selected.contains(item.id)
+        guard isSupported(item) else { return false }
+        if item.followsParent, let parent = item.coveredBy { return selected.contains(parent) }
+        return selected.contains(item.id) || isIncludedByParent(item)
+    }
+
+    /// Rows that remove something of their own and count in the totals.
+    private func counts(_ item: PlanItem) -> Bool {
+        isSupported(item) && !item.followsParent && selected.contains(item.id) && !isIncludedByParent(item)
     }
 
     public mutating func toggle(_ id: String) {
+        guard let item = plan.allItems.first(where: { $0.id == id }), isTickable(item) else { return }
         if selected.contains(id) { selected.remove(id) } else { selected.insert(id) }
     }
 
+    /// Rows of the section with a checkbox of their own: whole items and trims.
+    private func rowsWithBox(of section: PlanSection) -> [PlanItem] {
+        section.items.filter { isSupported($0) && !$0.followsParent }
+    }
+
+    /// On ticks the whole items (their trims then show as included); off clears
+    /// the whole items and the trims' own ticks, so nothing of the section is sent.
     public mutating func setSection(_ sectionId: String, on: Bool) {
         guard let s = plan.sections.first(where: { $0.id == sectionId }) else { return }
-        for item in items(of: s) {
+        for item in on ? items(of: s) : rowsWithBox(of: s) {
             if on { selected.insert(item.id) } else { selected.remove(item.id) }
         }
     }
 
+    /// A trim counts as a row: only a trim ticked makes its section mixed.
     public func sectionState(_ section: PlanSection) -> TriState {
-        let own = items(of: section)
-        let n = own.filter { selected.contains($0.id) }.count
+        let own = rowsWithBox(of: section)
+        let n = own.filter { isSelected($0) }.count
         if n == 0 { return .off }
         return n == own.count ? .on : .mixed
     }
 
     public mutating func selectNone() { selected.removeAll() }
 
-    // MARK: totals (covered rows never add)
+    // MARK: totals (covered rows and included trims never add)
 
     public var selectedBytes: Int64 {
-        plan.allItems.filter { !$0.isCovered && selected.contains($0.id) }.reduce(0) { $0 + $1.bytes }
+        plan.allItems.filter(counts).reduce(0) { $0 + $1.bytes }
     }
     /// Command items add no files, matching the CLI's `total_items`.
     public var selectedItems: Int {
-        plan.allItems.filter { !$0.isCovered && !$0.isCommand && selected.contains($0.id) }.reduce(0) { $0 + $1.count }
+        plan.allItems.filter { counts($0) && !$0.isCommand }.reduce(0) { $0 + $1.count }
     }
-    public var selectedRowCount: Int { plan.allItems.filter { !$0.isCovered && selected.contains($0.id) }.count }
+    public var selectedRowCount: Int { plan.allItems.filter(counts).count }
+
+    /// The header's "N of M items". Clean counts files (its `total_items`); purge and
+    /// installer count rows with a checkbox, a trim as one row (never its entries):
+    /// N rows that will be sent, M whole items plus trims.
+    public var itemCounts: (selected: Int, total: Int) {
+        if plan.command == MoleCommand.clean.rawValue { return (selectedItems, plan.totalItems) }
+        return (selectedRowCount, plan.allItems.filter { isSupported($0) && !$0.followsParent }.count)
+    }
 
     public func selectedBytes(in section: PlanSection) -> Int64 {
-        items(of: section).filter { selected.contains($0.id) }.reduce(0) { $0 + $1.bytes }
+        section.items.filter(counts).reduce(0) { $0 + $1.bytes }
     }
 
     public var selectedCommandCount: Int { selectedCommandNames.count }
 
     /// Names of the ticked command items, as the confirm sheet lists them.
     public var selectedCommandNames: [String] {
-        plan.allItems.filter { $0.isCommand && selected.contains($0.id) }.map { $0.name ?? $0.command ?? $0.id }
+        plan.allItems.filter { $0.isCommand && counts($0) }.map { $0.name ?? $0.command ?? $0.id }
     }
+
+    /// Ticked rows in a cloud-synced folder, for the confirm sheet's warning.
+    public var selectedCloudCount: Int { plan.allItems.filter { counts($0) && $0.isCloud }.count }
 
     // MARK: expiry
 
     public func isExpired(now: Date = Date()) -> Bool { now >= plan.expiresAt }
     public func remaining(now: Date = Date()) -> TimeInterval { plan.expiresAt.timeIntervalSince(now) }
 
-    /// Clean is available only for an unexpired plan with something ticked.
-    public func canClean(now: Date = Date()) -> Bool { !isExpired(now: now) && !selected.isEmpty }
+    /// Apply is available only for an unexpired plan with something ticked.
+    public func canClean(now: Date = Date()) -> Bool { !isExpired(now: now) && selectedRowCount > 0 }
 
     // MARK: rows
 
@@ -103,13 +153,14 @@ public struct ReviewState {
 
     // MARK: selection file
 
-    /// Ids to hand to `--select`: ticked rows plus the covered rows under them.
+    /// Ids to hand to `--select`: ticked rows plus the covered rows under them;
+    /// a trim only when its whole item is not ticked; never an unsupported kind.
     public func selectionIDs() -> [String] {
         var out: [String] = []
-        for item in plan.allItems {
-            if item.isCovered {
+        for item in plan.allItems where isSupported(item) {
+            if item.followsParent {
                 if selected.contains(item.coveredBy!) { out.append(item.id) }
-            } else if selected.contains(item.id) {
+            } else if counts(item) {
                 out.append(item.id)
             }
         }

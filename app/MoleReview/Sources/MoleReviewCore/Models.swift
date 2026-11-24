@@ -1,7 +1,50 @@
 import Foundation
 
-/// One row of a plan section. `kind` is "path" or "command"; covered rows are
-/// listed but already counted inside the folder named by `coveredBy`.
+/// The `mo` commands the app reviews, each with its own tab, plan and result.
+public enum MoleCommand: String, CaseIterable, Identifiable {
+    case clean, purge, installer
+    public var id: String { rawValue }
+    public var title: String {
+        switch self {
+        case .clean: return "Clean"
+        case .purge: return "Purge"
+        case .installer: return "Installer"
+        }
+    }
+    /// The apply button's verb.
+    public var action: String {
+        switch self {
+        case .clean: return "Clean"
+        case .purge: return "Purge"
+        case .installer: return "Remove"
+        }
+    }
+    public var progress: String {
+        switch self {
+        case .clean: return "Cleaning…"
+        case .purge: return "Purging…"
+        case .installer: return "Removing…"
+        }
+    }
+    /// Item kinds this command's plan holds (`clean_plan_render_json`,
+    /// `purge_plan_render_item`, `installer_plan_render_item`). Any other kind is
+    /// shown but never ticked or sent.
+    public var kinds: Set<String> {
+        switch self {
+        case .clean: return ["path", "command"]
+        case .purge: return ["path", "trim"]
+        case .installer: return ["path"]
+        }
+    }
+    /// `mo installer` writes no session markers (no `log_operation_session_start`),
+    /// so its rows carry no run id and `mo history` merges back-to-back runs.
+    public var writesRunMarkers: Bool { self != .installer }
+}
+
+/// One row of a plan section. `kind` is "path", "command" (clean) or "trim"
+/// (purge); covered rows are listed but already counted inside the folder
+/// named by `coveredBy`. A trim row is covered by its whole `target` item but
+/// is ticked on its own (see `ReviewState`).
 public struct PlanItem: Decodable, Equatable {
     public let id: String
     public let kind: String
@@ -13,16 +56,28 @@ public struct PlanItem: Decodable, Equatable {
     public let count: Int
     public let coveredBy: String?
     public let defaultSelected: Bool
+    /// Purge: artifact folder name, age text and whether it sits in a cloud-synced folder.
+    public let artifact: String?
+    public let age: String?
+    public let cloud: Bool?
+    /// Installer: file extension.
+    public let type: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, kind, path, name, command, bytes, count
+        case id, kind, path, name, command, bytes, count, artifact, age, cloud, type
         case sizeKnown = "size_known"
         case coveredBy = "covered_by"
         case defaultSelected = "default_selected"
     }
 
     public var isCommand: Bool { kind == "command" }
+    public var isTrim: Bool { kind == "trim" }
     public var isCovered: Bool { coveredBy != nil }
+    /// A covered row that follows its folder's tick (clean's covered rows); a trim does not.
+    public var followsParent: Bool { coveredBy != nil && !isTrim }
+    public var isCloud: Bool { cloud == true }
+
+    public static let trimLabel = "Trim: incremental caches and week-old build files"
 
     /// Text shown for the row and matched by the search field.
     public var title: String {
@@ -49,6 +104,8 @@ public struct SkippedEntry: Decodable, Equatable {
 
 public struct Plan: Decodable, Equatable {
     public let schema: Int
+    /// The command that made the plan (`clean`, `purge`, `installer`).
+    public let command: String
     public let planId: String
     public let createdAt: Date
     public let expiresAt: Date
@@ -59,7 +116,7 @@ public struct Plan: Decodable, Equatable {
     public let skipped: [SkippedEntry]
 
     enum CodingKeys: String, CodingKey {
-        case schema, sections, skipped
+        case schema, sections, skipped, command
         case planId = "plan_id"
         case createdAt = "created_at"
         case expiresAt = "expires_at"
@@ -71,6 +128,7 @@ public struct Plan: Decodable, Equatable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         schema = try c.decode(Int.self, forKey: .schema)
+        command = try c.decodeIfPresent(String.self, forKey: .command) ?? ""
         planId = try c.decode(String.self, forKey: .planId)
         createdAt = try Plan.date(c, .createdAt)
         expiresAt = try Plan.date(c, .expiresAt)
@@ -98,7 +156,7 @@ public struct PlanError: Equatable {
     public let message: String
 }
 
-/// What `mo clean --dry-run --json` printed on stdout.
+/// What `mo <command> --dry-run --json` printed on stdout.
 public enum PlanDocument: Equatable {
     case plan(Plan)
     case error(PlanError)

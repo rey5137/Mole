@@ -15,12 +15,18 @@ _ = NSApplication.shared
 
 let fixtures = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
     .appendingPathComponent("Fixtures")
-guard case .plan(let plan) = try PlanDocument.decode(Data(contentsOf: fixtures.appendingPathComponent("plan-sample.json"))) else {
-    print("plan-sample.json is not a plan"); exit(1)
+func loadPlan(_ name: String) -> Plan {
+    guard let data = try? Data(contentsOf: fixtures.appendingPathComponent(name)),
+          case .plan(let p)? = try? PlanDocument.decode(data) else { print("\(name) is not a plan"); exit(1) }
+    return p
 }
+let plan = loadPlan("plan-sample.json")
+let purgePlan = loadPlan("purge-sample.json")
+let installerPlan = loadPlan("installer-sample.json")
 
-@MainActor func model(_ phase: Phase, _ setup: (AppModel) -> Void = { _ in }) -> AppModel {
+@MainActor func model(_ phase: Phase, _ command: MoleCommand = .clean, _ setup: (AppModel) -> Void = { _ in }) -> AppModel {
     let m = AppModel()
+    m.command = command
     m.phase = phase
     m.now = plan.createdAt.addingTimeInterval(600)
     m.startedAt = plan.createdAt.addingTimeInterval(540)
@@ -34,6 +40,23 @@ guard case .plan(let plan) = try PlanDocument.decode(Data(contentsOf: fixtures.a
         s.toggle(item.element.id)
     }
     s.searchText = search
+    m.review = s
+}
+
+/// Purge: the default selection plus the Rust trim ticked alone; `whole` ticks its
+/// target too, so the trim shows as included.
+@MainActor func purgeState(_ m: AppModel, whole: Bool = false) {
+    var s = ReviewState(plan: purgePlan)
+    if let trim = purgePlan.allItems.first(where: { $0.isTrim }) {
+        s.toggle(trim.id)
+        if whole, let parent = trim.coveredBy { s.toggle(parent) }
+    }
+    m.review = s
+}
+
+@MainActor func installerState(_ m: AppModel) {
+    var s = ReviewState(plan: installerPlan)
+    if let first = installerPlan.allItems.first(where: { $0.type == "dmg" }) { s.toggle(first.id) }
     m.review = s
 }
 
@@ -56,6 +79,13 @@ let shots: [Shot] = [
     Shot(name: "review") { d in wrapped(model(.review) { reviewState($0) }, dark: d, ContentView()) },
     Shot(name: "review-search") { d in wrapped(model(.review) { reviewState($0, search: "item3") }, dark: d, ContentView()) },
     Shot(name: "confirm") { d in wrapped(model(.review) { reviewState($0) }, dark: d, ConfirmSheet().background(dark(d))) },
+    Shot(name: "purge-review") { d in wrapped(model(.review, .purge) { purgeState($0) }, dark: d, ContentView()) },
+    Shot(name: "purge-review-whole") { d in wrapped(model(.review, .purge) { purgeState($0, whole: true) }, dark: d, ContentView()) },
+    Shot(name: "purge-confirm") { d in
+        wrapped(model(.review, .purge) { purgeState($0) }, dark: d, ConfirmSheet().background(dark(d)))
+    },
+    Shot(name: "installer-review") { d in wrapped(model(.review, .installer) { installerState($0) }, dark: d, ContentView()) },
+    Shot(name: "installer-idle") { d in wrapped(model(.idle, .installer), dark: d, ContentView()) },
     Shot(name: "result") { d in
         wrapped(model(.result) {
             $0.result = ApplyResult(exitCode: 0, session: session, skipped: [

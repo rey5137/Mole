@@ -13,13 +13,13 @@ struct MoleReviewApp: App {
                 .frame(minWidth: 760, minHeight: 520)
         }
         .commands {
-            CommandMenu("Clean") {
+            CommandMenu("Review") {
                 Button("Scan") { model.scan() }.keyboardShortcut("r", modifiers: .command)
                     .disabled(model.busy)
                 Button("Toggle Selected Row") { model.toggleFocused() }.keyboardShortcut(.space, modifiers: [])
                     .disabled(model.phase != .review || model.focusedRow == nil)
-                Button("Clean…") { model.showConfirm = true }.keyboardShortcut(.return, modifiers: .command)
-                    .disabled(!(model.phase == .review && model.review?.canClean(now: model.now) == true))
+                Button("\(model.command.action)…") { model.showConfirm = true }.keyboardShortcut(.return, modifiers: .command)
+                    .disabled(!model.canApply)
             }
         }
         Settings { SettingsView().environmentObject(model) }

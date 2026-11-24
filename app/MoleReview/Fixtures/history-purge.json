@@ -1,0 +1,10 @@
+{
+  "logs": {"operations": "OPLOG", "deletions": "OPLOG.deletions"},
+  "limit": 20,
+  "sessions": [
+    {"command": "purge-dry-run", "run_id": "DRYRUN", "attribution": "run", "started_at": "STARTED", "ended_at": "ENDED", "items": 0, "size": "0B", "operation_count": 1, "failed_tasks": 0, "actions": {"removed": 0, "trashed": 0, "skipped": 1, "failed": 0, "rebuilt": 0, "other": 0}},
+    {"command": "clean", "run_id": "OTHERCMD", "attribution": "run", "started_at": "STARTED", "ended_at": "ENDED", "items": 9, "size": "9.00GB", "operation_count": 1, "failed_tasks": 0, "actions": {"removed": 9, "trashed": 0, "skipped": 0, "failed": 0, "rebuilt": 0, "other": 0}},
+    {"command": "purge", "run_id": "RUNID", "attribution": "run", "started_at": "STARTED", "ended_at": "ENDED", "items": 1, "size": "905KB", "operation_count": 3, "failed_tasks": 0, "actions": {"removed": 0, "trashed": 1, "skipped": 2, "failed": 0, "rebuilt": 0, "other": 0}}
+  ],
+  "deletions": []
+}

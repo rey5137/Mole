@@ -1,0 +1,8 @@
+{
+  "logs": {"operations": "OPLOG", "deletions": "OPLOG.deletions"},
+  "limit": 20,
+  "sessions": [
+    {"command": "installer", "run_id": "", "attribution": "command", "started_at": "2026-01-01 00:00:00", "ended_at": "", "items": 0, "size": "0B", "operation_count": 3, "failed_tasks": 0, "actions": {"removed": 0, "trashed": 1, "skipped": 2, "failed": 0, "rebuilt": 0, "other": 0}}
+  ],
+  "deletions": []
+}

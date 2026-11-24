@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "command": "installer",
+  "plan_id": "9c3b7a1e5d2f0a64",
+  "created_at": "2026-11-24T07:00:00Z",
+  "expires_at": "2026-11-24T08:00:00Z",
+  "free_bytes": 25951117312,
+  "total_bytes": 3752000,
+  "total_items": 3,
+  "sections": [
+    {"id": "desktop", "name": "Desktop", "bytes": 52000, "items": [
+      {"id": "i1", "kind": "path", "path": "/Users/sample/Desktop/Tool Setup.pkg", "bytes": 52000, "size_known": true, "count": 1, "covered_by": null, "default_selected": false, "type": "pkg", "name": "Tool Setup.pkg"}
+    ]},
+    {"id": "downloads", "name": "Downloads", "bytes": 3700000, "items": [
+      {"id": "i2", "kind": "path", "path": "/Users/sample/Downloads/Example App.dmg", "bytes": 3000000, "size_known": true, "count": 1, "covered_by": null, "default_selected": false, "type": "dmg", "name": "Example App.dmg"},
+      {"id": "i3", "kind": "path", "path": "/Users/sample/Downloads/old/Ubuntu.iso", "bytes": 700000, "size_known": true, "count": 1, "covered_by": null, "default_selected": false, "type": "iso", "name": "Ubuntu.iso"}
+    ]}
+  ],
+  "skipped": []
+}

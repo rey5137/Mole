@@ -34,8 +34,11 @@ check("decode tricky fixture (quote/backslash/newline/emoji, covered_by, command
         && p.allItems[2].coveredBy == "i2" && p.allItems[3].isCommand && p.skipped.count == 1
         && p.skipped[0].reason == "needs sudo" && p.sections[0].name == "User \"essentials\""
 }
-check("fixtures contain only sample or test home paths") {
+check("fixtures contain only sample or test home paths (every fixture, purge and installer included)") {
     let urls = try FileManager.default.contentsOfDirectory(at: fixtures, includingPropertiesForKeys: nil)
+    let names = Set(urls.map { $0.lastPathComponent })
+    guard ["purge-sample.json", "installer-sample.json", "oplog-apply-purge.txt", "oplog-apply-installer.txt"]
+        .allSatisfy(names.contains) else { return false }
     let pattern = try NSRegularExpression(pattern: #"/Users/(?!sample(?:/|$)|test(?:/|$))"#)
     return try urls.allSatisfy { url in
         let text = try String(contentsOf: url, encoding: .utf8)
@@ -124,18 +127,18 @@ func fakeEnv(stdout: String? = nil, stderr: String = "", exit: Int = 0, argv: St
 
 check("runner separates stdout and stderr, streams stderr lines") {
     var seen: [String] = []
-    let r = MoleRunner(executable: fake).run(arguments: MoleService.scanArguments,
+    let r = MoleRunner(executable: fake).run(arguments: MoleService.scanArguments(.clean),
                                              extraEnvironment: fakeEnv(stdout: "tricky.json", stderr: "line one\nline two")) { seen.append($0) }
     let doc = try? PlanDocument.decode(r.stdout)
     return r.exitCode == 0 && r.stderrLines == ["line one", "line two"] && seen == r.stderrLines
         && doc != nil && !String(decoding: r.stdout, as: UTF8.self).contains("line one")
 }
 check("scan interprets plan, error document, and non-JSON with stderr tail") {
-    let ok = MoleService.interpretScan(MoleRunner(executable: fake).run(arguments: MoleService.scanArguments, extraEnvironment: fakeEnv(stdout: "tricky.json")))
+    let ok = MoleService.interpretScan(MoleRunner(executable: fake).run(arguments: MoleService.scanArguments(.clean), extraEnvironment: fakeEnv(stdout: "tricky.json")), command: .clean)
     guard case .plan = ok else { return false }
-    let err = MoleService.interpretScan(MoleRunner(executable: fake).run(arguments: MoleService.scanArguments, extraEnvironment: fakeEnv(stdout: "error.json", exit: 130)))
+    let err = MoleService.interpretScan(MoleRunner(executable: fake).run(arguments: MoleService.scanArguments(.clean), extraEnvironment: fakeEnv(stdout: "error.json", exit: 130)), command: .clean)
     guard case .failed(let m) = err, m.hasPrefix("cancelled:") else { return false }
-    let junk = MoleService.interpretScan(MoleRunner(executable: fake).run(arguments: MoleService.scanArguments, extraEnvironment: fakeEnv(stderr: "boom happened", exit: 3)))
+    let junk = MoleService.interpretScan(MoleRunner(executable: fake).run(arguments: MoleService.scanArguments(.clean), extraEnvironment: fakeEnv(stderr: "boom happened", exit: 3)), command: .clean)
     guard case .failed(let m2) = junk else { return false }
     return m2.contains("exit 3") && m2.contains("boom happened")
 }
@@ -155,11 +158,11 @@ check("locator: --version check and candidate order") {
 }
 check("apply passes exact --apply <id> --select <file> --trash arguments") {
     let argv = scratch.appendingPathComponent("argv1").path
-    let args = MoleService.applyArguments(planId: "abc123", selectFile: "/tmp/sel", trash: true)
+    let args = MoleService.applyArguments(.clean, planId: "abc123", selectFile: "/tmp/sel", trash: true)
     _ = MoleRunner(executable: fake).run(arguments: args, extraEnvironment: fakeEnv(argv: argv))
     let got = try String(contentsOfFile: argv, encoding: .utf8)
     let argv2 = scratch.appendingPathComponent("argv2").path
-    _ = MoleRunner(executable: fake).run(arguments: MoleService.applyArguments(planId: "abc123", selectFile: "/tmp/sel", trash: false), extraEnvironment: fakeEnv(argv: argv2))
+    _ = MoleRunner(executable: fake).run(arguments: MoleService.applyArguments(.clean, planId: "abc123", selectFile: "/tmp/sel", trash: false), extraEnvironment: fakeEnv(argv: argv2))
     let got2 = try String(contentsOfFile: argv2, encoding: .utf8)
     return got == "clean\n--apply\nabc123\n--select\n/tmp/sel\n--trash\n"
         && got2 == "clean\n--apply\nabc123\n--select\n/tmp/sel\n"
@@ -298,6 +301,173 @@ check("confirm lists the ticked command names") {
     guard s.selectedCommandNames == ["npm cache"] else { return false }
     s.toggle("i4")
     return s.selectedCommandNames.isEmpty
+}
+
+
+// MARK: purge and installer tabs
+
+check("purge fixture decodes: trim row is kind trim, covered by its whole target, never default-selected") {
+    let p = try plan("purge-sample.json")
+    guard p.command == "purge", let trim = p.allItems.first(where: { $0.isTrim }),
+          let whole = p.allItems.first(where: { $0.id == trim.coveredBy }) else { return false }
+    let s = ReviewState(plan: p)
+    return trim.kind == "trim" && whole.kind == "path" && whole.path == trim.path && !trim.defaultSelected
+        && !s.isSelected(trim) && trim.artifact == "target" && trim.age != nil
+        && p.allItems.contains(where: { $0.isCloud }) && p.allItems.contains(where: { $0.artifact == "node_modules" })
+        && p.allItems.contains(where: { !$0.defaultSelected && !$0.isTrim && $0.age == "<1d" })
+}
+check("installer fixture decodes with name and type") {
+    let p = try plan("installer-sample.json")
+    let s = ReviewState(plan: p)
+    return p.command == "installer" && p.allItems.count == 3 && p.allItems.allSatisfy { $0.type != nil && $0.name != nil }
+        && s.selectedRowCount == 0 && p.allItems.allSatisfy { s.isTickable($0) }
+}
+check("purge default selection: whole items only, totals match the default-selected rows") {
+    let p = try plan("purge-sample.json")
+    let s = ReviewState(plan: p)
+    let want = p.allItems.filter { $0.defaultSelected && !$0.isCovered }
+    return s.selectionIDs() == want.map { $0.id } && s.selectedBytes == want.reduce(0) { $0 + $1.bytes }
+}
+check("trim ticks on its own: alone sends only the trim; with its whole item only the whole, counted once; unticking the whole restores it") {
+    let p = try plan("purge-sample.json")
+    var s = ReviewState(plan: p)
+    s.selectNone()
+    guard let trim = p.allItems.first(where: { $0.kind == "trim" }),
+          let whole = p.allItems.first(where: { $0.id == trim.coveredBy }), s.isTickable(trim) else { return false }
+    s.toggle(trim.id)
+    guard s.selectionIDs() == [trim.id], s.selectedBytes == trim.bytes, s.selectedItems == trim.count,
+          s.isSelected(trim), !s.isSelected(whole), s.canClean(now: p.createdAt) else { return false }
+    s.toggle(whole.id)
+    guard s.selectionIDs() == [whole.id], s.selectedBytes == whole.bytes, s.selectedRowCount == 1,
+          s.isSelected(trim), s.isIncludedByParent(trim), !s.isTickable(trim) else { return false }
+    s.toggle(trim.id)   // disabled while the whole item is ticked: no effect
+    guard s.selectionIDs() == [whole.id] else { return false }
+    s.toggle(whole.id)
+    guard s.selectionIDs() == [trim.id], s.isSelected(trim), s.selectedBytes == trim.bytes else { return false }
+    // A section checkbox ticks whole items, never the trim.
+    s.selectNone()
+    s.setSection(p.sections[0].id, on: true)
+    return s.selectionIDs() == [whole.id] && s.sectionState(p.sections[0]) == .on
+}
+check("clean covered rows still follow their folder and are sent with it") {
+    var s = ReviewState(plan: try plan("tricky.json"))
+    let covered = s.plan.allItems[2]
+    guard !s.isTickable(covered), s.isSelected(covered), s.selectionIDs() == ["i1", "i2", "i3", "i4"] else { return false }
+    s.toggle("i3")   // not tickable: no effect
+    s.toggle("i2")
+    return !s.isSelected(covered) && s.selectionIDs() == ["i1", "i4"]
+}
+let unknownKindPlan = """
+{"schema": 1, "command": "purge", "plan_id": "u1", "created_at": "2026-11-24T07:00:00Z", "expires_at": "2026-11-24T08:00:00Z",
+ "free_bytes": null, "total_bytes": 300, "total_items": 3, "skipped": [], "sections": [{"id": "s", "name": "~/www/x", "bytes": 300, "items": [
+  {"id": "i1", "kind": "path", "path": "/Users/sample/www/x/dist", "bytes": 100, "size_known": true, "count": 1, "covered_by": null, "default_selected": true},
+  {"id": "i2", "kind": "shrink", "path": "/Users/sample/www/x/build", "bytes": 100, "size_known": true, "count": 1, "covered_by": null, "default_selected": true},
+  {"id": "i3", "kind": "command", "name": "npm cache", "command": "npm cache clean", "bytes": 100, "size_known": false, "count": 1, "covered_by": null, "default_selected": true}]}]}
+"""
+check("an item kind the command does not produce is shown but never ticked, counted or sent") {
+    guard case .plan(let p) = try PlanDocument.decode(Data(unknownKindPlan.utf8)) else { return false }
+    var s = ReviewState(plan: p)
+    let odd = p.allItems.filter { $0.kind != "path" }
+    guard s.selectionIDs() == ["i1"], odd.allSatisfy({ !s.isTickable($0) && !s.isSelected($0) }) else { return false }
+    s.toggle("i2"); s.toggle("i3")
+    s.setSection("s", on: true)
+    guard s.selectionIDs() == ["i1"], s.selectedBytes == 100, s.selectedCommandNames.isEmpty,
+          s.rows(in: p.sections[0]).count == 3 else { return false }
+    let url = try s.writeSelectionFile(in: scratch)
+    return try String(contentsOf: url, encoding: .utf8) == "i1\n"
+}
+check("scan and apply argv per command") {
+    var got: [String] = []
+    for (cmd, trash) in [(MoleCommand.purge, false), (.installer, true)] {
+        let a1 = scratch.appendingPathComponent("argv-scan-\(cmd.rawValue)").path
+        _ = MoleRunner(executable: fake).run(arguments: MoleService.scanArguments(cmd), extraEnvironment: fakeEnv(argv: a1))
+        let a2 = scratch.appendingPathComponent("argv-apply-\(cmd.rawValue)").path
+        _ = MoleRunner(executable: fake).run(arguments: MoleService.applyArguments(cmd, planId: "pid", selectFile: "/tmp/f", trash: trash),
+                                             extraEnvironment: fakeEnv(argv: a2))
+        got += [try String(contentsOfFile: a1, encoding: .utf8), try String(contentsOfFile: a2, encoding: .utf8)]
+    }
+    return got == ["purge\n--dry-run\n--json\n", "purge\n--apply\npid\n--select\n/tmp/f\n",
+                   "installer\n--dry-run\n--json\n", "installer\n--apply\npid\n--select\n/tmp/f\n--trash\n"]
+}
+check("a plan made by another command is refused, never loaded") {
+    func scan(_ file: String, _ cmd: MoleCommand) -> ScanOutcome {
+        MoleService.interpretScan(MoleRunner(executable: fake).run(arguments: MoleService.scanArguments(cmd),
+                                                                   extraEnvironment: fakeEnv(stdout: file)), command: cmd)
+    }
+    guard case .failed(let m) = scan("plan-sample.json", .purge), m.contains("`mo clean`"), m.contains("`mo purge`"),
+          case .failed = scan("purge-sample.json", .installer), case .failed = scan("installer-sample.json", .clean),
+          case .plan(let p) = scan("purge-sample.json", .purge), p.command == "purge",
+          case .plan = scan("installer-sample.json", .installer) else { return false }
+    return true
+}
+func runApply(_ cmd: MoleCommand, _ env: [String: String]) -> ApplyResult {
+    MoleService.runApply(cmd, runner: MoleRunner(executable: fake), planId: "p1", selectFile: "/tmp/s", trash: true,
+                         planSkipped: [], extraEnvironment: env)
+}
+check("purge apply result reads the purge session, not a clean or purge-dry-run one in the same window") {
+    let res = runApply(.purge, applyEnv(oplog: try freshLog(), run: "RP1", history: "history-purge.json", rows: "oplog-apply-purge.txt"))
+    let names = res.skipped.flatMap { $0.names }
+    return res.session?.runId == "RP1" && res.session?.command == "purge" && res.session?.sizeText == "905KB"
+        && res.skipped.map({ $0.reason }) == ["changed since review", "in use"] && res.notes.isEmpty
+        && !names.contains("/Users/sample/www/preview/dist") && !names.contains("/Users/sample/Library/Caches/NotMine")
+        && !names.contains("/Users/sample/www/other/dist")
+}
+check("purge apply with no purge session in the window names purge in its note") {
+    let res = runApply(.purge, applyEnv(oplog: try freshLog(), run: "RP2", history: "history.json", rows: nil))
+    return res.session == nil && res.notes == [MoleService.ambiguousRunNote(.purge)] && res.notes[0].contains("mo purge")
+}
+check("installer apply (no run markers) reads its own rows written while it ran, never older or other-command rows") {
+    let log = try freshLog("[2026-01-01 00:00:00] [installer] SKIPPED /old (changed since review)\n")
+    let res = runApply(.installer, applyEnv(oplog: log, run: "", history: "history-installer.json", rows: "oplog-apply-installer.txt"))
+    let names = res.skipped.flatMap { $0.names }
+    return res.session?.command == "installer" && res.session?.trashed == 1 && res.session?.skipped == 1
+        && res.session?.sizeBytes == 3_000_000 && names == ["/Users/sample/Desktop/Tool Setup.pkg"]
+        && res.skipped.map({ $0.reason }) == ["changed since review"] && res.notes.isEmpty
+}
+check("operation rows: exact command only, dry-run and other commands never match") {
+    let log = "[2026-11-24 14:50:01] [purge run=A] TRASHED /x (12MB)\n[2026-11-24 14:50:01] [purge-dry-run run=B] SKIPPED /y (z)\n"
+        + "[2026-11-24 14:50:01] [purger] SKIPPED /w (z)\n[2026-11-24 14:50:02] [purge] SKIPPED /v/App (copy) (changed since review)\n"
+    // log_operation writes `<path> (<detail>)`; details are fixed reasons or sizes with no
+    // parentheses, while a path may hold them, so the detail is the last group.
+    let rows = OperationRow.parse(log, command: "purge")
+    return rows.count == 2 && rows[0].runId == "A" && rows[0].detail == "12MB" && rows[0].subject == "/x"
+        && rows[1].runId == nil && rows[1].action == "SKIPPED" && rows[1].subject == "/v/App (copy)"
+        && rows[1].detail == "changed since review"
+}
+
+check("section box counts a trim as a row: trim alone is mixed; on ticks the whole; off clears the trim too") {
+    let p = try plan("purge-sample.json")
+    var s = ReviewState(plan: p)
+    s.selectNone()
+    let rusty = p.sections[0]
+    guard let trim = rusty.items.first(where: { $0.isTrim }), s.sectionState(rusty) == .off else { return false }
+    s.toggle(trim.id)
+    guard s.sectionState(rusty) == .mixed else { return false }
+    s.setSection(rusty.id, on: true)
+    guard s.sectionState(rusty) == .on, s.isIncludedByParent(trim), s.selectionIDs() == [trim.coveredBy!] else { return false }
+    s.setSection(rusty.id, on: false)
+    return s.sectionState(rusty) == .off && s.selectionIDs().isEmpty && s.selectedBytes == 0 && !s.isSelected(trim)
+}
+check("header item counts: purge counts rows (a trim is one row), clean keeps its file counts") {
+    let p = try plan("purge-sample.json")
+    var s = ReviewState(plan: p)
+    s.selectNone()
+    let trim = p.allItems.first(where: { $0.isTrim })!
+    guard s.itemCounts == (0, 5) else { return false }
+    s.toggle(trim.id)
+    guard s.itemCounts == (1, 5) else { return false }
+    s.toggle(trim.coveredBy!)
+    guard s.itemCounts == (1, 5) else { return false }
+    s.setSection(p.sections[1].id, on: true)
+    let c = ReviewState(plan: try plan("tricky.json"))
+    return s.itemCounts == (2, 5) && c.itemCounts == (c.selectedItems, c.plan.totalItems) && c.itemCounts == (7, 7)
+}
+check("installer run size: a removed symlink counts 0 bytes, not an unknown total") {
+    let log = "[2026-11-24 14:50:01] [installer] TRASHED /Users/sample/Downloads/A.dmg (3.00MB)\n"
+        + "[2026-11-24 14:50:02] [installer] REMOVED /Users/sample/Downloads/Link.dmg (symlink)\n"
+        + "[2026-11-24 14:50:03] [installer] TRASHED /Users/sample/Downloads/B.pkg (512KB)\n"
+    let sess = History.windowSession("installer", rows: OperationRow.parse(log, command: "installer"))
+    return sess?.sizeBytes == 3_512_000 && sess?.items == 3 && sess?.removed == 1 && sess?.trashed == 2
 }
 
 if failures > 0 { print("\(failures) check(s) failed"); exit(1) }
