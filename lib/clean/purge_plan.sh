@@ -13,8 +13,12 @@ set -euo pipefail
 # nine shared ones, in this order: activity state, default selection, cloud
 # flag, age label, the folder's physical parent and its dev:inode, then the
 # scan root's lexical and physical identities (path, parent, parent dev:inode,
-# dev:inode each). The folder's own dev:inode is the shared devino field. A
-# later kind (a Rust `target` trim) adds its own letter and fields.
+# dev:inode each). The folder's own dev:inode is the shared devino field.
+# A T record (the trim of a Rust `target`, lib/clean/project.sh) names the
+# same folder with the same purge fields; its shared count is the number of
+# entries the review listed and its covered_by the id of the folder's A
+# record, which always comes just before it. The entries themselves are not
+# saved: apply lists them again.
 readonly PURGE_PLAN_AUX_FIELDS=14
 
 # Called by clean_project_artifacts in place of the menu: append each review
@@ -24,18 +28,23 @@ readonly PURGE_PLAN_AUX_FIELDS=14
 purge_plan_record_items() {
     local file="${PURGE_PLAN_RECORDS_FILE:-}"
     [[ -n "$file" && -f "$file" && ! -L "$file" ]] || return 1
-    local i root section default_selected
+    local i root section default_selected kind covered artifact
     {
         for ((i = 0; i < ${#item_paths[@]}; i++)); do
             root="${item_scan_root_indexes[i]}"
+            kind="${item_kinds[i]:-A}"
+            covered="${item_covered_rows[i]:--1}"
+            artifact="${menu_options[i]}"
+            [[ "$kind" != "T" || $covered -lt 0 ]] || artifact="${menu_options[covered]}"
             section="${item_project_paths[i]}"
             section="${section#"[cloud] "}"
             default_selected=true
             [[ "${item_recent_flags[i]}" != "true" ]] || default_selected=false
             local size_known=true
             [[ "${item_size_unknown_flags[i]:-false}" != "true" ]] || size_known=false
-            printf '%s\0' "$section" "${item_paths[i]}" "${item_expected_target_ids[i]}" "${item_sizes[i]}" \
-                "$size_known" "${menu_options[i]}" \
+            printf '%s\0' "$kind" "${item_trim_counts[i]:-1}" "$covered" \
+                "$section" "${item_paths[i]}" "${item_expected_target_ids[i]}" "${item_sizes[i]}" \
+                "$size_known" "$artifact" \
                 "${item_activity_states[i]:-uncertain}" "$default_selected" "${item_cloud_flags[i]:-false}" \
                 "${item_age_labels[i]:-unknown}" "${item_expected_parents[i]}" "${item_expected_parent_ids[i]}" \
                 "${scan_roots[$root]}" "${scan_root_parents[$root]}" "${scan_root_parent_ids[$root]}" \
@@ -52,10 +61,13 @@ purge_plan_save() {
     local body_file
     body_file=$(create_temp_file) || return 1
 
-    local index=0 section path devino size_kb known artifact field k
+    local index=0 kind count covered covered_id section path devino size_kb known artifact field k
     local -a aux=()
     {
-        while IFS= read -r -d '' section &&
+        while IFS= read -r -d '' kind &&
+            IFS= read -r -d '' count &&
+            IFS= read -r -d '' covered &&
+            IFS= read -r -d '' section &&
             IFS= read -r -d '' path &&
             IFS= read -r -d '' devino &&
             IFS= read -r -d '' size_kb &&
@@ -68,8 +80,18 @@ purge_plan_save() {
             done
             index=$((index + 1))
             [[ "$size_kb" =~ ^[0-9]+$ ]] || size_kb=0
-            printf 'A\0i%s\0%s\0%s\0%s\0%s\0%s\0%s\0\0%s\0%s\0' \
-                "$index" "$section" "$path" "$devino" "$size_kb" 1 "$known" "$artifact" "$PURGE_PLAN_AUX_FIELDS"
+            # Records keep menu order, so row N is item iN+1.
+            covered_id=""
+            if [[ "$kind" == "T" ]]; then
+                [[ "$covered" =~ ^[0-9]+$ && "$count" =~ ^[0-9]+$ ]] || return 1
+                covered_id="i$((covered + 1))"
+            else
+                kind="A"
+                count=1
+            fi
+            printf '%s\0i%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0' \
+                "$kind" "$index" "$section" "$path" "$devino" "$size_kb" "$count" "$known" "$covered_id" \
+                "$artifact" "$PURGE_PLAN_AUX_FIELDS"
             printf '%s\0' "${aux[@]}"
         done < "$PURGE_PLAN_RECORDS_FILE"
     } > "$body_file"
@@ -82,9 +104,15 @@ purge_plan_save() {
 purge_plan_render_item() {
     local idx="$1"
     local at="${CLEAN_PLAN_R_AUX_AT[$idx]}"
-    local kind_json
+    local kind_json count=1 covered_json="null"
     case "${CLEAN_PLAN_R_KIND[$idx]}" in
         A) kind_json="path" ;;
+        T)
+            kind_json="trim"
+            count="${CLEAN_PLAN_R_COUNT[$idx]}"
+            [[ "$count" =~ ^[0-9]+$ ]] || count=0
+            [[ ! "${CLEAN_PLAN_R_COVERED[$idx]}" =~ ^i[0-9]+$ ]] || covered_json="\"${CLEAN_PLAN_R_COVERED[$idx]}\""
+            ;;
         *) return 1 ;;
     esac
     local size_kb="${CLEAN_PLAN_R_SIZE[$idx]}"
@@ -96,8 +124,8 @@ purge_plan_render_item() {
 
     printf '"kind": "%s", "path": ' "$kind_json"
     history_json_string "${CLEAN_PLAN_R_TARGET[$idx]}"
-    printf ', "bytes": %s, "size_known": %s, "count": 1, "covered_by": null, "default_selected": %s' \
-        "$((size_kb * 1024))" "$size_known" "$default_selected"
+    printf ', "bytes": %s, "size_known": %s, "count": %s, "covered_by": %s, "default_selected": %s' \
+        "$((size_kb * 1024))" "$size_known" "$count" "$covered_json" "$default_selected"
     printf ', "artifact": '
     history_json_string "${CLEAN_PLAN_R_EXTRA[$idx]}"
     printf ', "age": '
@@ -126,6 +154,42 @@ purge_plan_finish_json() {
     printf '\n'
 }
 
+# clean_plan_stage_path_selection hook: the approved-items records of a T
+# record ($1, kept when $2 is true). A kept trim whose whole folder is not
+# kept approves each `incremental`, `deps`, `build` and `.fingerprint` of the
+# folder's profiles as it is now, so the sinks can take trim entries but never
+# folder itself or a binary beside them; the folder's own unticked A
+# record keeps it out. When the profiles cannot be listed in time nothing is
+# approved and the record's id goes to PURGE_TRIM_STAGE_FAILED_IDS, so apply
+# names that cause instead of letting every entry meet the gate. An A record
+# returns 1: the shared whole-path rule stages it.
+PURGE_TRIM_STAGE_FAILED_IDS=""
+purge_plan_stage_record() {
+    local idx="$1" kept="$2" rs=$'\x1f'
+    [[ "${CLEAN_PLAN_R_KIND[$idx]}" == "T" ]] || return 1
+    [[ "$kept" == "true" ]] || return 0
+    [[ "$CLEAN_PLAN_SELECTED_IDS" != *"$rs${CLEAN_PLAN_R_COVERED[$idx]}$rs"* ]] || return 0
+    local target profiles profile name scope identity
+    target=$(_clean_plan_normalize_path "${CLEAN_PLAN_R_TARGET[$idx]}")
+    profiles=$(create_temp_file) || return 0
+    if _purge_rust_trim_profiles "$target" "$profiles" "$((SECONDS + MOLE_TIMEOUT_HINT_SCAN_SEC))"; then
+        while IFS= read -r -d '' profile; do
+            for name in incremental "${PURGE_RUST_TRIM_AGED_DIRS[@]}"; do
+                scope="$profile/$name"
+                [[ -e "$scope" || -L "$scope" ]] || continue
+                # A symlinked deps, build or .fingerprint is never trimmed.
+                [[ "$name" == "incremental" || ! -L "$scope" ]] || continue
+                identity=$("$STAT_BSD" -f '%d:%i' "$scope" 2> /dev/null) || continue
+                printf 'P\0%s\0%s\0\0' "$scope" "$identity"
+            done
+        done < "$profiles"
+    else
+        PURGE_TRIM_STAGE_FAILED_IDS+="$rs${CLEAN_PLAN_R_ID[$idx]}$rs"
+    fi
+    rm -f "$profiles" # SAFE: this function's own registered temp file
+    return 0
+}
+
 # Apply a reviewed plan that clean_plan_load_selection accepted: build the
 # menu run's arrays from the kept records only, narrow every sink to them
 # (MOLE_APPLY_PLAN), and remove them through _purge_remove_selected_items.
@@ -135,7 +199,7 @@ purge_plan_apply() {
     local selected="$CLEAN_PLAN_SELECTED_IDS"
     local -a selected_indices=() item_paths=() item_display_paths=() item_sizes=() item_size_unknown_flags=()
     local -a item_activity_states=() item_expected_parents=() item_expected_parent_ids=() item_expected_target_ids=()
-    local -a item_scan_root_indexes=()
+    local -a item_scan_root_indexes=() item_kinds=() item_trim_counts=() item_covered_rows=() item_record_ids=()
     local -a scan_roots=() scan_root_parents=() scan_root_parent_ids=() scan_root_target_ids=()
     local -a scan_root_physical_paths=() scan_root_physical_parents=() scan_root_physical_parent_ids=()
     local -a scan_root_physical_target_ids=()
@@ -149,6 +213,12 @@ purge_plan_apply() {
 
     for ((idx = 0; idx < record_count; idx++)); do
         [[ "$selected" == *"$rs${CLEAN_PLAN_R_ID[$idx]}$rs"* ]] || continue
+        # A trim kept together with its whole folder is dropped: the whole
+        # removal wins and the trim logs nothing.
+        if [[ "${CLEAN_PLAN_R_KIND[$idx]}" == "T" &&
+            "$selected" == *"$rs${CLEAN_PLAN_R_COVERED[$idx]}$rs"* ]]; then
+            continue
+        fi
         path="${CLEAN_PLAN_R_TARGET[$idx]}"
         # Discovery leaves whitelisted folders out; a whitelist entry added
         # since the review, on the folder or on its SwiftPM scratch root,
@@ -175,6 +245,12 @@ purge_plan_apply() {
         fi
         display=$(format_purge_target_path "$path")
         [[ "${CLEAN_PLAN_R_AUX[$((at + 2))]}" != "true" ]] || display="[cloud] $display"
+        local item_kind="A" trim_count=1
+        if [[ "${CLEAN_PLAN_R_KIND[$idx]}" == "T" ]]; then
+            item_kind="T"
+            trim_count="${CLEAN_PLAN_R_COUNT[$idx]}"
+            display="$display (trim)"
+        fi
         local size_kb="${CLEAN_PLAN_R_SIZE[$idx]}"
         [[ "$size_kb" =~ ^[0-9]+$ ]] || size_kb=0
         local size_unknown=false
@@ -197,12 +273,17 @@ purge_plan_apply() {
         scan_root_physical_parent_ids+=("${CLEAN_PLAN_R_AUX[$((at + 12))]}")
         scan_root_physical_target_ids+=("${CLEAN_PLAN_R_AUX[$((at + 13))]}")
         item_scan_root_indexes+=("$count")
+        item_kinds+=("$item_kind")
+        item_trim_counts+=("$trim_count")
+        item_covered_rows+=(-1)
+        item_record_ids+=("${CLEAN_PLAN_R_ID[$idx]}")
         selected_indices+=("$count")
         count=$((count + 1))
     done
 
     # Every sink also asks the plan: only a kept folder whose dev:inode is
     # still the reviewed one may go, and never an unticked one.
+    PURGE_TRIM_STAGE_FAILED_IDS=""
     if ! clean_plan_stage_path_selection; then
         _clean_plan_refuse "the approved items of plan $CLEAN_PLAN_ID could not be staged ($_MOLE_APPLY_PLAN_LOAD_ERROR)." \
             "Run 'mo purge --dry-run --json' to create a new plan, then apply its plan_id."
@@ -220,6 +301,22 @@ purge_plan_apply() {
         _purge_note_review_skip "$path" "whitelist"
         PURGE_RUN_OUTCOME="incomplete"
     done
+    # A trim whose scope could not be listed while staging has nothing the
+    # sinks may take; say so instead of refusing each entry at the gate.
+    if [[ -n "$PURGE_TRIM_STAGE_FAILED_IDS" ]]; then
+        local -a staged_indices=()
+        local apply_index
+        for apply_index in "${selected_indices[@]}"; do
+            if [[ "$PURGE_TRIM_STAGE_FAILED_IDS" == *"$rs${item_record_ids[apply_index]}$rs"* ]]; then
+                echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped ${item_display_paths[apply_index]} (its trim set could not be listed in time; run mo purge again)"
+                _purge_note_review_skip "${item_paths[apply_index]}" "could not list trim"
+                PURGE_RUN_OUTCOME="incomplete"
+                continue
+            fi
+            staged_indices+=("$apply_index")
+        done
+        selected_indices=("${staged_indices[@]+"${staged_indices[@]}"}")
+    fi
     [[ ${#selected_indices[@]} -gt 0 ]] || return 0
     _purge_remove_selected_items
 }

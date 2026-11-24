@@ -265,9 +265,9 @@ clean_plan_save() {
 # The header is magic, schema, created, uid and command. Every record has a
 # kind and nine fields (id, section, target, devino, size_kb,
 # count, size_known, covered_by, extra). Clean writes P (path) and C (command)
-# records; purge writes A (whole artifact folder) records and installer I
-# (installer file) records, which add a count and that many command fields,
-# so a later kind can carry its own.
+# records; purge writes A (whole artifact folder) and T (Rust target trim)
+# records and installer I (installer file) records, which add a count and
+# that many command fields, so a later kind can carry its own.
 _clean_plan_read() {
     local file="$1"
     CLEAN_PLAN_R_CREATED=""
@@ -314,7 +314,7 @@ _clean_plan_read() {
                 break
             fi
             case "$command:$kind" in
-                clean:P | clean:C | purge:A | installer:I) ;;
+                clean:P | clean:C | purge:A | purge:T | installer:I) ;;
                 *) return 1 ;;
             esac
             IFS= read -r -d '' id &&
@@ -747,20 +747,30 @@ clean_plan_parent_unchanged() {
 # For a command whose plan items are each one whole path (purge, installer):
 # write every record of the loaded plan as the approved-items file the sinks
 # read (MOLE_APPLY_PLAN), P with its recorded dev:inode when the selection
-# kept it and D otherwise, and load it. 1 when it cannot be staged, with
-# _MOLE_APPLY_PLAN_LOAD_ERROR naming why.
+# kept it and D otherwise, and load it. A command whose plan also has items
+# that are not one whole path (purge's Rust trim) defines
+# <command>_plan_stage_record, which writes such a record's entries itself
+# and returns 1 for a record the whole-path rule stages. 1 when it cannot be
+# staged, with _MOLE_APPLY_PLAN_LOAD_ERROR naming why.
 clean_plan_stage_path_selection() {
     local rs=$'\x1f'
-    local selected="$CLEAN_PLAN_SELECTED_IDS" idx path approved
+    local selected="$CLEAN_PLAN_SELECTED_IDS" idx path approved kept
     local record_count=${#CLEAN_PLAN_R_ID[@]}
+    local stage_hook="${CLEAN_PLAN_COMMAND}_plan_stage_record"
+    declare -F "$stage_hook" > /dev/null || stage_hook=""
     if ! approved=$(create_temp_file); then
         _MOLE_APPLY_PLAN_LOAD_ERROR="no temporary file for the approved items"
         return 1
     fi
     {
         for ((idx = 0; idx < record_count; idx++)); do
+            kept=false
+            [[ "$selected" != *"$rs${CLEAN_PLAN_R_ID[$idx]}$rs"* ]] || kept=true
+            if [[ -n "$stage_hook" ]] && "$stage_hook" "$idx" "$kept"; then
+                continue
+            fi
             path=$(_clean_plan_normalize_path "${CLEAN_PLAN_R_TARGET[$idx]}")
-            if [[ "$selected" == *"$rs${CLEAN_PLAN_R_ID[$idx]}$rs"* ]]; then
+            if [[ "$kept" == "true" ]]; then
                 printf 'P\0%s\0%s\0\0' "$path" "${CLEAN_PLAN_R_DEVINO[$idx]}"
             else
                 printf 'D\0%s\0\0\0' "$path"

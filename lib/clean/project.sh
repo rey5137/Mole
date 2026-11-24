@@ -1738,7 +1738,14 @@ _mole_purge_final_remove_guard() {
     is_protected_purge_artifact "$path" || protection_rc=$?
     [[ $protection_rc -le 128 ]] || return "$protection_rc"
     [[ $protection_rc -ne 0 ]] || return 1
+    _mole_purge_final_artifact_unchanged "$path"
+}
 
+# Last identity proof of both final guards: the scan root, lexically and
+# physically, and the artifact folder $1 are still the reviewed ones, and the
+# folder still lies under that root.
+_mole_purge_final_artifact_unchanged() {
+    local path="$1"
     _mole_path_matches_identity \
         "${_MOLE_PURGE_FINAL_SCAN_ROOT:-}" \
         "${_MOLE_PURGE_FINAL_SCAN_ROOT_PARENT:-}" \
@@ -1759,6 +1766,19 @@ _mole_purge_final_remove_guard() {
     [[ "$_MOLE_PATH_SNAPSHOT_PARENT" == "/" ]] && current_physical_path="/${path##*/}"
     is_safe_project_artifact_under_root \
         "$current_physical_path" "${_MOLE_PURGE_FINAL_SCAN_ROOT_PHYSICAL:-}"
+}
+
+# Final safe_remove hook for one entry of a Rust `target` trim. The in-use and
+# protection probes ran once for the folder before its trim set was listed;
+# per entry, rebind the scan root and the reviewed `target` folder and require
+# the entry to sit where the trim rule puts one, with no symlink in between.
+_mole_purge_trim_final_guard() {
+    local entry="$1" target="${_MOLE_PURGE_FINAL_TRIM_TARGET:-}"
+    [[ -n "$target" ]] || return 1
+    _mole_purge_final_artifact_unchanged "$target" || return 1
+    local physical_target="${_MOLE_PATH_SNAPSHOT_PARENT%/}/${target##*/}"
+    [[ "$_MOLE_PATH_SNAPSHOT_PARENT" == "/" ]] && physical_target="/${target##*/}"
+    _purge_rust_trim_entry_in_scope "$entry" "$target" "$physical_target"
 }
 
 # Args: $1 - path, $2 - optional shared deadline in SECONDS
@@ -1818,6 +1838,179 @@ get_dir_size_kb() {
 
 _mole_purge_size_budget_seconds() {
     mole_purge_timeout_budget_seconds "${1:-$MOLE_TIMEOUT_DISK_VERIFY_SEC}" 30
+}
+
+# A Rust `target` folder: a sibling Cargo.toml or its own .rustc_info.json,
+# and no sibling pom.xml, since a Maven build folder has the same name.
+is_rust_target_artifact() {
+    local path="${1%/}"
+    [[ "${path##*/}" == "target" && -d "$path" && ! -L "$path" ]] || return 1
+    [[ ! -e "${path%/*}/pom.xml" && ! -L "${path%/*}/pom.xml" ]] || return 1
+    [[ -f "${path%/*}/Cargo.toml" || -f "$path/.rustc_info.json" ]]
+}
+
+# Age past which a trim takes a Rust build output, in days (`find -mtime +7`).
+readonly PURGE_RUST_TRIM_AGE_DAYS=7
+# What a trim may take inside a profile folder: the whole `incremental`, and
+# the old direct entries of these three.
+readonly PURGE_RUST_TRIM_AGED_DIRS=("deps" "build" ".fingerprint")
+
+# Write the profile folders of the Rust target $1 to $2, NUL-separated: a real
+# folder one level down, or two levels down under a folder that is not itself
+# a profile (a cross-compile triple), that holds a real `deps` or
+# `.fingerprint` folder. The walk never follows a symlink, so a symlinked
+# profile or triple is never listed. Returns 0 when complete, 124 when the
+# walk ran out of time, a signal status, or 1; on nonzero $2 means nothing.
+_purge_rust_trim_profiles() {
+    local target="${1%/}" out="$2" deadline="${3:-}" duration markers rc=0
+    : > "$out" || return 1
+    duration=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_HINT_SCAN_SEC" "$deadline") || return 124
+    markers=$(create_temp_file) || return 1
+    run_with_timeout "$duration" "$_MOLE_PURGE_FIND" "$target" -mindepth 2 -maxdepth 3 -type d \
+        \( -name deps -o -name .fingerprint \) -print0 > "$markers" 2> /dev/null < /dev/null || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        rm -f "$markers" # SAFE: this function's own mktemp scratch file
+        mole_rc_timeout_or_signal "$rc" && return "$rc"
+        return 1
+    fi
+    local nl=$'\n' marker profile rel
+    local seen="$nl"
+    local -a depth_two=()
+    while IFS= read -r -d '' marker; do
+        profile="${marker%/*}"
+        rel="${profile#"$target"/}"
+        [[ "$seen" != *"$nl$profile$nl"* ]] || continue
+        seen+="$profile$nl"
+        if [[ "$rel" == */* ]]; then
+            depth_two+=("$profile")
+        else
+            printf '%s\0' "$profile"
+        fi
+    done < "$markers" > "$out"
+    rm -f "$markers" # SAFE: this function's own mktemp scratch file
+    for profile in "${depth_two[@]+"${depth_two[@]}"}"; do
+        # target/debug/build/<pkg>/deps is no profile: its parent is one.
+        [[ "$seen" != *"$nl${profile%/*}$nl"* ]] || continue
+        printf '%s\0' "$profile" >> "$out"
+    done
+    return 0
+}
+
+# Write the trim set of the Rust target $1 to $2, NUL-separated, recomputed
+# from the disk on every call (the menu sizes it, apply recomputes it, never a
+# saved list): each profile's `incremental` (a real folder, or a symlink taken
+# as the link), and every direct entry of its real `deps`, `build` and
+# `.fingerprint` folders last modified more than PURGE_RUST_TRIM_AGE_DAYS days
+# ago. mtime, not atime, which macOS does not keep reliably. Accepted cost: a
+# trim can make Cargo recompile dependencies that did not change. Nothing else
+# in `target` is listed: binaries, examples, doc, .rustc_info.json and
+# CACHEDIR.TAG stay. Statuses as _purge_rust_trim_profiles; a partial list is
+# never published as complete.
+purge_rust_trim_list() {
+    local target="${1%/}" out="$2" deadline="${3:-}" profiles rc=0
+    : > "$out" || return 1
+    profiles=$(create_temp_file) || return 1
+    _purge_rust_trim_profiles "$target" "$profiles" "$deadline" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        rm -f "$profiles" # SAFE: this function's own mktemp scratch file
+        return "$rc"
+    fi
+    local profile name
+    local -a aged_dirs=()
+    while IFS= read -r -d '' profile; do
+        if [[ -L "$profile/incremental" || -d "$profile/incremental" ]]; then
+            printf '%s\0' "$profile/incremental"
+        fi
+        for name in "${PURGE_RUST_TRIM_AGED_DIRS[@]}"; do
+            [[ -d "$profile/$name" && ! -L "$profile/$name" ]] && aged_dirs+=("$profile/$name")
+        done
+    done < "$profiles" > "$out"
+    rm -f "$profiles" # SAFE: this function's own mktemp scratch file
+    [[ ${#aged_dirs[@]} -gt 0 ]] || return 0
+    local duration
+    duration=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_HINT_SCAN_SEC" "$deadline") || {
+        : > "$out"
+        return 124
+    }
+    run_with_timeout "$duration" "$_MOLE_PURGE_FIND" "${aged_dirs[@]}" -mindepth 1 -maxdepth 1 \
+        -mtime "+$PURGE_RUST_TRIM_AGE_DAYS" -print0 >> "$out" 2> /dev/null < /dev/null || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        : > "$out"
+        mole_rc_timeout_or_signal "$rc" && return "$rc"
+        return 1
+    fi
+    return 0
+}
+
+# Size the trim set of the Rust target $1 for the menu and the plan, using the
+# scratch file $3 for its list. Prints `<entries> <kb>`, `<entries> TIMEOUT`
+# when the list completed but its size did not, or TIMEOUT / ERROR when the
+# list itself did not complete (no trim row is offered then).
+purge_rust_trim_measure() {
+    local target="$1" deadline="${2:-}" list="$3" rc=0
+    purge_rust_trim_list "$target" "$list" "$deadline" || rc=$?
+    if mole_rc_timeout "$rc"; then
+        echo "TIMEOUT"
+        return 0
+    elif [[ $rc -ne 0 ]]; then
+        echo "ERROR"
+        return 0
+    fi
+    local count
+    count=$(LC_ALL=C /usr/bin/tr -cd '\000' < "$list" | /usr/bin/wc -c | /usr/bin/tr -d ' ') || count=""
+    if [[ ! "$count" =~ ^[0-9]+$ ]]; then
+        echo "ERROR"
+        return 0
+    fi
+    if [[ $count -eq 0 ]]; then
+        echo "0 0"
+        return 0
+    fi
+    local duration size_kb=""
+    duration=$(_mole_timeout_with_deadline "${MO_PURGE_SIZE_TIMEOUT_SEC:-15}" "$deadline") || {
+        echo "$count TIMEOUT"
+        return 0
+    }
+    rc=0
+    size_kb=$(run_with_timeout "$duration" /usr/bin/xargs -0 du -skP < "$list" 2> /dev/null |
+        LC_ALL=C awk '{ total += $1 } END { printf "%d", total }') || rc=$?
+    if [[ $rc -ne 0 || ! "$size_kb" =~ ^[0-9]+$ ]]; then
+        debug_log "Rust trim size unavailable (exit $rc): $target"
+        echo "$count TIMEOUT"
+        return 0
+    fi
+    echo "$count $size_kb"
+}
+
+# 0 when $1 sits where a trim entry can: <profile>/incremental, or a direct
+# entry of <profile>/deps, build or .fingerprint, with the profile one level
+# below the target $2 or two under a triple, and no symlink between the
+# target and the entry's folder. The final sink guard asks this per entry.
+_purge_rust_trim_entry_in_scope() {
+    local entry="$1" target="${2%/}" physical_target="$3"
+    [[ "$entry" == "$target/"* ]] || return 1
+    local rel="${entry#"$target"/}" parent_rel leaf
+    leaf="${rel##*/}"
+    [[ "$rel" == */* && -n "$leaf" && "$leaf" != "." && "$leaf" != ".." ]] || return 1
+    parent_rel="${rel%/*}"
+    local -a parts=()
+    IFS='/' read -r -a parts <<< "$parent_rel"
+    local part
+    for part in "${parts[@]}"; do
+        [[ -n "$part" && "$part" != "." && "$part" != ".." ]] || return 1
+    done
+    local last="${parts[${#parts[@]} - 1]}" depth=${#parts[@]}
+    if [[ "$leaf" == "incremental" && ($depth -eq 1 || $depth -eq 2) ]]; then
+        :
+    elif [[ ($depth -eq 2 || $depth -eq 3) &&
+        ("$last" == "deps" || "$last" == "build" || "$last" == ".fingerprint") ]]; then
+        :
+    else
+        return 1
+    fi
+    local physical_parent=""
+    physical_parent=$(cd -P "$target/$parent_rel" 2> /dev/null && pwd -P) || return 1
+    [[ "$physical_parent" == "${physical_target%/}/$parent_rel" ]]
 }
 
 # Resolve the owning project for a purge artifact. Monorepo indicators take
@@ -1947,13 +2140,17 @@ select_purge_categories() {
     local rendered_width=0 menu_ready=true
 
     # Selection and group totals belong to the menu, keyed by canonical row index.
-    local -a selected=() sizes=() recent_flags=() age_labels=()
+    local -a selected=() sizes=() recent_flags=() age_labels=() covered_rows=() trim_rows=()
     local -a group_starts=() group_ends=() row_groups=() group_sizes=() group_selected=() group_unknown=()
     local selected_size=0 selected_count=0 selected_unknown=0 group=-1
     local previous_project_id="" project_id=""
     IFS=',' read -r -a sizes <<< "${PURGE_CATEGORY_SIZES:-}"
     IFS=',' read -r -a recent_flags <<< "${PURGE_RECENT_CATEGORIES:-}"
     IFS=',' read -r -a age_labels <<< "${PURGE_AGE_LABELS:-}"
+    IFS=',' read -r -a covered_rows <<< "${PURGE_COVERED_ROWS:-}"
+    for ((i = 0; i < total_items; i++)); do
+        [[ "${covered_rows[i]:--1}" -lt 0 ]] || trim_rows[covered_rows[i]]=$i
+    done
     for ((i = 0; i < total_items; i++)); do
         project_id="${PURGE_CATEGORY_PROJECT_IDS_ARRAY[i]:-}"
         if [[ $i -eq 0 || -z "$project_id" || "$project_id" != "$previous_project_id" ]]; then
@@ -1966,34 +2163,45 @@ select_purge_categories() {
         previous_project_id="$project_id"
         row_groups[i]=$group
         group_ends[group]=$i
+        selected[i]=false
+        # A trim row is part of its whole row's folder: it adds nothing to the
+        # project total.
+        [[ "${covered_rows[i]:--1}" -lt 0 ]] || continue
         group_sizes[group]=$((group_sizes[group] + ${sizes[i]:-0}))
         if [[ "${PURGE_CATEGORY_SIZE_UNKNOWN_FLAGS_ARRAY[i]:-false}" == true ]]; then
             group_unknown[group]=true
         fi
-        selected[i]=false
-        if [[ "${recent_flags[i]:-false}" != true ]]; then
-            selected[i]=true
-            selected_count=$((selected_count + 1))
-            selected_size=$((selected_size + ${sizes[i]:-0}))
-            group_selected[group]=$((group_selected[group] + 1))
-            if [[ "${PURGE_CATEGORY_SIZE_UNKNOWN_FLAGS_ARRAY[i]:-false}" == true ]]; then
-                selected_unknown=$((selected_unknown + 1))
-            fi
-        fi
     done
+    # Add or take away one row in the selected count, size and unmeasured count.
+    _purge_menu_count_row() {
+        local index="$1" delta="$2"
+        selected_count=$((selected_count + delta))
+        selected_size=$((selected_size + delta * ${sizes[index]:-0}))
+        if [[ "${PURGE_CATEGORY_SIZE_UNKNOWN_FLAGS_ARRAY[index]:-false}" == true ]]; then
+            selected_unknown=$((selected_unknown + delta))
+        fi
+    }
+    # A trim whose whole row is ticked is not counted: the whole removal wins.
     set_selected() {
         local index="$1" value="$2" delta=1
         [[ "${selected[index]}" != "$value" ]] || return 0
         [[ "$value" == true ]] || delta=-1
         selected[index]="$value"
-        selected_count=$((selected_count + delta))
-        selected_size=$((selected_size + delta * ${sizes[index]:-0}))
         local group_index="${row_groups[index]}"
         group_selected[group_index]=$((group_selected[group_index] + delta))
-        if [[ "${PURGE_CATEGORY_SIZE_UNKNOWN_FLAGS_ARRAY[index]:-false}" == true ]]; then
-            selected_unknown=$((selected_unknown + delta))
+        local cover="${covered_rows[index]:--1}"
+        if [[ $cover -ge 0 && "${selected[cover]}" == true ]]; then
+            return 0
+        fi
+        _purge_menu_count_row "$index" "$delta"
+        local trim="${trim_rows[index]:--1}"
+        if [[ $trim -ge 0 && "${selected[trim]}" == true ]]; then
+            _purge_menu_count_row "$trim" "$((-delta))"
         fi
     }
+    for ((i = 0; i < total_items; i++)); do
+        [[ "${recent_flags[i]:-false}" == true ]] || set_selected "$i" true
+    done
     local original_stty=""
     local previous_exit_trap=""
     local previous_int_trap=""
@@ -2455,6 +2663,46 @@ _purge_note_review_skip() {
     [[ "${3:-}" == "logged" ]] || log_operation "purge" "SKIPPED" "$1" "$2"
     PURGE_APPLY_SKIPPED="${PURGE_APPLY_SKIPPED:+$PURGE_APPLY_SKIPPED
 }$(mole_tilde_path "$1") ($2)"
+}
+
+# After the whole row $2 of a Rust `target`, add its trim row from the result
+# file $1 that purge_rust_trim_measure wrote: only when the trim set listed
+# completely and is not empty. A trim set whose size did not finish is
+# offered with an unknown size. The row is never pre-selected (its recent
+# flag is set) and keeps the whole row's project, identities and age.
+# shellcheck disable=SC2154  # The item_* arrays are locals of clean_project_artifacts.
+_purge_add_trim_row() {
+    local result_file="$1" whole="$2"
+    [[ -n "$result_file" && -r "$result_file" ]] || return 0
+    local count="" size="" extra=""
+    read -r count size extra < "$result_file" 2> /dev/null || true
+    [[ "$count" =~ ^[0-9]+$ && $count -gt 0 && -z "$extra" ]] || return 0
+    local size_kb=0 size_unknown=false
+    if [[ "$size" =~ ^[0-9]+$ ]]; then
+        size_kb="$size"
+    elif [[ "$size" == "TIMEOUT" ]]; then
+        size_unknown=true
+    else
+        return 0
+    fi
+    menu_options+=("  trim")
+    item_paths+=("${item_paths[whole]}")
+    item_display_paths+=("${item_display_paths[whole]} (trim)")
+    item_project_identities+=("${item_project_identities[whole]}")
+    item_project_paths+=("${item_project_paths[whole]}")
+    item_sizes+=("$size_kb")
+    item_size_unknown_flags+=("$size_unknown")
+    item_recent_flags+=(true)
+    item_activity_states+=("${item_activity_states[whole]}")
+    item_cloud_flags+=("${item_cloud_flags[whole]}")
+    item_expected_parents+=("${item_expected_parents[whole]}")
+    item_expected_parent_ids+=("${item_expected_parent_ids[whole]}")
+    item_expected_target_ids+=("${item_expected_target_ids[whole]}")
+    item_scan_root_indexes+=("${item_scan_root_indexes[whole]}")
+    item_age_labels+=("${item_age_labels[whole]}")
+    item_kinds+=("T")
+    item_trim_counts+=("$count")
+    item_covered_rows+=("$whole")
 }
 
 # Main cleanup function - scans and prompts user to select artifacts to clean.
@@ -3225,18 +3473,40 @@ clean_project_artifacts() {
     trap '_handle_purge_size_interrupt 143' TERM
     _size_traps_installed=true
 
+    # A Rust `target` also gets its trim set listed and sized in the same
+    # pool and budget (_trim_tmpfiles, aligned with _size_tmpfiles, empty for
+    # every other artifact; _trim_listfiles are the workers' scratch lists).
+    local -a _trim_tmpfiles=() _trim_listfiles=()
     for _sz_item in "${safe_to_clean[@]}"; do
         [[ $_size_interrupt_status -ge 128 ]] && break
-        local _stmp
+        local _stmp _ttmp=""
         _stmp=$(mktemp)
         register_temp_file "$_stmp"
         _size_tmpfiles+=("$_stmp")
+        if is_rust_target_artifact "$_sz_item"; then
+            local _tlist
+            _ttmp=$(mktemp)
+            register_temp_file "$_ttmp"
+            _tlist=$(mktemp)
+            register_temp_file "$_tlist"
+            _trim_listfiles+=("$_tlist")
+        fi
+        _trim_tmpfiles+=("$_ttmp")
         if [[ $SECONDS -ge $_size_deadline ]]; then
             printf 'TIMEOUT\n' > "$_stmp"
+            [[ -z "$_ttmp" ]] || printf 'TIMEOUT\n' > "$_ttmp"
             continue
         fi
         (get_dir_size_kb "$_sz_item" "$_size_deadline" > "$_stmp" 2> /dev/null) < /dev/null &
         _size_pids+=($!)
+        if [[ -n "$_ttmp" ]]; then
+            if [[ ${#_size_pids[@]} -ge $_max_size_jobs ]]; then
+                _reap_one_size_pid
+                [[ $_size_interrupt_status -ge 128 ]] && break
+            fi
+            (purge_rust_trim_measure "$_sz_item" "$_size_deadline" "$_tlist" > "$_ttmp" 2> /dev/null) < /dev/null &
+            _size_pids+=($!)
+        fi
 
         if [[ ${#_size_pids[@]} -ge $_max_size_jobs ]]; then
             _reap_one_size_pid
@@ -3253,7 +3523,9 @@ clean_project_artifacts() {
 
     if [[ $_size_interrupt_status -ge 128 ]]; then
         local interrupted_size_temp
-        for interrupted_size_temp in "${_size_tmpfiles[@]+"${_size_tmpfiles[@]}"}"; do
+        for interrupted_size_temp in "${_size_tmpfiles[@]+"${_size_tmpfiles[@]}"}" \
+            "${_trim_tmpfiles[@]+"${_trim_tmpfiles[@]}"}" "${_trim_listfiles[@]+"${_trim_listfiles[@]}"}"; do
+            [[ -n "$interrupted_size_temp" ]] || continue
             rm -f "$interrupted_size_temp" 2> /dev/null || true # SAFE: exact scratch file created by mktemp above
         done
         if [[ -t 1 ]]; then
@@ -3274,6 +3546,12 @@ clean_project_artifacts() {
     local -a item_expected_parent_ids=()
     local -a item_expected_target_ids=()
     local -a item_scan_root_indexes=()
+    # A row is a whole artifact (A) or the trim of a Rust `target` (T), which
+    # follows its whole row; item_covered_rows names that row (-1 for none)
+    # and item_trim_counts the trim's entry count (1 for a whole row).
+    local -a item_kinds=()
+    local -a item_trim_counts=()
+    local -a item_covered_rows=()
     # Resolve project ownership once per artifact. An indicator-backed root is
     # preferred. Without one, the artifact's direct parent is the narrowest
     # exact ownership boundary we can prove without grouping unrelated paths.
@@ -3397,8 +3675,16 @@ clean_project_artifacts() {
         else
             item_age_labels+=("$((_age_d / 365))y")
         fi
+        item_kinds+=("A")
+        item_trim_counts+=(1)
+        item_covered_rows+=(-1)
+        _purge_add_trim_row "${_trim_tmpfiles[$item_index]:-}" "$((${#item_paths[@]} - 1))"
     done
     rm -f "${_size_tmpfiles[@]+"${_size_tmpfiles[@]}"}" 2> /dev/null || true # SAFE: exact registered mktemp size result files
+    local _trim_scratch
+    for _trim_scratch in "${_trim_tmpfiles[@]+"${_trim_tmpfiles[@]}"}" "${_trim_listfiles[@]+"${_trim_listfiles[@]}"}"; do
+        [[ -z "$_trim_scratch" ]] || rm -f "$_trim_scratch" 2> /dev/null || true # SAFE: exact registered mktemp trim scratch file
+    done
 
     # Keep every exact project together. Project groups are ordered by their
     # aggregate known size, then artifacts within each group by item size. Only
@@ -3420,7 +3706,10 @@ clean_project_artifacts() {
             encoded_identity="${encoded_identity//%/%25}"
             encoded_identity="${encoded_identity//|/%7C}"
             encoded_identity="${encoded_identity//$'\n'/%0A}"
-            printf '%s|%d|%d\n' "$encoded_identity" "$i" "${item_sizes[i]}"
+            # A trim is part of its whole row's size; it adds nothing here.
+            local grouping_size="${item_sizes[i]}"
+            [[ "${item_kinds[i]}" != "T" ]] || grouping_size=0
+            printf '%s|%d|%d\n' "$encoded_identity" "$i" "$grouping_size"
         done > "$grouping_temp"
 
         local previous_encoded_identity=""
@@ -3452,18 +3741,29 @@ clean_project_artifacts() {
         done < <(sort -t'|' -k2,2nr -k1,1n "$group_sort_temp")
         rm -f "$group_sort_temp"
 
+        # A trim row sorts by its whole row's keys and directly after it.
         local item_sort_temp
         item_sort_temp=$(mktemp)
         for ((i = 0; i < ${#item_sizes[@]}; i++)); do
             group_index=${item_group_indices[i]}
-            printf '%d|%d|%d\n' "${group_ranks[group_index]}" "${item_sizes[i]}" "$i"
+            local sort_anchor=$i sort_sub=0
+            if [[ "${item_kinds[i]}" == "T" ]]; then
+                sort_anchor="${item_covered_rows[i]}"
+                sort_sub=1
+            fi
+            printf '%d|%d|%d|%d|%d\n' "${group_ranks[group_index]}" "${item_sizes[sort_anchor]}" "$sort_anchor" \
+                "$sort_sub" "$i"
         done > "$item_sort_temp"
 
         local -a sorted_indices=()
-        while IFS='|' read -r group_rank size idx; do
+        while IFS='|' read -r group_rank size sort_anchor sort_sub idx; do
             sorted_indices+=("$idx")
-        done < <(sort -t'|' -k1,1n -k2,2nr -k3,3n "$item_sort_temp")
+        done < <(sort -t'|' -k1,1n -k2,2nr -k3,3n -k4,4n "$item_sort_temp")
         rm -f "$item_sort_temp"
+        local -a sorted_positions=()
+        for ((i = 0; i < ${#sorted_indices[@]}; i++)); do
+            sorted_positions[sorted_indices[i]]=$i
+        done
 
         # Rebuild arrays in sorted order
         local -a sorted_menu_options=()
@@ -3481,6 +3781,9 @@ clean_project_artifacts() {
         local -a sorted_item_expected_parent_ids=()
         local -a sorted_item_expected_target_ids=()
         local -a sorted_item_scan_root_indexes=()
+        local -a sorted_item_kinds=()
+        local -a sorted_item_trim_counts=()
+        local -a sorted_item_covered_rows=()
 
         for idx in "${sorted_indices[@]}"; do
             sorted_menu_options+=("${menu_options[idx]}")
@@ -3498,6 +3801,13 @@ clean_project_artifacts() {
             sorted_item_expected_parent_ids+=("${item_expected_parent_ids[idx]}")
             sorted_item_expected_target_ids+=("${item_expected_target_ids[idx]}")
             sorted_item_scan_root_indexes+=("${item_scan_root_indexes[idx]}")
+            sorted_item_kinds+=("${item_kinds[idx]}")
+            sorted_item_trim_counts+=("${item_trim_counts[idx]}")
+            if [[ "${item_covered_rows[idx]}" -ge 0 ]]; then
+                sorted_item_covered_rows+=("${sorted_positions[${item_covered_rows[idx]}]}")
+            else
+                sorted_item_covered_rows+=(-1)
+            fi
         done
 
         # Replace original arrays with sorted versions
@@ -3516,6 +3826,9 @@ clean_project_artifacts() {
         item_expected_parent_ids=("${sorted_item_expected_parent_ids[@]}")
         item_expected_target_ids=("${sorted_item_expected_target_ids[@]}")
         item_scan_root_indexes=("${sorted_item_scan_root_indexes[@]}")
+        item_kinds=("${sorted_item_kinds[@]}")
+        item_trim_counts=("${sorted_item_trim_counts[@]}")
+        item_covered_rows=("${sorted_item_covered_rows[@]}")
     fi
     if [[ -t 1 ]]; then
         stop_inline_spinner
@@ -3557,6 +3870,10 @@ clean_project_artifacts() {
         IFS=,
         echo "${item_age_labels[*]-}"
     )
+    export PURGE_COVERED_ROWS=$(
+        IFS=,
+        echo "${item_covered_rows[*]-}"
+    )
     # Interactive selection (only if terminal is available)
     PURGE_SELECTION_RESULT=""
     PURGE_CATEGORY_FULL_PATHS_ARRAY=("${item_display_paths[@]}")
@@ -3569,7 +3886,7 @@ clean_project_artifacts() {
             PURGE_CATEGORY_PROJECT_IDS_ARRAY=()
             PURGE_CATEGORY_PROJECT_PATHS_ARRAY=()
             PURGE_CATEGORY_SIZE_UNKNOWN_FLAGS_ARRAY=()
-            unset PURGE_CATEGORY_SIZES PURGE_RECENT_CATEGORIES PURGE_AGE_LABELS PURGE_SELECTION_RESULT
+            unset PURGE_CATEGORY_SIZES PURGE_RECENT_CATEGORIES PURGE_AGE_LABELS PURGE_COVERED_ROWS PURGE_SELECTION_RESULT
             PURGE_RUN_OUTCOME="cancelled"
             return 0
         fi
@@ -3601,7 +3918,7 @@ clean_project_artifacts() {
         PURGE_CATEGORY_PROJECT_IDS_ARRAY=()
         PURGE_CATEGORY_PROJECT_PATHS_ARRAY=()
         PURGE_CATEGORY_SIZE_UNKNOWN_FLAGS_ARRAY=()
-        unset PURGE_CATEGORY_SIZES PURGE_RECENT_CATEGORIES PURGE_AGE_LABELS PURGE_SELECTION_RESULT
+        unset PURGE_CATEGORY_SIZES PURGE_RECENT_CATEGORIES PURGE_AGE_LABELS PURGE_COVERED_ROWS PURGE_SELECTION_RESULT
         [[ "$PURGE_RUN_OUTCOME" != "incomplete" ]] && PURGE_RUN_OUTCOME="cancelled"
         return 0
     fi
@@ -3610,7 +3927,12 @@ clean_project_artifacts() {
     local selected_unknown_count=0
     local selected_cloud_count=0
     local -a selected_display_paths=()
+    local selected_row_set=",$PURGE_SELECTION_RESULT,"
+    local selected_effective_count=0
     for idx in "${selected_indices[@]}"; do
+        # A trim whose whole folder is also selected goes with it.
+        [[ "${item_covered_rows[idx]:--1}" -lt 0 || "$selected_row_set" != *",${item_covered_rows[idx]},"* ]] || continue
+        selected_effective_count=$((selected_effective_count + 1))
         local selected_size_kb="${item_sizes[idx]:-0}"
         [[ "$selected_size_kb" =~ ^[0-9]+$ ]] || selected_size_kb=0
         selected_total_kb=$((selected_total_kb + selected_size_kb))
@@ -3624,14 +3946,14 @@ clean_project_artifacts() {
     done
 
     if [[ -t 0 ]]; then
-        if ! confirm_purge_cleanup "${#selected_indices[@]}" "$selected_total_kb" "$selected_unknown_count" "$selected_cloud_count" "${selected_display_paths[@]}"; then
+        if ! confirm_purge_cleanup "$selected_effective_count" "$selected_total_kb" "$selected_unknown_count" "$selected_cloud_count" "${selected_display_paths[@]}"; then
             echo -e "${GRAY}Purge cancelled${NC}"
             printf '\n'
             PURGE_CATEGORY_FULL_PATHS_ARRAY=()
             PURGE_CATEGORY_PROJECT_IDS_ARRAY=()
             PURGE_CATEGORY_PROJECT_PATHS_ARRAY=()
             PURGE_CATEGORY_SIZE_UNKNOWN_FLAGS_ARRAY=()
-            unset PURGE_CATEGORY_SIZES PURGE_RECENT_CATEGORIES PURGE_AGE_LABELS PURGE_SELECTION_RESULT
+            unset PURGE_CATEGORY_SIZES PURGE_RECENT_CATEGORIES PURGE_AGE_LABELS PURGE_COVERED_ROWS PURGE_SELECTION_RESULT
             PURGE_RUN_OUTCOME="cancelled"
             return 0
         fi
@@ -3646,17 +3968,217 @@ clean_project_artifacts() {
     _purge_remove_selected_items
 }
 
+# Recheck one selected row before anything in it is removed, for a whole
+# artifact and a Rust trim alike: the scan root, lexically and physically; an
+# artifact already gone under its unchanged parent in a reviewed apply; the
+# folder's own identity and place under the root; its protection and in-use
+# probes. Reads the loop locals of _purge_remove_selected_items through
+# dynamic scope. Returns 0 to go on, 3 when the artifact is already gone, 1
+# after reporting a refusal, or a signal status.
+_purge_selected_item_guard() {
+    if ! _mole_path_matches_identity \
+        "$expected_scan_root" \
+        "${scan_root_parents[$expected_scan_root_index]}" \
+        "${scan_root_parent_ids[$expected_scan_root_index]}" \
+        "${scan_root_target_ids[$expected_scan_root_index]}"; then
+        echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (scan root changed after review)"
+        _purge_note_review_skip "$item_path" "scan root changed since review"
+        return 1
+    fi
+    if ! _mole_path_matches_identity \
+        "$expected_scan_root_physical" \
+        "${scan_root_physical_parents[$expected_scan_root_index]}" \
+        "${scan_root_physical_parent_ids[$expected_scan_root_index]}" \
+        "${scan_root_physical_target_ids[$expected_scan_root_index]}"; then
+        echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (scan root target changed after review)"
+        _purge_note_review_skip "$item_path" "scan root changed since review"
+        return 1
+    fi
+    # A reviewed plan applied twice finds its artifact already gone. Only
+    # when its scan root and its reviewed parent are both still in place:
+    # an artifact whose project was renamed or whose disk is gone was not
+    # removed, and falls through to the identity refusal below.
+    if [[ -n "${PURGE_APPLY_PLAN_ID:-}" && ! -e "$item_path" && ! -L "$item_path" ]] &&
+        clean_plan_parent_unchanged "$item_path" "$expected_parent" "$expected_parent_id"; then
+        echo -e "${GRAY}${ICON_SUCCESS} $display_item_path already removed${NC}"
+        return 3
+    fi
+    if ! _mole_path_matches_identity \
+        "$item_path" "$expected_parent" "$expected_parent_id" "$expected_target_id"; then
+        echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (path changed after review)"
+        _purge_note_review_skip "$item_path" "changed since review"
+        return 1
+    fi
+    local current_item_physical_path="${_MOLE_PATH_SNAPSHOT_PARENT%/}/${item_path##*/}"
+    [[ "$_MOLE_PATH_SNAPSHOT_PARENT" == "/" ]] && current_item_physical_path="/${item_path##*/}"
+    if ! is_safe_project_artifact_under_root "$current_item_physical_path" "$expected_scan_root_physical"; then
+        debug_log "Skipping purge target outside configured safe roots: ${item_path:-<empty>}"
+        _purge_note_review_skip "$item_path" "outside purge paths"
+        return 1
+    fi
+    local protection_rc=0
+    is_protected_purge_artifact "$item_path" || protection_rc=$?
+    [[ $protection_rc -le 128 ]] || return "$protection_rc"
+    if [[ $protection_rc -eq 0 ]]; then
+        if [[ "$PURGE_PROTECTION_UNVERIFIED" == "true" ]]; then
+            echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (could not inspect contents; re-run mo purge to review it again)"
+            _purge_note_review_skip "$item_path" "could not inspect"
+        elif [[ "${PURGE_PROTECTION_REASON:-}" == "in_use" ]]; then
+            echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (in use; stop what has it open, then run mo purge again)"
+            _purge_note_review_skip "$item_path" "in use"
+        else
+            debug_log "Skipping purge target that became protected after review: $item_path"
+            _purge_note_review_skip "$item_path" "protected"
+        fi
+        return 1
+    fi
+    return 0
+}
+
+# Trim one Rust `target` row that _purge_selected_item_guard passed: list its
+# trim set afresh (purge_rust_trim_list, never a list from the review) and
+# remove each entry through mole_delete, bound to the identity read just
+# before, so --trash, dry runs and both logs behave as for any other item. An
+# old entry modified since it was listed is kept. A symlinked `incremental`
+# goes through mole_delete's link sink, which has no final hook, so the trim
+# final guard is asked here first. Reads the loop locals of
+# _purge_remove_selected_items through dynamic scope. Sets
+# _PURGE_TRIM_REMOVED_COUNT and _PURGE_TRIM_REMOVED_KB to the entries actually
+# removed and their size measured just before (_PURGE_TRIM_SIZE_PARTIAL when
+# one could not be measured), so a partial trim reports an honest partial
+# total. Returns 0 when every entry went (or none was left), 1 after reporting
+# a refusal, or a timeout or signal status that cancels the run.
+_PURGE_TRIM_REMOVED_COUNT=0
+_PURGE_TRIM_REMOVED_KB=0
+_PURGE_TRIM_SIZE_PARTIAL=false
+_purge_trim_selected_item() {
+    _PURGE_TRIM_REMOVED_COUNT=0
+    _PURGE_TRIM_REMOVED_KB=0
+    _PURGE_TRIM_SIZE_PARTIAL=false
+    if ! is_rust_target_artifact "$item_path"; then
+        echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (no longer a Rust build folder; run mo purge --dry-run --json again)"
+        _purge_note_review_skip "$item_path" "not a Rust target"
+        return 1
+    fi
+    local list list_rc=0
+    if ! list=$(create_temp_file); then
+        echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (no temporary file for its trim list; check free space, then run mo purge again)"
+        _purge_note_review_skip "$item_path" "could not list trim"
+        return 1
+    fi
+    purge_rust_trim_list "$item_path" "$list" "$((SECONDS + MOLE_TIMEOUT_HINT_SCAN_SEC))" || list_rc=$?
+    if [[ $list_rc -ne 0 ]]; then
+        rm -f "$list" # SAFE: this function's own registered temp file
+        mole_rc_signal "$list_rc" && return "$list_rc"
+        echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (its trim set could not be listed in time; run mo purge again)"
+        _purge_note_review_skip "$item_path" "could not list trim"
+        return 1
+    fi
+
+    local now entry identity identity_rc entry_rc parent_name failed=0 skip_reason="" stop_rc=0
+    local entry_kb size_rc guard_rc
+    local age_limit=$((PURGE_RUST_TRIM_AGE_DAYS * 86400))
+    now=$(get_epoch_seconds)
+    while IFS= read -r -d '' entry <&3; do
+        identity_rc=0
+        identity=$(mole_deletion_identity "$entry") || identity_rc=$?
+        if mole_rc_signal "$identity_rc"; then
+            stop_rc=$identity_rc
+            break
+        fi
+        if [[ $identity_rc -ne 0 ]]; then
+            # Gone since the listing (a build cleaned it): nothing to take.
+            [[ -e "$entry" || -L "$entry" ]] || continue
+            failed=$((failed + 1))
+            continue
+        fi
+        parent_name="${entry%/*}"
+        parent_name="${parent_name##*/}"
+        if [[ "${entry##*/}" != "incremental" || " ${PURGE_RUST_TRIM_AGED_DIRS[*]} " == *" $parent_name "* ]]; then
+            # An old entry that was modified since it was listed stays.
+            [[ $((now - ${identity##*:})) -gt $age_limit ]] || continue
+        fi
+        if [[ -L "$entry" ]]; then
+            entry_kb=0
+            guard_rc=0
+            _mole_purge_trim_final_guard "$entry" || guard_rc=$?
+            if mole_rc_timeout_or_signal "$guard_rc"; then
+                stop_rc=$guard_rc
+                break
+            fi
+            if [[ $guard_rc -ne 0 ]]; then
+                log_operation "${MOLE_CURRENT_COMMAND:-purge}" "SKIPPED" "$entry" "sink guard denied"
+                failed=$((failed + 1))
+                continue
+            fi
+        else
+            size_rc=0
+            entry_kb=$(get_path_size_kb "$entry" 2> /dev/null) || size_rc=$?
+            if mole_rc_signal "$size_rc"; then
+                stop_rc=$size_rc
+                break
+            fi
+            if [[ $size_rc -ne 0 || ! "$entry_kb" =~ ^[0-9]+$ ]]; then
+                entry_kb=0
+                _PURGE_TRIM_SIZE_PARTIAL=true
+            fi
+        fi
+        # mole_delete can refuse before safe_remove clears the reason, so a
+        # cause left by an earlier item must not be read as this one's.
+        _MOLE_SAFE_REMOVE_SKIP_REASON=""
+        entry_rc=0
+        mole_delete "$entry" false "$identity" || entry_rc=$?
+        if mole_rc_timeout_or_signal "$entry_rc"; then
+            stop_rc=$entry_rc
+            break
+        fi
+        if [[ $entry_rc -ne 0 ]] || [[ "${MOLE_DRY_RUN:-0}" != "1" && (-e "$entry" || -L "$entry") ]]; then
+            failed=$((failed + 1))
+            [[ -z "${_MOLE_SAFE_REMOVE_SKIP_REASON:-}" ]] || skip_reason="$_MOLE_SAFE_REMOVE_SKIP_REASON"
+            continue
+        fi
+        _PURGE_TRIM_REMOVED_COUNT=$((_PURGE_TRIM_REMOVED_COUNT + 1))
+        _PURGE_TRIM_REMOVED_KB=$((_PURGE_TRIM_REMOVED_KB + entry_kb))
+    done 3< "$list"
+    rm -f "$list" # SAFE: this function's own registered temp file
+    [[ $stop_rc -eq 0 ]] || return "$stop_rc"
+    [[ $failed -gt 0 ]] || return 0
+
+    local cause="final removal check failed"
+    if [[ "$skip_reason" == "trash-failed" ]]; then
+        cause="could not move to Trash; run without --trash, or give your terminal Full Disk Access"
+    elif [[ -n "$skip_reason" ]]; then
+        cause="$skip_reason; run mo purge --dry-run --json again to review it"
+    fi
+    echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $(mole_count_label "$failed" entry) of $display_item_path ($cause)"
+    _purge_note_review_skip "$item_path" "trim incomplete"
+    return 1
+}
+
 # Remove the selected rows of a purge review. Reads the caller's arrays
 # (selected_indices, item_*, scan_root*) through dynamic scope: the menu run
 # above and a reviewed `mo purge --apply` (lib/clean/purge_plan.sh) both end
 # here, so both pass the same scan-root, identity, protection, in-use and
-# activity rechecks and the same final sink.
+# activity rechecks and the same final sink. A Rust trim row whose whole
+# `target` row is also selected is dropped without a trace: the whole removal
+# wins.
 _purge_remove_selected_items() {
     local stats_dir="${XDG_CACHE_HOME:-$HOME/.cache}/mole"
     local cleaned_count=0
     local already_removed_count=0
+    local covered_count=0
     local dry_run_mode="${MOLE_DRY_RUN:-0}"
+    local selected_row_set=","
     for idx in "${selected_indices[@]}"; do
+        selected_row_set+="$idx,"
+    done
+    for idx in "${selected_indices[@]}"; do
+        local item_kind="${item_kinds[idx]:-A}"
+        local covered_row="${item_covered_rows[idx]:--1}"
+        if [[ "$item_kind" == "T" && "$covered_row" -ge 0 && "$selected_row_set" == *",$covered_row,"* ]]; then
+            covered_count=$((covered_count + 1))
+            continue
+        fi
         local item_path="${item_paths[idx]}"
         local display_item_path="${item_display_paths[idx]}"
         local size_kb="${item_sizes[idx]}"
@@ -3674,107 +4196,82 @@ _purge_remove_selected_items() {
         local expected_scan_root_index="${item_scan_root_indexes[idx]}"
         local expected_scan_root="${scan_roots[$expected_scan_root_index]}"
         local expected_scan_root_physical="${scan_root_physical_paths[$expected_scan_root_index]}"
-        if ! _mole_path_matches_identity \
-            "$expected_scan_root" \
-            "${scan_root_parents[$expected_scan_root_index]}" \
-            "${scan_root_parent_ids[$expected_scan_root_index]}" \
-            "${scan_root_target_ids[$expected_scan_root_index]}"; then
-            echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (scan root changed after review)"
-            _purge_note_review_skip "$item_path" "scan root changed since review"
-            continue
+        local guard_rc=0
+        _purge_selected_item_guard || guard_rc=$?
+        if [[ $guard_rc -gt 128 ]]; then
+            PURGE_RUN_OUTCOME="cancelled"
+            echo "$cleaned_count" > "$stats_dir/purge_count"
+            return "$guard_rc"
         fi
-        if ! _mole_path_matches_identity \
-            "$expected_scan_root_physical" \
-            "${scan_root_physical_parents[$expected_scan_root_index]}" \
-            "${scan_root_physical_parent_ids[$expected_scan_root_index]}" \
-            "${scan_root_physical_target_ids[$expected_scan_root_index]}"; then
-            echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (scan root target changed after review)"
-            _purge_note_review_skip "$item_path" "scan root changed since review"
-            continue
-        fi
-        # A reviewed plan applied twice finds its artifact already gone. Only
-        # when its scan root and its reviewed parent are both still in place:
-        # an artifact whose project was renamed or whose disk is gone was not
-        # removed, and falls through to the identity refusal below.
-        if [[ -n "${PURGE_APPLY_PLAN_ID:-}" && ! -e "$item_path" && ! -L "$item_path" ]] &&
-            clean_plan_parent_unchanged "$item_path" "$expected_parent" "$expected_parent_id"; then
-            echo -e "${GRAY}${ICON_SUCCESS} $display_item_path already removed${NC}"
+        if [[ $guard_rc -eq 3 ]]; then
             already_removed_count=$((already_removed_count + 1))
             continue
         fi
-        if ! _mole_path_matches_identity \
-            "$item_path" "$expected_parent" "$expected_parent_id" "$expected_target_id"; then
-            echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (path changed after review)"
-            _purge_note_review_skip "$item_path" "changed since review"
-            continue
-        fi
-        local current_item_physical_path="${_MOLE_PATH_SNAPSHOT_PARENT%/}/${item_path##*/}"
-        [[ "$_MOLE_PATH_SNAPSHOT_PARENT" == "/" ]] && current_item_physical_path="/${item_path##*/}"
-        if ! is_safe_project_artifact_under_root "$current_item_physical_path" "$expected_scan_root_physical"; then
-            debug_log "Skipping purge target outside configured safe roots: ${item_path:-<empty>}"
-            _purge_note_review_skip "$item_path" "outside purge paths"
-            continue
-        fi
-        local protection_rc=0
-        is_protected_purge_artifact "$item_path" || protection_rc=$?
-        if [[ $protection_rc -gt 128 ]]; then
-            PURGE_RUN_OUTCOME="cancelled"
-            echo "$cleaned_count" > "$stats_dir/purge_count"
-            return "$protection_rc"
-        fi
-        if [[ $protection_rc -eq 0 ]]; then
-            if [[ "$PURGE_PROTECTION_UNVERIFIED" == "true" ]]; then
-                echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (could not inspect contents; re-run mo purge to review it again)"
-                _purge_note_review_skip "$item_path" "could not inspect"
-            elif [[ "${PURGE_PROTECTION_REASON:-}" == "in_use" ]]; then
-                echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (in use; stop what has it open, then run mo purge again)"
-                _purge_note_review_skip "$item_path" "in use"
-            else
-                debug_log "Skipping purge target that became protected after review: $item_path"
-                _purge_note_review_skip "$item_path" "protected"
+        [[ $guard_rc -eq 0 ]] || continue
+        if [[ "$item_kind" != "T" ]]; then
+            local activity_status=0
+            purge_target_activity_still_safe "$item_path" "${item_activity_states[idx]:-uncertain}" || activity_status=$?
+            if mole_rc_timeout_or_signal "$activity_status"; then
+                PURGE_RUN_OUTCOME="cancelled"
+                echo "$cleaned_count" > "$stats_dir/purge_count"
+                return "$activity_status"
             fi
-            continue
-        fi
-        local activity_status=0
-        purge_target_activity_still_safe "$item_path" "${item_activity_states[idx]:-uncertain}" || activity_status=$?
-        if mole_rc_timeout_or_signal "$activity_status"; then
-            PURGE_RUN_OUTCOME="cancelled"
-            echo "$cleaned_count" > "$stats_dir/purge_count"
-            return "$activity_status"
-        fi
-        if [[ $activity_status -ne 0 ]]; then
-            echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (activity changed after review)"
-            _purge_note_review_skip "$item_path" "modified since review"
-            continue
+            if [[ $activity_status -ne 0 ]]; then
+                echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (activity changed after review)"
+                _purge_note_review_skip "$item_path" "modified since review"
+                continue
+            fi
         fi
         if [[ -t 1 ]]; then
             start_inline_spinner "Cleaning $display_item_path..."
         fi
-        local removal_recorded=false
-        if [[ -e "$item_path" ]]; then
-            local _MOLE_PURGE_FINAL_ACTIVITY_STATE="${item_activity_states[idx]:-uncertain}"
-            local _MOLE_PURGE_FINAL_SCAN_ROOT="$expected_scan_root"
-            local _MOLE_PURGE_FINAL_SCAN_ROOT_PARENT="${scan_root_parents[$expected_scan_root_index]}"
-            local _MOLE_PURGE_FINAL_SCAN_ROOT_PARENT_ID="${scan_root_parent_ids[$expected_scan_root_index]}"
-            local _MOLE_PURGE_FINAL_SCAN_ROOT_TARGET_ID="${scan_root_target_ids[$expected_scan_root_index]}"
-            local _MOLE_PURGE_FINAL_SCAN_ROOT_PHYSICAL="$expected_scan_root_physical"
-            local _MOLE_PURGE_FINAL_SCAN_ROOT_PHYSICAL_PARENT="${scan_root_physical_parents[$expected_scan_root_index]}"
-            local _MOLE_PURGE_FINAL_SCAN_ROOT_PHYSICAL_PARENT_ID="${scan_root_physical_parent_ids[$expected_scan_root_index]}"
-            local _MOLE_PURGE_FINAL_SCAN_ROOT_PHYSICAL_TARGET_ID="${scan_root_physical_target_ids[$expected_scan_root_index]}"
-            local _MOLE_PURGE_FINAL_EXPECTED_PARENT="$expected_parent"
-            local _MOLE_PURGE_FINAL_EXPECTED_PARENT_ID="$expected_parent_id"
-            local _MOLE_PURGE_FINAL_EXPECTED_TARGET_ID="$expected_target_id"
+        local removal_recorded=false trim_nothing_left=false
+        local _MOLE_PURGE_FINAL_ACTIVITY_STATE="${item_activity_states[idx]:-uncertain}"
+        local _MOLE_PURGE_FINAL_SCAN_ROOT="$expected_scan_root"
+        local _MOLE_PURGE_FINAL_SCAN_ROOT_PARENT="${scan_root_parents[$expected_scan_root_index]}"
+        local _MOLE_PURGE_FINAL_SCAN_ROOT_PARENT_ID="${scan_root_parent_ids[$expected_scan_root_index]}"
+        local _MOLE_PURGE_FINAL_SCAN_ROOT_TARGET_ID="${scan_root_target_ids[$expected_scan_root_index]}"
+        local _MOLE_PURGE_FINAL_SCAN_ROOT_PHYSICAL="$expected_scan_root_physical"
+        local _MOLE_PURGE_FINAL_SCAN_ROOT_PHYSICAL_PARENT="${scan_root_physical_parents[$expected_scan_root_index]}"
+        local _MOLE_PURGE_FINAL_SCAN_ROOT_PHYSICAL_PARENT_ID="${scan_root_physical_parent_ids[$expected_scan_root_index]}"
+        local _MOLE_PURGE_FINAL_SCAN_ROOT_PHYSICAL_TARGET_ID="${scan_root_physical_target_ids[$expected_scan_root_index]}"
+        local _MOLE_PURGE_FINAL_EXPECTED_PARENT="$expected_parent"
+        local _MOLE_PURGE_FINAL_EXPECTED_PARENT_ID="$expected_parent_id"
+        local _MOLE_PURGE_FINAL_EXPECTED_TARGET_ID="$expected_target_id"
+        if [[ "$item_kind" == "T" ]]; then
+            local _MOLE_PURGE_FINAL_TRIM_TARGET="$item_path"
+            local _MOLE_SAFE_REMOVE_FINAL_GUARD="_mole_purge_trim_final_guard"
+            local trim_rc=0
+            _purge_trim_selected_item || trim_rc=$?
+            _MOLE_SAFE_REMOVE_FINAL_GUARD=""
+            if mole_rc_timeout_or_signal "$trim_rc"; then
+                PURGE_RUN_OUTCOME="cancelled"
+                echo "$cleaned_count" > "$stats_dir/purge_count"
+                if [[ -t 1 ]]; then
+                    stop_inline_spinner
+                fi
+                return "$trim_rc"
+            fi
+            # The total is what this run removed, measured entry by entry, not
+            # the reviewed size; a trim with any removed entry is one item,
+            # and one that also kept a refused entry leaves the run incomplete.
+            size_kb="$_PURGE_TRIM_REMOVED_KB"
+            size_unknown="$_PURGE_TRIM_SIZE_PARTIAL"
+            size_human=$(bytes_to_human "$((size_kb * 1024))")
+            [[ "$size_unknown" != "true" ]] || size_human="${size_human}+"
+            if [[ $_PURGE_TRIM_REMOVED_COUNT -gt 0 ]]; then
+                removal_recorded=true
+                [[ $trim_rc -eq 0 ]] || PURGE_RUN_OUTCOME="incomplete"
+            elif [[ $trim_rc -eq 0 ]]; then
+                # Nothing old was left to take: done, like an artifact already gone.
+                trim_nothing_left=true
+                already_removed_count=$((already_removed_count + 1))
+            fi
+        elif [[ -e "$item_path" ]]; then
             local _MOLE_SAFE_REMOVE_FINAL_GUARD="_mole_purge_final_remove_guard"
             if safe_remove "$item_path" true "$size_kb" "" \
                 "$expected_parent" "$expected_parent_id" "$expected_target_id"; then
                 if [[ "$dry_run_mode" == "1" || ! -e "$item_path" ]]; then
-                    local current_total
-                    current_total=$(cat "$stats_dir/purge_stats" 2> /dev/null || echo "0")
-                    echo "$((current_total + size_kb))" > "$stats_dir/purge_stats"
-                    cleaned_count=$((cleaned_count + 1))
-                    if [[ "$size_unknown" == "true" ]]; then
-                        PURGE_UNKNOWN_SIZE_COUNT=$((PURGE_UNKNOWN_SIZE_COUNT + 1))
-                    fi
                     removal_recorded=true
                 fi
             else
@@ -3806,9 +4303,19 @@ _purge_remove_selected_items() {
                 fi
             fi
         fi
+        if [[ "$removal_recorded" == "true" ]]; then
+            local current_total
+            current_total=$(cat "$stats_dir/purge_stats" 2> /dev/null || echo "0")
+            echo "$((current_total + size_kb))" > "$stats_dir/purge_stats"
+            cleaned_count=$((cleaned_count + 1))
+            if [[ "$size_unknown" == "true" ]]; then
+                PURGE_UNKNOWN_SIZE_COUNT=$((PURGE_UNKNOWN_SIZE_COUNT + 1))
+            fi
+        fi
         if [[ -t 1 ]]; then
             stop_inline_spinner
         fi
+        [[ "$trim_nothing_left" != "true" ]] || echo -e "${GRAY}${ICON_SUCCESS} $display_item_path nothing left to trim${NC}"
         if [[ "$removal_recorded" == "true" ]]; then
             if [[ "$dry_run_mode" == "1" ]]; then
                 echo -e "${GREEN}${ICON_SUCCESS}${NC} [DRY RUN] $display_item_path${NC}, ${GREEN}$size_human${NC}"
@@ -3819,8 +4326,8 @@ _purge_remove_selected_items() {
     done
     # Update count
     echo "$cleaned_count" > "$stats_dir/purge_count"
-    if [[ $((cleaned_count + already_removed_count)) -lt ${#selected_indices[@]} ]]; then
+    if [[ $((cleaned_count + already_removed_count + covered_count)) -lt ${#selected_indices[@]} ]]; then
         PURGE_RUN_OUTCOME="incomplete"
     fi
-    unset PURGE_CATEGORY_SIZES PURGE_RECENT_CATEGORIES PURGE_AGE_LABELS PURGE_SELECTION_RESULT
+    unset PURGE_CATEGORY_SIZES PURGE_RECENT_CATEGORIES PURGE_AGE_LABELS PURGE_COVERED_ROWS PURGE_SELECTION_RESULT
 }

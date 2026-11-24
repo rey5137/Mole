@@ -145,6 +145,23 @@ listed in the summary, naming a failed Trash move as such; an unticked
 artifact is never handed to a sink. An artifact counts as already removed
 only while its scan root and reviewed parent folder are unchanged.
 
+A Rust `target` folder (a sibling `Cargo.toml` or its own `.rustc_info.json`,
+and no sibling `pom.xml`) also gets a `trim` item, never pre-selected and not
+offered while the folder is in use: each profile's `incremental` and the
+direct entries of its `deps`, `build` and `.fingerprint` older than seven days
+by mtime, with profiles found without following a symlink. The plan keeps the
+folder's identities, not the entries. Applying a trim passes the same scan
+root, identity, containment and in-use rechecks as the whole folder, lists the
+entries again from the disk, and hands each to `mole_delete` bound to the
+identity read just before (an old entry modified since is kept), with
+`_mole_purge_trim_final_guard` rebinding the folder and requiring the entry to
+sit where the trim rule puts one (asked directly for a symlinked `incremental`,
+whose link sink has no final hook). The reviewed-plan gate approves only the
+`incremental`, `deps`, `build` and `.fingerprint` folders of a kept trim, so no
+sink can take the `target` folder or a binary beside them; when those cannot be
+listed in time, the trim is refused as `could not list trim` before any sink. A trim kept with
+its whole folder is dropped; the whole removal wins.
+
 A reviewed `mo installer --apply <plan_id> --select <file>` reads a plan that
 `mo installer --dry-run --json` saved after the same scan as the text preview
 (`lib/clean/installer_plan.sh`); a clean or purge plan is refused, and an
