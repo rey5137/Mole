@@ -1559,6 +1559,8 @@ _MOLE_APPLY_PLAN_REASON=""
 _MOLE_APPLY_PLAN_LOAD_ERROR="reviewed plan unavailable"
 _MOLE_APPLY_PLAN_MATCHED_ID=""
 _MOLE_APPLY_PLAN_MATCHED_SELF=false
+# Kept roots read unchanged during the open mole_delete batch.
+_MOLE_APPLY_PLAN_BATCH_ROOTS=""
 declare -a _MOLE_APPLY_PLAN_COMMAND_KEYS=()
 declare -a _MOLE_APPLY_PLAN_COMMAND_TEXTS=()
 readonly _MOLE_APPLY_PLAN_RS=$'\x1f'
@@ -1664,15 +1666,23 @@ mole_apply_plan_allows() {
         if [[ "$_MOLE_APPLY_PLAN_ROOTS" == *"$rs$candidate$fs"* ]]; then
             local planned_identity="${_MOLE_APPLY_PLAN_ROOTS#*"$rs$candidate$fs"}"
             planned_identity="${planned_identity%%"$rs"*}"
-            local current_identity="" identity_rc=0
-            current_identity=$(mole_deletion_identity "$candidate") || identity_rc=$?
-            if mole_rc_signal "$identity_rc"; then
-                return "$identity_rc"
-            fi
-            if [[ $identity_rc -ne 0 || -z "$planned_identity" ||
-                "${current_identity%:*}" != "$planned_identity" ]]; then
-                _MOLE_APPLY_PLAN_REASON="changed since review"
-                return 1
+            # Within one mole_delete batch (mole_delete_batch_begin) a kept
+            # root read unchanged answers again: it is a folder, and each path
+            # of the batch is bound to the dev:inode its caller read before
+            # the batch began, so a root replaced later shows as a changed path.
+            local batch_root_key="$rs${_MOLE_DELETE_BATCH_ID:-}$fs$candidate$fs$planned_identity$rs"
+            if [[ -z "${_MOLE_DELETE_BATCH_ID:-}" || "$_MOLE_APPLY_PLAN_BATCH_ROOTS" != *"$batch_root_key"* ]]; then
+                local current_identity="" identity_rc=0
+                current_identity=$(mole_deletion_identity "$candidate") || identity_rc=$?
+                if mole_rc_signal "$identity_rc"; then
+                    return "$identity_rc"
+                fi
+                if [[ $identity_rc -ne 0 || -z "$planned_identity" ||
+                    "${current_identity%:*}" != "$planned_identity" ]]; then
+                    _MOLE_APPLY_PLAN_REASON="changed since review"
+                    return 1
+                fi
+                [[ -z "${_MOLE_DELETE_BATCH_ID:-}" ]] || _MOLE_APPLY_PLAN_BATCH_ROOTS+="$batch_root_key"
             fi
             if [[ "$_MOLE_APPLY_PLAN_DESELECTED" == *"$rs$target/"* ]]; then
                 _MOLE_APPLY_PLAN_REASON="holds unticked item"
@@ -1830,6 +1840,333 @@ _mole_clean_move_to_trash() {
 # logged). Empty for every other cause.
 _MOLE_SAFE_REMOVE_SKIP_REASON=""
 
+# safe_remove's checks between validation and its dry-run return, shared with
+# mole_delete's batch route: whitelist, the path still there, the reviewed
+# plan, ownership and a compiled model cache. Returns 0 to go on (with
+# _MOLE_SAFE_REMOVE_PATH_GONE=true when the path is already gone, so there is
+# nothing to do), 1 after logging a refusal, or the plan gate's signal status.
+_MOLE_SAFE_REMOVE_PATH_GONE=false
+_mole_safe_remove_prechecks() {
+    local path="$1"
+    _MOLE_SAFE_REMOVE_PATH_GONE=false
+
+    # Honor the user whitelist here, not just in safe_clean. safe_remove is
+    # called directly by several clean/optimize flows (Xcode DerivedData,
+    # mail downloads, deep-system caches, broken LaunchAgents) that would
+    # otherwise ignore a user's whitelist selection. is_path_whitelisted is
+    # a no-op when the whitelist is empty, and uninstall does not route
+    # through safe_remove, so this stays scoped to clean/optimize. See #710.
+    if declare -f is_path_whitelisted > /dev/null 2>&1 && is_path_whitelisted "$path"; then
+        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "whitelist"
+        return 1
+    fi
+
+    # Check if path exists
+    if [[ ! -e "$path" ]]; then
+        _MOLE_SAFE_REMOVE_PATH_GONE=true
+        return 0
+    fi
+
+    local plan_rc=0
+    _mole_apply_plan_gate "$path" || plan_rc=$?
+    [[ $plan_rc -eq 0 ]] || return "$plan_rc"
+
+    # Before the dry-run return, so a preview never lists what the run refuses.
+    if _mole_user_sink_refuses_on_ownership "$path"; then
+        debug_log "Skipped removal of an item another user owns: $path"
+        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "owned by another user"
+        return 1
+    fi
+
+    # Keep preview eligibility identical to real cleanup. This first check
+    # rejects an already-present compiled model cache before the dry-run return;
+    # the final-sink check below still catches one created during size probing.
+    if declare -f holds_compiled_model_cache > /dev/null 2>&1 && holds_compiled_model_cache "$path" 2> /dev/null; then
+        debug_log "Skipped removal for compiled model cache: $path"
+        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "compiled model cache"
+        return 1
+    fi
+    return 0
+}
+
+# safe_remove's final sink, after its dry-run return and sizing, shared with
+# mole_delete's batch route: the compiled-model, live-cache and open-file
+# rechecks, the caller's final guard, the identity rebinds, the last plan
+# gate and ownership check, then the Trash leg or rm, and the outcome row.
+# Args: path, silent, size_human, deadline_seconds, expected_parent,
+# expected_parent_id, expected_target_id, expected_file_sha256,
+# expected_absent_path, and expected_mtime: when given, the last rebind also
+# requires the path's mtime to be unchanged (_mole_owned_path_still_valid).
+_mole_safe_remove_sink() {
+    local path="$1"
+    local silent="${2:-false}"
+    local size_human="${3:-}"
+    local deadline_seconds="${4:-}"
+    local expected_parent="${5:-}"
+    local expected_parent_id="${6:-}"
+    local expected_target_id="${7:-}"
+    local expected_file_sha256="${8:-}"
+    local expected_absent_path="${9:-}"
+    local expected_mtime="${10:-}"
+    local container_probe_parent=""
+    local container_probe_parent_id=""
+    local container_probe_target_id=""
+    local exact_probe_parent=""
+    local exact_probe_parent_id=""
+    local exact_probe_target_id=""
+
+    # Recheck at the final sink. A daemon can create this compiled-model cache
+    # while the preceding size probe walks the target, and deleting its parent
+    # then breaks recognition until the owning process restarts.
+    if declare -f holds_compiled_model_cache > /dev/null 2>&1 && holds_compiled_model_cache "$path" 2> /dev/null; then
+        debug_log "Skipped removal after compiled model cache appeared: $path"
+        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "compiled model cache"
+        return 1
+    fi
+
+    # Recheck live-owner / open-SQLite state after size probing: a helper can
+    # launch while du is walking the tree (same race class as the compiled
+    # model cache check above).
+    _mole_reset_process_snapshot
+    local live_cache_guard_rc=0
+    _mole_should_refuse_live_user_cache_path "$path" || live_cache_guard_rc=$?
+    if [[ $live_cache_guard_rc -eq 0 ]]; then
+        debug_log "Skipped removal after live user cache appeared: $path"
+        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "live user cache"
+        return 1
+    fi
+    if mole_rc_timeout_or_signal "$live_cache_guard_rc"; then
+        _mole_record_clean_cancellation "$live_cache_guard_rc"
+        return "$live_cache_guard_rc"
+    fi
+    container_probe_parent="$_MOLE_CONTAINER_CACHE_PROBE_PARENT"
+    container_probe_parent_id="$_MOLE_CONTAINER_CACHE_PROBE_PARENT_ID"
+    container_probe_target_id="$_MOLE_CONTAINER_CACHE_PROBE_TARGET_ID"
+
+    # Reverse-DNS and container caches were rechecked by the live-cache guard.
+    # SQLite files elsewhere still need their own post-size handle probe.
+    if _mole_is_sqlite_database_path "$path" &&
+        ! _mole_user_cache_scope "$path" > /dev/null 2>&1; then
+        _mole_snapshot_path_identity "$path" || return 1
+        local sqlite_parent="$_MOLE_PATH_SNAPSHOT_PARENT"
+        local sqlite_parent_id="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
+        local sqlite_target_id="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
+        local sqlite_state=0
+        _mole_sqlite_database_in_use "$path" || sqlite_state=$?
+        if mole_rc_timeout_or_signal "$sqlite_state"; then
+            _mole_record_clean_cancellation "$sqlite_state"
+            return "$sqlite_state"
+        fi
+        if [[ $sqlite_state -ne 1 ]]; then
+            debug_log "Skipped SQLite file after final open-file recheck: $path"
+            log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "active or unknown SQLite database"
+            return 1
+        fi
+        if ! _mole_path_matches_identity \
+            "$path" "$sqlite_parent" "$sqlite_parent_id" "$sqlite_target_id"; then
+            debug_log "Skipped SQLite file after identity changed during final open-file recheck: $path"
+            log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "identity changed"
+            return 1
+        fi
+        exact_probe_parent="$sqlite_parent"
+        exact_probe_parent_id="$sqlite_parent_id"
+        exact_probe_target_id="$sqlite_target_id"
+    fi
+
+    # Downloads are outside the user-cache owner guard above. Recheck the exact
+    # file after sizing so a browser that resumed the transfer cannot race the
+    # earlier validation into the unlink.
+    if _mole_is_incomplete_download_path "$path"; then
+        _mole_snapshot_path_identity "$path" || return 1
+        local download_parent="$_MOLE_PATH_SNAPSHOT_PARENT"
+        local download_parent_id="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
+        local download_target_id="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
+        local download_open_state=0
+        _mole_paths_have_open_handle "$path" || download_open_state=$?
+        if mole_rc_timeout_or_signal "$download_open_state"; then
+            _mole_record_clean_cancellation "$download_open_state"
+            return "$download_open_state"
+        fi
+        if [[ $download_open_state -ne 1 ]]; then
+            debug_log "Skipped incomplete download after final open-file recheck: $path"
+            log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "active or unknown download"
+            return 1
+        fi
+        if ! _mole_path_matches_identity \
+            "$path" "$download_parent" "$download_parent_id" "$download_target_id"; then
+            debug_log "Skipped incomplete download after identity changed during final open-file recheck: $path"
+            log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "identity changed"
+            return 1
+        fi
+        exact_probe_parent="$download_parent"
+        exact_probe_parent_id="$download_parent_id"
+        exact_probe_target_id="$download_target_id"
+    fi
+
+    # A caller that also bound the mtime (a mole_delete batch) gets one
+    # rebind, the strictest and last: _mole_owned_path_still_valid below runs
+    # after every check these two guard and compares the mtime too, so a
+    # replacement made before or during the final guard still never reaches
+    # rm. Every other caller keeps both, with their own rows.
+    if [[ -n "$expected_parent" && -z "$expected_mtime" ]] && ! _mole_path_matches_identity \
+        "$path" "$expected_parent" "$expected_parent_id" "$expected_target_id"; then
+        debug_log "Refusing removal after final path identity changed: $path"
+        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "identity changed"
+        return 1
+    fi
+
+    # Last hop before rm, for callers whose exclusion depends on state this
+    # function cannot express as a parent/target inode pair. A candidate list
+    # that skipped a live owner root only proves where that root pointed when
+    # the list was built; re-asking here closes the rest of the window rather
+    # than leaving it open from discovery all the way to the unlink. Set
+    # _MOLE_SAFE_REMOVE_FINAL_GUARD to a function name that takes the path and
+    # returns non-zero to refuse.
+    local final_sink_guard="${_MOLE_SAFE_REMOVE_FINAL_GUARD:-}"
+    if [[ -n "$final_sink_guard" ]] && declare -f "$final_sink_guard" > /dev/null 2>&1; then
+        local final_sink_guard_rc=0
+        "$final_sink_guard" "$path" || final_sink_guard_rc=$?
+        if [[ $final_sink_guard_rc -ne 0 ]]; then
+            debug_log "Refusing removal after the final sink guard denied: $path"
+            log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "sink guard denied"
+            if mole_rc_timeout_or_signal "$final_sink_guard_rc"; then
+                _mole_record_clean_cancellation "$final_sink_guard_rc"
+                return "$final_sink_guard_rc"
+            fi
+            return 1
+        fi
+    fi
+
+    # A caller-specific final guard may perform process or metadata probes.
+    # Rebind the original object once more after that work so a replacement
+    # during the guard cannot reach rm under the identity checked above.
+    if [[ -n "$expected_parent" && -z "$expected_mtime" ]] && ! _mole_path_matches_identity \
+        "$path" "$expected_parent" "$expected_parent_id" "$expected_target_id"; then
+        debug_log "Refusing removal after path identity changed during the final sink guard: $path"
+        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "identity changed"
+        return 1
+    fi
+
+    if [[ -n "$container_probe_parent" ]] && ! _mole_path_matches_identity \
+        "$path" "$container_probe_parent" "$container_probe_parent_id" \
+        "$container_probe_target_id"; then
+        debug_log "Refusing removal after container cache identity changed: $path"
+        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "identity changed"
+        return 1
+    fi
+
+    if [[ -n "$exact_probe_parent" ]] && ! _mole_path_matches_identity \
+        "$path" "$exact_probe_parent" "$exact_probe_parent_id" \
+        "$exact_probe_target_id"; then
+        debug_log "Refusing removal after final open-file target identity changed: $path"
+        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "identity changed"
+        return 1
+    fi
+
+    # Resolve the removal budget before the last ownership check so a
+    # replacement during that work cannot inherit the earlier approval.
+    local error_msg
+    local rm_exit=0
+    local section_deadline_spent=0
+    local rm_timeout=""
+    local shell_rm=false
+    if declare -F rm > /dev/null 2>&1; then
+        shell_rm=true
+    elif [[ -z "$deadline_seconds" ]]; then
+        # No section deadline: the budget is the request, without a subshell.
+        rm_timeout="$MOLE_TIMEOUT_DISK_VERIFY_SEC"
+    else
+        rm_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_DISK_VERIFY_SEC" \
+            "$deadline_seconds") || rm_exit=$?
+        [[ $rm_exit -eq 0 ]] || section_deadline_spent=1
+    fi
+    if [[ $rm_exit -eq 0 && -n "${MOLE_APPLY_PLAN:-}" ]]; then
+        # The plan check at entry ran before sizing and the final guards. Ask
+        # again here, and bind a kept root to its planned inode so the rebind
+        # below refuses a replacement made after this check.
+        local final_plan_rc=0
+        _mole_apply_plan_gate "$path" || final_plan_rc=$?
+        [[ $final_plan_rc -eq 0 ]] || return "$final_plan_rc"
+        if [[ -z "$expected_parent" && "$_MOLE_APPLY_PLAN_MATCHED_SELF" == "true" ]]; then
+            if ! _mole_snapshot_path_identity "$path" ||
+                [[ "$_MOLE_PATH_SNAPSHOT_TARGET_ID" != "$_MOLE_APPLY_PLAN_MATCHED_ID" ]]; then
+                log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "changed since review"
+                return 1
+            fi
+            expected_parent="$_MOLE_PATH_SNAPSHOT_PARENT"
+            expected_parent_id="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
+            expected_target_id="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
+        fi
+    fi
+    if [[ $rm_exit -eq 0 ]]; then
+        _mole_owned_path_still_valid "$path" \
+            "$expected_file_sha256" "$expected_absent_path" \
+            "$expected_parent" "$expected_parent_id" "$expected_target_id" "" \
+            "$expected_mtime" || return $?
+        if _mole_clean_trash_active; then
+            _mole_clean_move_to_trash "$path" "$size_human" \
+                "$expected_parent" "$expected_parent_id" "$expected_target_id" \
+                "$expected_file_sha256" "$expected_absent_path"
+            return $?
+        fi
+        # Use || so set -e does not abort before the failure is classified.
+        if [[ "$shell_rm" == true ]]; then
+            error_msg=$(rm -rf "$path" 2>&1) || rm_exit=$? # SAFE: safe_remove validated and rebound this exact target above
+        elif [[ -n "${_MOLE_DELETE_BATCH_ID:-}" && -n "${_MOLE_DELETE_BATCH_ERROR_FILE:-}" && -f "${_MOLE_DELETE_BATCH_ERROR_FILE:-}" ]]; then
+            # Inside a mole_delete batch rm's message goes to the batch's
+            # scratch file: a command substitution around the perl timeout
+            # helper costs about as much as rm itself.
+            run_with_timeout "$rm_timeout" rm -rf "$path" < /dev/null 2> "$_MOLE_DELETE_BATCH_ERROR_FILE" || rm_exit=$? # SAFE: safe_remove validated and rebound this exact target above
+            [[ $rm_exit -eq 0 ]] || IFS= read -r -d '' error_msg < "$_MOLE_DELETE_BATCH_ERROR_FILE" || true
+        else
+            error_msg=$(run_with_timeout "$rm_timeout" rm -rf "$path" < /dev/null 2>&1) || rm_exit=$? # SAFE: safe_remove validated and rebound this exact target above
+        fi
+    fi
+
+    if mole_rc_timeout "$rm_exit"; then
+        debug_log "Removal timed out: $path"
+        if [[ $section_deadline_spent -eq 1 ]]; then
+            # Not a slow removal: the caller's section deadline expired before
+            # rm ran, and that section reports its own stop. Counting it here
+            # would point the user at the per-item removal budget instead.
+            log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "section time limit reached"
+        else
+            log_operation "${MOLE_CURRENT_COMMAND:-clean}" "FAILED" "$path" "removal timed out"
+            # A slow disk can exceed the per-item removal budget. That is a
+            # failed removal, not a user interrupt: count it and keep going so
+            # one slow cache never cancels the remaining cleanup.
+            MOLE_CLEAN_REMOVAL_TIMEOUTS=$((${MOLE_CLEAN_REMOVAL_TIMEOUTS:-0} + 1))
+            _mole_record_removal_timeout_path "$path"
+        fi
+        return 124
+    fi
+
+    # Preserve interrupt semantics so callers can abort long-running deletions.
+    if [[ $rm_exit -ge 128 ]]; then
+        _mole_record_clean_cancellation "$rm_exit"
+        return "$rm_exit"
+    fi
+
+    if [[ $rm_exit -eq 0 ]]; then
+        # Log successful removal
+        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "REMOVED" "$path" "$size_human"
+        return 0
+    else
+        # Check if it's a permission error
+        if [[ "$error_msg" == *"Permission denied"* ]] || [[ "$error_msg" == *"Operation not permitted"* ]]; then
+            MOLE_PERMISSION_DENIED_COUNT=${MOLE_PERMISSION_DENIED_COUNT:-0}
+            MOLE_PERMISSION_DENIED_COUNT=$((MOLE_PERMISSION_DENIED_COUNT + 1))
+            export MOLE_PERMISSION_DENIED_COUNT
+            debug_log "Permission denied: $path, may need Full Disk Access"
+            log_operation "${MOLE_CURRENT_COMMAND:-clean}" "FAILED" "$path" "permission denied"
+        else
+            [[ "$silent" != "true" ]] && log_error "Failed to remove: $path"
+            log_operation "${MOLE_CURRENT_COMMAND:-clean}" "FAILED" "$path" "error"
+        fi
+        return 1
+    fi
+}
+
 safe_remove() {
     _MOLE_SAFE_REMOVE_SKIP_REASON=""
     local path="$1"
@@ -1842,12 +2179,6 @@ safe_remove() {
     local expected_file_sha256="${8:-}"
     local expected_absent_path="${9:-}"
     local _MOLE_DEFER_CONTAINER_HANDLE_PROBE=false
-    local container_probe_parent=""
-    local container_probe_parent_id=""
-    local container_probe_target_id=""
-    local exact_probe_parent=""
-    local exact_probe_parent_id=""
-    local exact_probe_target_id=""
 
     local pending_clean_cancel="${MOLE_CLEAN_CANCEL_STATUS:-0}"
     if [[ "${MOLE_CURRENT_COMMAND:-}" == "clean" ]] && mole_rc_timeout_or_signal "$pending_clean_cancel"; then
@@ -1885,41 +2216,10 @@ safe_remove() {
     fi
     _MOLE_DEFER_CONTAINER_HANDLE_PROBE=false
 
-    # Honor the user whitelist here, not just in safe_clean. safe_remove is
-    # called directly by several clean/optimize flows (Xcode DerivedData,
-    # mail downloads, deep-system caches, broken LaunchAgents) that would
-    # otherwise ignore a user's whitelist selection. is_path_whitelisted is
-    # a no-op when the whitelist is empty, and uninstall does not route
-    # through safe_remove, so this stays scoped to clean/optimize. See #710.
-    if declare -f is_path_whitelisted > /dev/null 2>&1 && is_path_whitelisted "$path"; then
-        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "whitelist"
-        return 1
-    fi
-
-    # Check if path exists
-    if [[ ! -e "$path" ]]; then
-        return 0
-    fi
-
-    local plan_rc=0
-    _mole_apply_plan_gate "$path" || plan_rc=$?
-    [[ $plan_rc -eq 0 ]] || return "$plan_rc"
-
-    # Before the dry-run return, so a preview never lists what the run refuses.
-    if _mole_user_sink_refuses_on_ownership "$path"; then
-        debug_log "Skipped removal of an item another user owns: $path"
-        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "owned by another user"
-        return 1
-    fi
-
-    # Keep preview eligibility identical to real cleanup. This first check
-    # rejects an already-present compiled model cache before the dry-run return;
-    # the final-sink check below still catches one created during size probing.
-    if declare -f holds_compiled_model_cache > /dev/null 2>&1 && holds_compiled_model_cache "$path" 2> /dev/null; then
-        debug_log "Skipped removal for compiled model cache: $path"
-        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "compiled model cache"
-        return 1
-    fi
+    local precheck_rc=0
+    _mole_safe_remove_prechecks "$path" || precheck_rc=$?
+    [[ $precheck_rc -eq 0 ]] || return "$precheck_rc"
+    [[ "$_MOLE_SAFE_REMOVE_PATH_GONE" != "true" ]] || return 0
 
     # Dry-run mode: log but don't delete
     if [[ "${MOLE_DRY_RUN:-0}" == "1" ]]; then
@@ -2017,241 +2317,11 @@ safe_remove() {
         fi
     fi
 
-    # Recheck at the final sink. A daemon can create this compiled-model cache
-    # while the preceding size probe walks the target, and deleting its parent
-    # then breaks recognition until the owning process restarts.
-    if declare -f holds_compiled_model_cache > /dev/null 2>&1 && holds_compiled_model_cache "$path" 2> /dev/null; then
-        debug_log "Skipped removal after compiled model cache appeared: $path"
-        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "compiled model cache"
-        return 1
-    fi
-
-    # Recheck live-owner / open-SQLite state after size probing: a helper can
-    # launch while du is walking the tree (same race class as the compiled
-    # model cache check above).
-    _mole_reset_process_snapshot
-    local live_cache_guard_rc=0
-    _mole_should_refuse_live_user_cache_path "$path" || live_cache_guard_rc=$?
-    if [[ $live_cache_guard_rc -eq 0 ]]; then
-        debug_log "Skipped removal after live user cache appeared: $path"
-        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "live user cache"
-        return 1
-    fi
-    if mole_rc_timeout_or_signal "$live_cache_guard_rc"; then
-        _mole_record_clean_cancellation "$live_cache_guard_rc"
-        return "$live_cache_guard_rc"
-    fi
-    container_probe_parent="$_MOLE_CONTAINER_CACHE_PROBE_PARENT"
-    container_probe_parent_id="$_MOLE_CONTAINER_CACHE_PROBE_PARENT_ID"
-    container_probe_target_id="$_MOLE_CONTAINER_CACHE_PROBE_TARGET_ID"
-
-    # Reverse-DNS and container caches were rechecked by the live-cache guard.
-    # SQLite files elsewhere still need their own post-size handle probe.
-    if _mole_is_sqlite_database_path "$path" &&
-        ! _mole_user_cache_scope "$path" > /dev/null 2>&1; then
-        _mole_snapshot_path_identity "$path" || return 1
-        local sqlite_parent="$_MOLE_PATH_SNAPSHOT_PARENT"
-        local sqlite_parent_id="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
-        local sqlite_target_id="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
-        local sqlite_state=0
-        _mole_sqlite_database_in_use "$path" || sqlite_state=$?
-        if mole_rc_timeout_or_signal "$sqlite_state"; then
-            _mole_record_clean_cancellation "$sqlite_state"
-            return "$sqlite_state"
-        fi
-        if [[ $sqlite_state -ne 1 ]]; then
-            debug_log "Skipped SQLite file after final open-file recheck: $path"
-            log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "active or unknown SQLite database"
-            return 1
-        fi
-        if ! _mole_path_matches_identity \
-            "$path" "$sqlite_parent" "$sqlite_parent_id" "$sqlite_target_id"; then
-            debug_log "Skipped SQLite file after identity changed during final open-file recheck: $path"
-            log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "identity changed"
-            return 1
-        fi
-        exact_probe_parent="$sqlite_parent"
-        exact_probe_parent_id="$sqlite_parent_id"
-        exact_probe_target_id="$sqlite_target_id"
-    fi
-
-    # Downloads are outside the user-cache owner guard above. Recheck the exact
-    # file after sizing so a browser that resumed the transfer cannot race the
-    # earlier validation into the unlink.
-    if _mole_is_incomplete_download_path "$path"; then
-        _mole_snapshot_path_identity "$path" || return 1
-        local download_parent="$_MOLE_PATH_SNAPSHOT_PARENT"
-        local download_parent_id="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
-        local download_target_id="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
-        local download_open_state=0
-        _mole_paths_have_open_handle "$path" || download_open_state=$?
-        if mole_rc_timeout_or_signal "$download_open_state"; then
-            _mole_record_clean_cancellation "$download_open_state"
-            return "$download_open_state"
-        fi
-        if [[ $download_open_state -ne 1 ]]; then
-            debug_log "Skipped incomplete download after final open-file recheck: $path"
-            log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "active or unknown download"
-            return 1
-        fi
-        if ! _mole_path_matches_identity \
-            "$path" "$download_parent" "$download_parent_id" "$download_target_id"; then
-            debug_log "Skipped incomplete download after identity changed during final open-file recheck: $path"
-            log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "identity changed"
-            return 1
-        fi
-        exact_probe_parent="$download_parent"
-        exact_probe_parent_id="$download_parent_id"
-        exact_probe_target_id="$download_target_id"
-    fi
-
-    if [[ -n "$expected_parent" ]] && ! _mole_path_matches_identity \
-        "$path" "$expected_parent" "$expected_parent_id" "$expected_target_id"; then
-        debug_log "Refusing removal after final path identity changed: $path"
-        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "identity changed"
-        return 1
-    fi
-
-    # Last hop before rm, for callers whose exclusion depends on state this
-    # function cannot express as a parent/target inode pair. A candidate list
-    # that skipped a live owner root only proves where that root pointed when
-    # the list was built; re-asking here closes the rest of the window rather
-    # than leaving it open from discovery all the way to the unlink. Set
-    # _MOLE_SAFE_REMOVE_FINAL_GUARD to a function name that takes the path and
-    # returns non-zero to refuse.
-    local final_sink_guard="${_MOLE_SAFE_REMOVE_FINAL_GUARD:-}"
-    if [[ -n "$final_sink_guard" ]] && declare -f "$final_sink_guard" > /dev/null 2>&1; then
-        local final_sink_guard_rc=0
-        "$final_sink_guard" "$path" || final_sink_guard_rc=$?
-        if [[ $final_sink_guard_rc -ne 0 ]]; then
-            debug_log "Refusing removal after the final sink guard denied: $path"
-            log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "sink guard denied"
-            if mole_rc_timeout_or_signal "$final_sink_guard_rc"; then
-                _mole_record_clean_cancellation "$final_sink_guard_rc"
-                return "$final_sink_guard_rc"
-            fi
-            return 1
-        fi
-    fi
-
-    # A caller-specific final guard may perform process or metadata probes.
-    # Rebind the original object once more after that work so a replacement
-    # during the guard cannot reach rm under the identity checked above.
-    if [[ -n "$expected_parent" ]] && ! _mole_path_matches_identity \
-        "$path" "$expected_parent" "$expected_parent_id" "$expected_target_id"; then
-        debug_log "Refusing removal after path identity changed during the final sink guard: $path"
-        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "identity changed"
-        return 1
-    fi
-
-    if [[ -n "$container_probe_parent" ]] && ! _mole_path_matches_identity \
-        "$path" "$container_probe_parent" "$container_probe_parent_id" \
-        "$container_probe_target_id"; then
-        debug_log "Refusing removal after container cache identity changed: $path"
-        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "identity changed"
-        return 1
-    fi
-
-    if [[ -n "$exact_probe_parent" ]] && ! _mole_path_matches_identity \
-        "$path" "$exact_probe_parent" "$exact_probe_parent_id" \
-        "$exact_probe_target_id"; then
-        debug_log "Refusing removal after final open-file target identity changed: $path"
-        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "identity changed"
-        return 1
-    fi
-
-    # Resolve the removal budget before the last ownership check so a
-    # replacement during that work cannot inherit the earlier approval.
-    local error_msg
-    local rm_exit=0
-    local section_deadline_spent=0
-    local rm_timeout=""
-    local shell_rm=false
-    if declare -F rm > /dev/null 2>&1; then
-        shell_rm=true
-    else
-        rm_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_DISK_VERIFY_SEC" \
-            "$deadline_seconds") || rm_exit=$?
-        [[ $rm_exit -eq 0 ]] || section_deadline_spent=1
-    fi
-    if [[ $rm_exit -eq 0 && -n "${MOLE_APPLY_PLAN:-}" ]]; then
-        # The plan check at entry ran before sizing and the final guards. Ask
-        # again here, and bind a kept root to its planned inode so the rebind
-        # below refuses a replacement made after this check.
-        local final_plan_rc=0
-        _mole_apply_plan_gate "$path" || final_plan_rc=$?
-        [[ $final_plan_rc -eq 0 ]] || return "$final_plan_rc"
-        if [[ -z "$expected_parent" && "$_MOLE_APPLY_PLAN_MATCHED_SELF" == "true" ]]; then
-            if ! _mole_snapshot_path_identity "$path" ||
-                [[ "$_MOLE_PATH_SNAPSHOT_TARGET_ID" != "$_MOLE_APPLY_PLAN_MATCHED_ID" ]]; then
-                log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "changed since review"
-                return 1
-            fi
-            expected_parent="$_MOLE_PATH_SNAPSHOT_PARENT"
-            expected_parent_id="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
-            expected_target_id="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
-        fi
-    fi
-    if [[ $rm_exit -eq 0 ]]; then
-        _mole_owned_path_still_valid "$path" \
-            "$expected_file_sha256" "$expected_absent_path" \
-            "$expected_parent" "$expected_parent_id" "$expected_target_id" || return $?
-        if _mole_clean_trash_active; then
-            _mole_clean_move_to_trash "$path" "$size_human" \
-                "$expected_parent" "$expected_parent_id" "$expected_target_id" \
-                "$expected_file_sha256" "$expected_absent_path"
-            return $?
-        fi
-        # Use || so set -e does not abort before the failure is classified.
-        if [[ "$shell_rm" == true ]]; then
-            error_msg=$(rm -rf "$path" 2>&1) || rm_exit=$? # SAFE: safe_remove validated and rebound this exact target above
-        else
-            error_msg=$(run_with_timeout "$rm_timeout" rm -rf "$path" < /dev/null 2>&1) || rm_exit=$? # SAFE: safe_remove validated and rebound this exact target above
-        fi
-    fi
-
-    if mole_rc_timeout "$rm_exit"; then
-        debug_log "Removal timed out: $path"
-        if [[ $section_deadline_spent -eq 1 ]]; then
-            # Not a slow removal: the caller's section deadline expired before
-            # rm ran, and that section reports its own stop. Counting it here
-            # would point the user at the per-item removal budget instead.
-            log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "section time limit reached"
-        else
-            log_operation "${MOLE_CURRENT_COMMAND:-clean}" "FAILED" "$path" "removal timed out"
-            # A slow disk can exceed the per-item removal budget. That is a
-            # failed removal, not a user interrupt: count it and keep going so
-            # one slow cache never cancels the remaining cleanup.
-            MOLE_CLEAN_REMOVAL_TIMEOUTS=$((${MOLE_CLEAN_REMOVAL_TIMEOUTS:-0} + 1))
-            _mole_record_removal_timeout_path "$path"
-        fi
-        return 124
-    fi
-
-    # Preserve interrupt semantics so callers can abort long-running deletions.
-    if [[ $rm_exit -ge 128 ]]; then
-        _mole_record_clean_cancellation "$rm_exit"
-        return "$rm_exit"
-    fi
-
-    if [[ $rm_exit -eq 0 ]]; then
-        # Log successful removal
-        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "REMOVED" "$path" "$size_human"
-        return 0
-    else
-        # Check if it's a permission error
-        if [[ "$error_msg" == *"Permission denied"* ]] || [[ "$error_msg" == *"Operation not permitted"* ]]; then
-            MOLE_PERMISSION_DENIED_COUNT=${MOLE_PERMISSION_DENIED_COUNT:-0}
-            MOLE_PERMISSION_DENIED_COUNT=$((MOLE_PERMISSION_DENIED_COUNT + 1))
-            export MOLE_PERMISSION_DENIED_COUNT
-            debug_log "Permission denied: $path, may need Full Disk Access"
-            log_operation "${MOLE_CURRENT_COMMAND:-clean}" "FAILED" "$path" "permission denied"
-        else
-            [[ "$silent" != "true" ]] && log_error "Failed to remove: $path"
-            log_operation "${MOLE_CURRENT_COMMAND:-clean}" "FAILED" "$path" "error"
-        fi
-        return 1
-    fi
+    local sink_rc=0
+    _mole_safe_remove_sink "$path" "$silent" "$size_human" "$deadline_seconds" \
+        "$expected_parent" "$expected_parent_id" "$expected_target_id" \
+        "$expected_file_sha256" "$expected_absent_path" || sink_rc=$?
+    return "$sink_rc"
 }
 
 # Safe symlink removal (for pre-validated symlinks only)
@@ -2706,6 +2776,30 @@ mole_deletion_identity() {
     printf '%s\n' "$identity"
 }
 
+# mole_deletion_identity for many paths at once: one bounded stat, the
+# dev:inode:mtime of each path left in _MOLE_DELETION_IDENTITIES in argument
+# order. All or nothing: 1 when any path could not be read (gone since it was
+# listed, unreadable), so the caller reads them one by one, or the stat's
+# timeout or signal status.
+_MOLE_DELETION_IDENTITIES=()
+mole_deletion_identities() {
+    _MOLE_DELETION_IDENTITIES=()
+    [[ $# -gt 0 ]] || return 0
+    local output="" rc=0 line
+    output=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" "$STAT_BSD" -f%d:%i:%m "$@" < /dev/null 2> /dev/null) || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        mole_rc_timeout_or_signal "$rc" && return "$rc"
+        return 1
+    fi
+    local -a read_identities=()
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[0-9]+:[0-9]+:-?[0-9]+$ ]] || return 1
+        read_identities+=("$line")
+    done <<< "$output"
+    [[ ${#read_identities[@]} -eq $# ]] || return 1
+    _MOLE_DELETION_IDENTITIES=("${read_identities[@]}")
+}
+
 # Bind owner decisions to file contents across slow probes. The caller also
 # supplies path identity so an atomic replacement cannot inherit approval.
 mole_file_sha256() {
@@ -2733,6 +2827,7 @@ _mole_owned_path_still_valid() {
     local expected_parent_id="${5:-}"
     local expected_target_id="${6:-}"
     local deadline="${7:-}"
+    local expected_mtime="${8:-}"
     if [[ -n "$expected_file_sha256" ]]; then
         local current_sha256="" hash_rc=0
         current_sha256=$(mole_file_sha256 "$path" "$deadline") || hash_rc=$?
@@ -2748,8 +2843,10 @@ _mole_owned_path_still_valid() {
     fi
     # Hashing reads a file descriptor while the sink acts on a pathname. A
     # replacement installed during the hash must not inherit its approval.
+    # An expected mtime also refuses the same inode rewritten in place.
     if [[ -n "$expected_parent" ]] && ! _mole_path_matches_identity \
-        "$path" "$expected_parent" "$expected_parent_id" "$expected_target_id"; then
+        "$path" "$expected_parent" "$expected_parent_id" "$expected_target_id" \
+        "$expected_mtime"; then
         return "$MOLE_ERR_OWNER_UNVERIFIED"
     fi
     _mole_expected_path_absent "$expected_absent_path" || return "$MOLE_ERR_APP_REAPPEARED"
@@ -2780,7 +2877,10 @@ _mole_report_unverified_delete() {
 # every call for forensic review. Designed for destructive paths where undo
 # matters (e.g. uninstall). Not used by cache-clean paths.
 #
-# Usage: mole_delete <path> [needs_sudo=false] [expected_dev_inode_mtime] [expected_file_sha256] [expected_absent_path]
+# Usage: mole_delete <path> [needs_sudo=false] [expected_dev_inode_mtime] [expected_file_sha256] [expected_absent_path] [size_kb]
+#
+# A size_kb the caller already measured (KB, or "unknown" when it could not)
+# is logged instead of measuring again.
 #
 # Environment:
 #   MOLE_DELETE_MODE      "permanent" (default) or "trash"; other values fail
@@ -2804,6 +2904,7 @@ mole_delete() {
     local expected_identity="${3:-}"
     local expected_file_sha256="${4:-}"
     local expected_absent_path="${5:-}"
+    local precomputed_size_kb="${6:-}"
     local mode="${MOLE_DELETE_MODE:-permanent}"
 
     [[ -z "$path" ]] && return 1
@@ -2831,6 +2932,18 @@ mole_delete() {
     # Nothing to do if path does not exist (but a broken symlink still counts).
     if [[ ! -e "$path" && ! -L "$path" ]]; then
         return 0
+    fi
+
+    # A path of an open batch shares that batch's reads. A symlink, a SQLite
+    # file and a partial download keep safe_remove's own probes.
+    if [[ "$mode" == "permanent" && "$needs_sudo" != "true" && -n "$expected_identity" &&
+        -z "$expected_file_sha256" && -z "$expected_absent_path" && ! -L "$path" &&
+        "${MOLE_UNINSTALL_MODE:-0}" != "1" && "${_MOLE_UNINSTALL_UUID_PATH:-}" != "$path" ]] &&
+        ! _mole_is_sqlite_database_path "$path" && ! _mole_is_incomplete_download_path "$path" &&
+        _mole_delete_batch_lookup "$path"; then
+        local batch_rc=0
+        _mole_delete_batch_one "$path" "$log_mode" "$expected_identity" "$precomputed_size_kb" || batch_rc=$?
+        return "$batch_rc"
     fi
 
     # Validation is delegated to the underlying safe_* helpers (which call
@@ -2878,7 +2991,11 @@ mole_delete() {
     if [[ "${MOLE_UNINSTALL_MODE:-0}" == "1" ]] && mole_sizing_would_ask_for_app_data "$path"; then
         skip_size_probe=true
     fi
-    if [[ -e "$path" && "$skip_size_probe" != "true" ]]; then
+    if [[ "$precomputed_size_kb" =~ ^[0-9]+$ ]]; then
+        size_kb="$precomputed_size_kb"
+    elif [[ "$precomputed_size_kb" == "unknown" ]]; then
+        : # The caller measured it and could not.
+    elif [[ -e "$path" && "$skip_size_probe" != "true" ]]; then
         local raw_size=""
         local du_rc=0
         if [[ "$needs_sudo" == "true" ]]; then
@@ -2979,7 +3096,8 @@ mole_delete() {
 
     if [[ "${MOLE_DRY_RUN:-0}" == "1" ]]; then
         local preview_rc=0
-        if [[ "$size_kb" =~ ^[0-9]+$ ]]; then
+        if [[ "$size_kb" =~ ^[0-9]+$ || "$precomputed_size_kb" == "unknown" ]]; then
+            # A size the caller could not measure stays unknown, not measured again.
             _record_file_ops_dry_run_target "$path" "$size_kb" || preview_rc=$?
         else
             _record_file_ops_dry_run_target "$path" || preview_rc=$?
@@ -3092,6 +3210,193 @@ mole_delete() {
     if [[ $rc -eq $MOLE_ERR_MUTABLE_PARENT ]]; then
         status_label="mutable-parent"
     elif mole_rc_timeout "$rc"; then
+        status_label="timed-out"
+    elif [[ $rc -ge 128 ]]; then
+        status_label="interrupted"
+    elif [[ $rc -ne 0 ]]; then
+        status_label="error"
+    fi
+    _mole_delete_log "$log_mode" "$size_kb" "$status_label" "$path"
+    return "$rc"
+}
+
+# Open a batch for mole_delete, for a caller that removes user-level paths by
+# the thousand (the Rust `target` trim of `mo purge`: about 190 ms an entry
+# before, most of it folder checks repeated per entry). Args: the paths the
+# caller will next hand to mole_delete, each with the identity it read for it
+# before this call. Call it after `local _MOLE_DELETE_BATCH_ID=""` in the
+# function that removes the batch: it sets that local, so the batch ends when
+# that function returns. While it is open, mole_delete of one of these paths
+# (permanent mode, not sudo, no hash or absent-path contract, not a symlink,
+# SQLite file or partial download) makes every check mole_delete and
+# safe_remove make, in their order, with the same rows in operations.log and
+# deletions.log, and rebinds the path to its parent and dev:inode just before
+# its removal. Shared across the batch is only work that does not depend on
+# the entry:
+#  - one bounded stat reads every path's dev:inode:mtime for mole_delete's
+#    identity check, and each distinct parent folder is resolved once;
+#  - a reviewed plan's kept root read unchanged answers again for the rest of
+#    the batch (mole_apply_plan_allows), and _MOLE_DELETE_BATCH_ID lets the
+#    caller's final guard keep its own folder verdict the same way.
+# Neither shortcut lets a replaced folder through: a swap after the caller
+# read its identities leaves the path naming another inode, which the
+# identity check refuses, and a swap before that fails the first fresh folder
+# check of the batch. When the stat cannot read every path (one is gone),
+# mole_delete takes its usual route for each. Returns 0, or a signal status.
+_MOLE_DELETE_BATCH_SERIAL=0
+_MOLE_DELETE_BATCH_BOUND_ID=""
+_MOLE_DELETE_BATCH_HIT=0
+_MOLE_DELETE_BATCH_PATHS=()
+_MOLE_DELETE_BATCH_PARENTS=()
+_MOLE_DELETE_BATCH_PARENT_IDS=()
+_MOLE_DELETE_BATCH_CURRENT=()
+# Scratch file for rm's message, one per process, made by the first batch;
+# the temp registry removes it at exit.
+_MOLE_DELETE_BATCH_ERROR_FILE=""
+mole_delete_batch_begin() {
+    _MOLE_DELETE_BATCH_SERIAL=$((_MOLE_DELETE_BATCH_SERIAL + 1))
+    _MOLE_DELETE_BATCH_ID="$$.$_MOLE_DELETE_BATCH_SERIAL"
+    _MOLE_DELETE_BATCH_BOUND_ID="$_MOLE_DELETE_BATCH_ID"
+    _MOLE_APPLY_PLAN_BATCH_ROOTS=""
+    _MOLE_DELETE_BATCH_PATHS=()
+    _MOLE_DELETE_BATCH_PARENTS=()
+    _MOLE_DELETE_BATCH_PARENT_IDS=()
+    _MOLE_DELETE_BATCH_CURRENT=()
+    [[ $# -gt 0 ]] || return 0
+    if [[ -z "$_MOLE_DELETE_BATCH_ERROR_FILE" || ! -f "$_MOLE_DELETE_BATCH_ERROR_FILE" ]]; then
+        _MOLE_DELETE_BATCH_ERROR_FILE=$(create_temp_file 2> /dev/null) || _MOLE_DELETE_BATCH_ERROR_FILE=""
+    fi
+    local read_rc=0
+    mole_deletion_identities "$@" || read_rc=$?
+    mole_rc_signal "$read_rc" && return "$read_rc"
+    [[ $read_rc -eq 0 ]] || return 0
+
+    local path lexical_parent last_lexical="" physical="" parent_id="" first=true
+    local -a parents=() parent_ids=()
+    for path in "$@"; do
+        lexical_parent="${path%/*}"
+        [[ -n "$lexical_parent" && "$lexical_parent" != "$path" ]] || lexical_parent="/"
+        if [[ "$first" == "true" || "$lexical_parent" != "$last_lexical" ]]; then
+            first=false
+            last_lexical="$lexical_parent"
+            parent_id=""
+            physical=$(cd -P "$lexical_parent" 2> /dev/null && pwd -P) || physical=""
+            if [[ -n "$physical" ]]; then
+                parent_id=$("$STAT_BSD" -f '%d:%i' "$physical" 2> /dev/null) || parent_id=""
+            fi
+            [[ "$parent_id" =~ ^[0-9]+:[0-9]+$ ]] || parent_id=""
+        fi
+        parents+=("$physical")
+        parent_ids+=("$parent_id")
+    done
+    _MOLE_DELETE_BATCH_PATHS=("$@")
+    _MOLE_DELETE_BATCH_PARENTS=("${parents[@]}")
+    _MOLE_DELETE_BATCH_PARENT_IDS=("${parent_ids[@]}")
+    _MOLE_DELETE_BATCH_CURRENT=("${_MOLE_DELETION_IDENTITIES[@]}")
+}
+
+# 0 when $1 is a path of the open mole_delete batch whose parent was
+# resolved, its index left in _MOLE_DELETE_BATCH_HIT.
+_mole_delete_batch_lookup() {
+    [[ -n "${_MOLE_DELETE_BATCH_ID:-}" && "$_MOLE_DELETE_BATCH_ID" == "$_MOLE_DELETE_BATCH_BOUND_ID" ]] || return 1
+    local index
+    for ((index = 0; index < ${#_MOLE_DELETE_BATCH_PATHS[@]}; index++)); do
+        if [[ "${_MOLE_DELETE_BATCH_PATHS[index]}" == "$1" ]]; then
+            [[ -n "${_MOLE_DELETE_BATCH_PARENTS[index]}" && -n "${_MOLE_DELETE_BATCH_PARENT_IDS[index]}" ]] || return 1
+            _MOLE_DELETE_BATCH_HIT=$index
+            return 0
+        fi
+    done
+    return 1
+}
+
+# mole_delete of a path of the open batch (see mole_delete_batch_begin), from
+# its validation on. Args: path, the deletions-log mode, the expected
+# dev:inode:mtime and the size in KB (anything else: unknown).
+_mole_delete_batch_one() {
+    local path="$1"
+    local log_mode="$2"
+    local expected_identity="$3"
+    local size_kb="$4"
+    [[ "$size_kb" =~ ^[0-9]+$ ]] || size_kb="unknown"
+
+    local validation_rc=0
+    validate_path_for_deletion "$path" || validation_rc=$?
+    if mole_rc_timeout_or_signal "$validation_rc"; then
+        local validation_status="interrupted"
+        mole_rc_timeout "$validation_rc" && validation_status="timed-out"
+        _mole_delete_log "$log_mode" "unknown" "$validation_status" "$path"
+        return "$validation_rc"
+    fi
+    if [[ $validation_rc -ne 0 ]]; then
+        _mole_delete_log "$log_mode" "0" "rejected" "$path"
+        log_operation "${MOLE_CURRENT_COMMAND:-uninstall}" "SKIPPED" "$path" "${_MOLE_VALIDATION_REASON:-protected}"
+        return 1
+    fi
+    local plan_rc=0
+    _mole_apply_plan_gate "$path" || plan_rc=$?
+    if [[ $plan_rc -ne 0 ]]; then
+        _mole_delete_log "$log_mode" "0" "rejected" "$path"
+        return "$plan_rc"
+    fi
+
+    local hit="$_MOLE_DELETE_BATCH_HIT"
+    local expected_parent="${_MOLE_DELETE_BATCH_PARENTS[hit]}"
+    local expected_parent_id="${_MOLE_DELETE_BATCH_PARENT_IDS[hit]}"
+    local current_identity="${_MOLE_DELETE_BATCH_CURRENT[hit]}"
+    local expected_target_id="${current_identity%:*}"
+    if [[ "$current_identity" != "$expected_identity" ||
+        "$expected_target_id" != "${expected_identity%:*}" ]]; then
+        _mole_delete_log "$log_mode" "$size_kb" "identity-changed" "$path"
+        debug_log "Refusing deletion after selected path identity changed: $path"
+        return 1
+    fi
+
+    # safe_remove's own route from here, without its second validation and
+    # sizing: its checks before the dry-run return, then its final sink, whose
+    # last rebind also requires the mtime read for this entry, so an entry
+    # rewritten in place since then is kept.
+    local rc=0
+    _mole_safe_remove_prechecks "$path" || rc=$?
+    if [[ $rc -eq 0 && "$_MOLE_SAFE_REMOVE_PATH_GONE" != "true" && "${MOLE_DRY_RUN:-0}" == "1" ]]; then
+        _record_file_ops_dry_run_target "$path" "$size_kb" || rc=$?
+        if mole_rc_timeout_or_signal "$rc"; then
+            local preview_status="interrupted"
+            mole_rc_timeout "$rc" && preview_status="timed-out"
+            _mole_delete_log "$log_mode" "$size_kb" "$preview_status" "$path"
+            return "$rc"
+        fi
+        if [[ $rc -ne 0 ]]; then
+            _mole_delete_log "$log_mode" "$size_kb" "rejected" "$path"
+            return "$rc"
+        fi
+        debug_log "[DRY RUN] Would delete (permanent): $path"
+        _mole_delete_log "$log_mode" "$size_kb" "dry-run" "$path"
+        return 0
+    fi
+    if [[ $rc -eq 0 && "$_MOLE_SAFE_REMOVE_PATH_GONE" != "true" ]]; then
+        debug_log "Removing: $path"
+        local size_human=""
+        if oplog_enabled && [[ "$size_kb" =~ ^[0-9]+$ ]] && [[ "$size_kb" -gt 0 ]]; then
+            size_human=$(bytes_to_human "$((size_kb * 1024))" 2> /dev/null || echo "${size_kb}KB")
+        fi
+        # The parent this path is bound to, for the caller's final guard: the
+        # rebind before removal holds the path to it.
+        local _MOLE_DELETE_BATCH_ENTRY="$path"
+        local _MOLE_DELETE_BATCH_ENTRY_PARENT="$expected_parent"
+        _mole_safe_remove_sink "$path" true "$size_human" "" \
+            "$expected_parent" "$expected_parent_id" "$expected_target_id" "" "" \
+            "${expected_identity##*:}" || rc=$?
+    fi
+    if [[ $rc -eq $MOLE_ERR_OWNER_UNVERIFIED ]]; then
+        # The last rebind found the entry changed (another inode, parent or
+        # mtime): kept, as mole_delete keeps a changed identity.
+        _mole_delete_log "$log_mode" "$size_kb" "identity-changed" "$path"
+        log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "identity changed"
+        return 1
+    fi
+    local status_label="ok"
+    if mole_rc_timeout "$rc"; then
         status_label="timed-out"
     elif [[ $rc -ge 128 ]]; then
         status_label="interrupted"
@@ -3691,12 +3996,16 @@ _MOLE_TRASH_MOVE_EXPECTED_TARGET_ID=""
 _MOLE_PATH_SNAPSHOT_PARENT=""
 _MOLE_PATH_SNAPSHOT_PARENT_ID=""
 _MOLE_PATH_SNAPSHOT_TARGET_ID=""
+# Set only when _mole_snapshot_path_identity is asked for it ($2 true).
+_MOLE_PATH_SNAPSHOT_TARGET_MTIME=""
 
 _mole_snapshot_path_identity() {
     local path="$1"
+    local with_mtime="${2:-false}"
     _MOLE_PATH_SNAPSHOT_PARENT=""
     _MOLE_PATH_SNAPSHOT_PARENT_ID=""
     _MOLE_PATH_SNAPSHOT_TARGET_ID=""
+    _MOLE_PATH_SNAPSHOT_TARGET_MTIME=""
 
     [[ -e "$path" || -L "$path" ]] || return 1
     local lexical_parent="${path%/*}"
@@ -3707,24 +4016,45 @@ _mole_snapshot_path_identity() {
     local parent_id=""
     local target_id=""
     local identities=""
-    identities=$("$STAT_BSD" -f '%d:%i' "$physical_parent" "$path" 2> /dev/null) || return 1
-    [[ "$identities" == *$'\n'* ]] || return 1
-    parent_id="${identities%%$'\n'*}"
-    target_id="${identities#*$'\n'}"
+    local target_mtime=""
+    if [[ "$with_mtime" == "true" ]]; then
+        identities=$("$STAT_BSD" -f '%d:%i:%m' "$physical_parent" "$path" 2> /dev/null) || return 1
+        [[ "$identities" == *$'\n'* ]] || return 1
+        parent_id="${identities%%$'\n'*}"
+        parent_id="${parent_id%:*}"
+        target_id="${identities#*$'\n'}"
+        target_mtime="${target_id##*:}"
+        target_id="${target_id%:*}"
+        [[ "$target_mtime" =~ ^-?[0-9]+$ ]] || return 1
+    else
+        identities=$("$STAT_BSD" -f '%d:%i' "$physical_parent" "$path" 2> /dev/null) || return 1
+        [[ "$identities" == *$'\n'* ]] || return 1
+        parent_id="${identities%%$'\n'*}"
+        target_id="${identities#*$'\n'}"
+    fi
     [[ "$parent_id" =~ ^[0-9]+:[0-9]+$ && "$target_id" =~ ^[0-9]+:[0-9]+$ ]] || return 1
 
     _MOLE_PATH_SNAPSHOT_PARENT="$physical_parent"
     _MOLE_PATH_SNAPSHOT_PARENT_ID="$parent_id"
     _MOLE_PATH_SNAPSHOT_TARGET_ID="$target_id"
+    _MOLE_PATH_SNAPSHOT_TARGET_MTIME="$target_mtime"
 }
 
+# Args: path, expected physical parent, its dev:inode, the path's dev:inode,
+# and optionally the path's mtime, which must then be unchanged too.
 _mole_path_matches_identity() {
     local path="$1"
     local expected_parent="$2"
     local expected_parent_id="$3"
     local expected_target_id="$4"
+    local expected_mtime="${5:-}"
 
-    _mole_snapshot_path_identity "$path" || return 1
+    if [[ -n "$expected_mtime" ]]; then
+        _mole_snapshot_path_identity "$path" true || return 1
+        [[ "$_MOLE_PATH_SNAPSHOT_TARGET_MTIME" == "$expected_mtime" ]] || return 1
+    else
+        _mole_snapshot_path_identity "$path" || return 1
+    fi
     [[ "$_MOLE_PATH_SNAPSHOT_PARENT" == "$expected_parent" ]] || return 1
     [[ "$_MOLE_PATH_SNAPSHOT_PARENT_ID" == "$expected_parent_id" ]] || return 1
     [[ "$_MOLE_PATH_SNAPSHOT_TARGET_ID" == "$expected_target_id" ]]
@@ -3861,7 +4191,7 @@ _mole_delete_log() {
     fi
 
     local ts
-    ts=$(date '+%Y-%m-%dT%H:%M:%S%z' 2> /dev/null || echo "unknown")
+    _mole_log_stamp ts date '+%Y-%m-%dT%H:%M:%S%z' 2> /dev/null || ts="unknown"
 
     _mole_escape_log_value mode "$mode"
     _mole_escape_log_value size_kb "$size_kb"

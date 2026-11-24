@@ -2011,3 +2011,104 @@ EOF
 	[[ -e "$victim" ]] || return 1
 	[[ -z "$(ls -A "$test_trash")" ]] || return 1
 }
+
+@test "mole_delete in an open batch removes a bound path and refuses one replaced after its caller read it" {
+    run bash -c "$(prelude)
+mkdir -p '$SANDBOX/d'
+printf a > '$SANDBOX/d/a'
+printf b > '$SANDBOX/d/b'
+ida=\$(mole_deletion_identity '$SANDBOX/d/a')
+idb=\$(mole_deletion_identity '$SANDBOX/d/b')
+# b is replaced after the caller read it, before the batch begins.
+rm -f '$SANDBOX/d/b'
+printf c > '$SANDBOX/d/b'
+remove_batch() {
+    local _MOLE_DELETE_BATCH_ID=''
+    mole_delete_batch_begin '$SANDBOX/d/a' '$SANDBOX/d/b'
+    mole_delete '$SANDBOX/d/a' false \"\$ida\" '' '' 7 && echo a-removed
+    mole_delete '$SANDBOX/d/b' false \"\$idb\" '' '' 7 || echo b-refused
+}
+remove_batch"
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"a-removed"* && "$output" == *"b-refused"* ]] || return 1
+    [ ! -e "$SANDBOX/d/a" ] || return 1
+    [ "$(cat "$SANDBOX/d/b")" = c ] || return 1
+    grep -q "	permanent	7	ok	$SANDBOX/d/a$" "$MOLE_DELETE_LOG" || return 1
+    grep -q "	permanent	7	identity-changed	$SANDBOX/d/b$" "$MOLE_DELETE_LOG"
+}
+
+@test "a mole_delete batch's reviewed-root shortcut ends with the function that opened it" {
+    run bash -c "$(prelude)
+root='$SANDBOX/root'
+mkdir -p \"\$root\"
+printf x > \"\$root/x\"
+printf 'P\0%s\0%s\0\0END\0' \"\$root\" \"\$(/usr/bin/stat -f %d:%i \"\$root\")\" > '$SANDBOX/approved.plan'
+export MOLE_APPLY_PLAN='$SANDBOX/approved.plan'
+in_batch() {
+    local _MOLE_DELETE_BATCH_ID=''
+    mole_delete_batch_begin \"\$root/x\"
+    mole_apply_plan_allows \"\$root/x\" && echo first-allowed
+}
+in_batch
+# The reviewed root is replaced once that batch is over.
+mv \"\$root\" '$SANDBOX/root.reviewed'
+mkdir \"\$root\"
+printf x > \"\$root/x\"
+mole_apply_plan_allows \"\$root/x\" || echo \"after: \$_MOLE_APPLY_PLAN_REASON\"
+in_batch || echo \"next batch: \$_MOLE_APPLY_PLAN_REASON\""
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"first-allowed"* ]] || return 1
+    [[ "$output" == *"after: changed since review"* ]] || return 1
+    [[ "$output" == *"next batch: changed since review"* ]]
+}
+
+@test "mole_delete dry run never measures again a size its caller could not measure" {
+    run bash -c "$(prelude)
+mkdir -p '$SANDBOX/d'
+printf a > '$SANDBOX/d/a'
+printf b > '$SANDBOX/d/b'
+ida=\$(mole_deletion_identity '$SANDBOX/d/a')
+idb=\$(mole_deletion_identity '$SANDBOX/d/b')
+record_dry_run_cleanup_target() { echo \"recorded \$1 \$2 \$4\"; }
+get_path_size_kb() { echo \"measured \$1\" >&2; echo 1; }
+export MOLE_DRY_RUN=1
+in_batch() {
+    local _MOLE_DELETE_BATCH_ID=''
+    mole_delete_batch_begin '$SANDBOX/d/a'
+    mole_delete '$SANDBOX/d/a' false \"\$ida\" '' '' unknown
+}
+in_batch
+mole_delete '$SANDBOX/d/b' false \"\$idb\" '' '' unknown" 2>&1
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" != *"measured"* ]] || return 1
+    [[ "$output" == *"recorded $SANDBOX/d/a 0 false"* ]] || return 1
+    [[ "$output" == *"recorded $SANDBOX/d/b 0 false"* ]] || return 1
+    [ -f "$SANDBOX/d/a" ] && [ -f "$SANDBOX/d/b" ] || return 1
+    grep -q "	permanent	unknown	dry-run	$SANDBOX/d/a$" "$MOLE_DELETE_LOG"
+}
+
+@test "mole_delete in an open batch keeps a path replaced while its final guard ran" {
+    mkdir -p "$SANDBOX/oplog-home"
+    run env HOME="$SANDBOX/oplog-home" bash -c "$(prelude)
+mkdir -p '$SANDBOX/d'
+printf a > '$SANDBOX/d/a'
+ida=\$(mole_deletion_identity '$SANDBOX/d/a')
+# The guard approves, but the path is swapped for a copy while it runs.
+swap_during_guard() {
+    /bin/rm -f '$SANDBOX/d/a'
+    printf c > '$SANDBOX/d/a'
+    return 0
+}
+_MOLE_SAFE_REMOVE_FINAL_GUARD=swap_during_guard
+remove_batch() {
+    local _MOLE_DELETE_BATCH_ID=''
+    mole_delete_batch_begin '$SANDBOX/d/a'
+    mole_delete '$SANDBOX/d/a' false \"\$ida\" '' '' 7 || echo a-refused
+}
+remove_batch"
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"a-refused"* ]] || return 1
+    [ "$(cat "$SANDBOX/d/a")" = c ] || return 1
+    grep -q "	permanent	7	identity-changed	$SANDBOX/d/a$" "$MOLE_DELETE_LOG" || return 1
+    grep -Fq "SKIPPED $SANDBOX/d/a (identity changed)" "$SANDBOX/oplog-home/Library/Logs/mole/operations.log"
+}

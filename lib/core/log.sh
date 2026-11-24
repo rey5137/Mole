@@ -309,6 +309,46 @@ operation_log_command() {
     fi
 }
 
+# Set the variable $1 to the output of the stamp command $2.. (get_timestamp,
+# or date with a format). Inside an open mole_delete batch
+# (mole_delete_batch_begin in lib/core/file_ops.sh), whose rows come by the
+# hundred a second, the rows of one wall-clock second share one call: bash's
+# SECONDS ticks with the wall clock, so a stamp taken while SECONDS held one
+# value is what the command prints for the rest of that second. A stamp that
+# straddled a tick, or a failed or empty one, is not kept. Returns the
+# command's status.
+_MOLE_BATCH_STAMP_KEY_1=""
+_MOLE_BATCH_STAMP_1=""
+_MOLE_BATCH_STAMP_KEY_2=""
+_MOLE_BATCH_STAMP_2=""
+_mole_log_stamp() {
+    local _mole_stamp_out="$1"
+    shift
+    local _mole_stamp_key="" _mole_stamp="" _mole_stamp_second="$SECONDS"
+    if [[ -n "${_MOLE_DELETE_BATCH_ID:-}" ]]; then
+        _mole_stamp_key="$_MOLE_DELETE_BATCH_ID@$_mole_stamp_second@$*"
+        if [[ "$_mole_stamp_key" == "$_MOLE_BATCH_STAMP_KEY_1" ]]; then
+            printf -v "$_mole_stamp_out" '%s' "$_MOLE_BATCH_STAMP_1"
+            return 0
+        fi
+        if [[ "$_mole_stamp_key" == "$_MOLE_BATCH_STAMP_KEY_2" ]]; then
+            printf -v "$_mole_stamp_out" '%s' "$_MOLE_BATCH_STAMP_2"
+            return 0
+        fi
+    fi
+    local _mole_stamp_rc=0
+    _mole_stamp=$("$@") || _mole_stamp_rc=$?
+    printf -v "$_mole_stamp_out" '%s' "$_mole_stamp"
+    if [[ $_mole_stamp_rc -eq 0 && -n "$_mole_stamp" && -n "$_mole_stamp_key" &&
+        "$_mole_stamp_second" == "$SECONDS" ]]; then
+        _MOLE_BATCH_STAMP_KEY_2="$_MOLE_BATCH_STAMP_KEY_1"
+        _MOLE_BATCH_STAMP_2="$_MOLE_BATCH_STAMP_1"
+        _MOLE_BATCH_STAMP_KEY_1="$_mole_stamp_key"
+        _MOLE_BATCH_STAMP_1="$_mole_stamp"
+    fi
+    return "$_mole_stamp_rc"
+}
+
 # Log an operation to the operations log file
 # Usage: log_operation <command> <action> <path> [detail]
 # Example: log_operation "clean" "REMOVED" "/path/to/file" "15.2MB"
@@ -327,7 +367,7 @@ log_operation() {
     [[ -z "$path" ]] && return 0
 
     local timestamp
-    timestamp=$(get_timestamp)
+    _mole_log_stamp timestamp get_timestamp || true
 
     local log_command
     operation_log_command log_command "$command"

@@ -1768,17 +1768,42 @@ _mole_purge_final_artifact_unchanged() {
         "$current_physical_path" "${_MOLE_PURGE_FINAL_SCAN_ROOT_PHYSICAL:-}"
 }
 
-# Final safe_remove hook for one entry of a Rust `target` trim. The in-use and
-# protection probes ran once for the folder before its trim set was listed;
-# per entry, rebind the scan root and the reviewed `target` folder and require
-# the entry to sit where the trim rule puts one, with no symlink in between.
+# Final sink hook for one entry of a Rust `target` trim. The in-use and
+# protection probes ran once for the folder before its trim set was listed.
+# The scan root and the reviewed `target` folder are rebound at the first
+# entry of each mole_delete batch (_MOLE_DELETE_BATCH_ID, at most
+# PURGE_RUST_TRIM_BATCH_MAX entries) and for every entry outside one: they are
+# folders, and each entry of a batch is bound to the dev:inode the trim read
+# before the batch began, so a folder replaced after that leaves the entry
+# path naming another inode, which mole_delete refuses. Per entry, the entry
+# must sit where the trim rule puts one, with no symlink between it and the
+# folder: inside a batch that is the physical parent the batch bound it to,
+# which the rebind just before its removal holds it to.
+_MOLE_PURGE_TRIM_VERIFIED_KEY=""
+_MOLE_PURGE_TRIM_VERIFIED_PHYSICAL=""
 _mole_purge_trim_final_guard() {
     local entry="$1" target="${_MOLE_PURGE_FINAL_TRIM_TARGET:-}"
     [[ -n "$target" ]] || return 1
-    _mole_purge_final_artifact_unchanged "$target" || return 1
-    local physical_target="${_MOLE_PATH_SNAPSHOT_PARENT%/}/${target##*/}"
-    [[ "$_MOLE_PATH_SNAPSHOT_PARENT" == "/" ]] && physical_target="/${target##*/}"
-    _purge_rust_trim_entry_in_scope "$entry" "$target" "$physical_target"
+    local batch_id="${_MOLE_DELETE_BATCH_ID:-}" physical_target
+    local key="$batch_id/$target/${_MOLE_PURGE_FINAL_EXPECTED_TARGET_ID:-}"
+    if [[ -n "$batch_id" && "$_MOLE_PURGE_TRIM_VERIFIED_KEY" == "$key" ]]; then
+        physical_target="$_MOLE_PURGE_TRIM_VERIFIED_PHYSICAL"
+    else
+        _MOLE_PURGE_TRIM_VERIFIED_KEY=""
+        _mole_purge_final_artifact_unchanged "$target" || return 1
+        physical_target="${_MOLE_PATH_SNAPSHOT_PARENT%/}/${target##*/}"
+        [[ "$_MOLE_PATH_SNAPSHOT_PARENT" == "/" ]] && physical_target="/${target##*/}"
+        if [[ -n "$batch_id" ]]; then
+            _MOLE_PURGE_TRIM_VERIFIED_KEY="$key"
+            _MOLE_PURGE_TRIM_VERIFIED_PHYSICAL="$physical_target"
+        fi
+    fi
+    local bound_parent=""
+    if [[ -n "$batch_id" && "${_MOLE_DELETE_BATCH_ENTRY:-}" == "$entry" ]]; then
+        bound_parent="${_MOLE_DELETE_BATCH_ENTRY_PARENT:-}"
+        [[ -n "$bound_parent" ]] || return 1
+    fi
+    _purge_rust_trim_entry_in_scope "$entry" "$target" "$physical_target" "$bound_parent"
 }
 
 # Args: $1 - path, $2 - optional shared deadline in SECONDS
@@ -1854,6 +1879,11 @@ readonly PURGE_RUST_TRIM_AGE_DAYS=7
 # What a trim may take inside a profile folder: the whole `incremental`, and
 # the old direct entries of these three.
 readonly PURGE_RUST_TRIM_AGED_DIRS=("deps" "build" ".fingerprint")
+# Entries a trim apply reads, sizes and removes in one mole_delete batch
+# (mole_delete_batch_begin). What the batch shares (the folder rebinds, the
+# plan root read, one stat and one du) then costs a few ms an entry, while
+# every entry is still rebound just before its own removal.
+readonly PURGE_RUST_TRIM_BATCH_MAX=32
 
 # Write the profile folders of the Rust target $1 to $2, NUL-separated: a real
 # folder one level down, or two levels down under a folder that is not itself
@@ -1985,9 +2015,12 @@ purge_rust_trim_measure() {
 # 0 when $1 sits where a trim entry can: <profile>/incremental, or a direct
 # entry of <profile>/deps, build or .fingerprint, with the profile one level
 # below the target $2 or two under a triple, and no symlink between the
-# target and the entry's folder. The final sink guard asks this per entry.
+# target and the entry's folder: that folder resolves, or $4 when given (the
+# physical folder a caller already resolved and binds the entry to), to the
+# same place under the physical target $3. The final sink guard asks this
+# per entry.
 _purge_rust_trim_entry_in_scope() {
-    local entry="$1" target="${2%/}" physical_target="$3"
+    local entry="$1" target="${2%/}" physical_target="$3" physical_parent="${4:-}"
     [[ "$entry" == "$target/"* ]] || return 1
     local rel="${entry#"$target"/}" parent_rel leaf
     leaf="${rel##*/}"
@@ -2008,8 +2041,9 @@ _purge_rust_trim_entry_in_scope() {
     else
         return 1
     fi
-    local physical_parent=""
-    physical_parent=$(cd -P "$target/$parent_rel" 2> /dev/null && pwd -P) || return 1
+    if [[ -z "$physical_parent" ]]; then
+        physical_parent=$(cd -P "$target/$parent_rel" 2> /dev/null && pwd -P) || return 1
+    fi
     [[ "$physical_parent" == "${physical_target%/}/$parent_rel" ]]
 }
 
@@ -4035,13 +4069,142 @@ _purge_selected_item_guard() {
     return 0
 }
 
+# Size the trim entries $@ with one bounded `du -skP`, the basis of
+# get_path_size_kb, into _PURGE_TRIM_SIZES index for index. When du does not
+# finish cleanly or its lines do not name the entries in order (du prints no
+# line for a file hard-linked to an earlier operand), each entry is sized
+# alone with get_path_size_kb instead, and one it cannot size is "unknown".
+# Returns 0, or a signal status.
+_PURGE_TRIM_SIZES=()
+_purge_trim_size_entries() {
+    _PURGE_TRIM_SIZES=()
+    [[ $# -gt 0 ]] || return 0
+    local output="" rc=0 line index=0
+    local -a entries=("$@") sizes=()
+    output=$(run_with_timeout "$MOLE_TIMEOUT_DISK_VERIFY_SEC" du -skP "${entries[@]}" < /dev/null 2> /dev/null) || rc=$?
+    mole_rc_signal "$rc" && return "$rc"
+    if [[ $rc -eq 0 ]]; then
+        while IFS= read -r line; do
+            [[ $index -lt ${#entries[@]} && "${line#*$'\t'}" == "${entries[index]}" &&
+                "${line%%$'\t'*}" =~ ^[0-9]+$ ]] || break
+            sizes+=("${line%%$'\t'*}")
+            index=$((index + 1))
+        done <<< "$output"
+    fi
+    if [[ ${#sizes[@]} -eq ${#entries[@]} ]]; then
+        _PURGE_TRIM_SIZES=("${sizes[@]}")
+        return 0
+    fi
+    local entry entry_kb
+    for entry in "${entries[@]}"; do
+        rc=0
+        entry_kb=$(get_path_size_kb "$entry" 2> /dev/null) || rc=$?
+        mole_rc_signal "$rc" && return "$rc"
+        [[ $rc -eq 0 && "$entry_kb" =~ ^[0-9]+$ ]] || entry_kb="unknown"
+        _PURGE_TRIM_SIZES+=("$entry_kb")
+    done
+    return 0
+}
+
+# Count one trim entry the sink handled with status $2: removed with $3 KB
+# ("unknown" marks the total partial), or refused for the reason $4. Reads
+# and sets the locals of _purge_trim_selected_item through dynamic scope.
+_purge_trim_count_entry() {
+    local entry="$1" entry_rc="$2" entry_kb="$3" reason="${4:-}"
+    if [[ $entry_rc -ne 0 ]] || [[ "${MOLE_DRY_RUN:-0}" != "1" && (-e "$entry" || -L "$entry") ]]; then
+        failed=$((failed + 1))
+        [[ -z "$reason" ]] || skip_reason="$reason"
+        return 0
+    fi
+    if [[ ! "$entry_kb" =~ ^[0-9]+$ ]]; then
+        entry_kb=0
+        _PURGE_TRIM_SIZE_PARTIAL=true
+    fi
+    _PURGE_TRIM_REMOVED_COUNT=$((_PURGE_TRIM_REMOVED_COUNT + 1))
+    _PURGE_TRIM_REMOVED_KB=$((_PURGE_TRIM_REMOVED_KB + entry_kb))
+}
+
+# Remove one batch of a trim's listed entries $@, at most
+# PURGE_RUST_TRIM_BATCH_MAX: read their identities with one stat (one by one
+# when an entry is gone), keep an old entry modified since it was listed,
+# size the rest once, then remove each through mole_delete bound to the
+# identity read here, inside one mole_delete batch. A symlinked `incremental`
+# goes through mole_delete's link sink, which has no final hook, so the trim
+# final guard is asked first. Returns 0, or the timeout or signal status that
+# stops the trim.
+_purge_trim_remove_batch() {
+    local -a entries=("$@") read_ids=() kept=() kept_ids=()
+    local index entry identity identity_rc parent_name read_rc=0 guard_rc entry_rc
+    mole_deletion_identities "${entries[@]}" || read_rc=$?
+    mole_rc_signal "$read_rc" && return "$read_rc"
+    [[ $read_rc -ne 0 ]] || read_ids=("${_MOLE_DELETION_IDENTITIES[@]}")
+    for ((index = 0; index < ${#entries[@]}; index++)); do
+        entry="${entries[index]}"
+        if [[ ${#read_ids[@]} -gt 0 ]]; then
+            identity="${read_ids[index]}"
+        else
+            identity_rc=0
+            identity=$(mole_deletion_identity "$entry") || identity_rc=$?
+            mole_rc_signal "$identity_rc" && return "$identity_rc"
+            if [[ $identity_rc -ne 0 ]]; then
+                # Gone since the listing (a build cleaned it): nothing to take.
+                [[ -e "$entry" || -L "$entry" ]] || continue
+                failed=$((failed + 1))
+                continue
+            fi
+        fi
+        parent_name="${entry%/*}"
+        parent_name="${parent_name##*/}"
+        if [[ "${entry##*/}" != "incremental" || " ${PURGE_RUST_TRIM_AGED_DIRS[*]} " == *" $parent_name "* ]]; then
+            # An old entry that was modified since it was listed stays.
+            [[ $((now - ${identity##*:})) -gt $age_limit ]] || continue
+        fi
+        if [[ -L "$entry" ]]; then
+            guard_rc=0
+            _mole_purge_trim_final_guard "$entry" || guard_rc=$?
+            mole_rc_timeout_or_signal "$guard_rc" && return "$guard_rc"
+            if [[ $guard_rc -ne 0 ]]; then
+                log_operation "${MOLE_CURRENT_COMMAND:-purge}" "SKIPPED" "$entry" "sink guard denied"
+                failed=$((failed + 1))
+                continue
+            fi
+        fi
+        kept+=("$entry")
+        kept_ids+=("$identity")
+    done
+    [[ ${#kept[@]} -gt 0 ]] || return 0
+
+    local rc=0
+    _purge_trim_size_entries "${kept[@]}" || rc=$?
+    [[ $rc -eq 0 ]] || return "$rc"
+    local _MOLE_DELETE_BATCH_ID=""
+    mole_delete_batch_begin "${kept[@]}" || rc=$?
+    [[ $rc -eq 0 ]] || return "$rc"
+    local entry_kb
+    for ((index = 0; index < ${#kept[@]}; index++)); do
+        entry="${kept[index]}"
+        entry_kb="${_PURGE_TRIM_SIZES[index]}"
+        # A link frees no space of its own.
+        [[ ! -L "$entry" ]] || entry_kb=0
+        # mole_delete can refuse before safe_remove clears the reason, so a
+        # cause left by an earlier item must not be read as this one's.
+        _MOLE_SAFE_REMOVE_SKIP_REASON=""
+        entry_rc=0
+        mole_delete "$entry" false "${kept_ids[index]}" "" "" "$entry_kb" || entry_rc=$?
+        mole_rc_timeout_or_signal "$entry_rc" && return "$entry_rc"
+        _purge_trim_count_entry "$entry" "$entry_rc" "$entry_kb" "${_MOLE_SAFE_REMOVE_SKIP_REASON:-}"
+    done
+    return 0
+}
+
 # Trim one Rust `target` row that _purge_selected_item_guard passed: list its
 # trim set afresh (purge_rust_trim_list, never a list from the review) and
 # remove each entry through mole_delete, bound to the identity read just
-# before, so --trash, dry runs and both logs behave as for any other item. An
+# before, so --trash, dry runs and both logs behave as for any other item,
+# PURGE_RUST_TRIM_BATCH_MAX entries at a time (_purge_trim_remove_batch). An
 # old entry modified since it was listed is kept. A symlinked `incremental`
 # goes through mole_delete's link sink, which has no final hook, so the trim
-# final guard is asked here first. Reads the loop locals of
+# final guard is asked first. Reads the loop locals of
 # _purge_remove_selected_items through dynamic scope. Sets
 # _PURGE_TRIM_REMOVED_COUNT and _PURGE_TRIM_REMOVED_KB to the entries actually
 # removed and their size measured just before (_PURGE_TRIM_SIZE_PARTIAL when
@@ -4075,70 +4238,17 @@ _purge_trim_selected_item() {
         return 1
     fi
 
-    local now entry identity identity_rc entry_rc parent_name failed=0 skip_reason="" stop_rc=0
-    local entry_kb size_rc guard_rc
+    local now entry failed=0 skip_reason="" stop_rc=0
     local age_limit=$((PURGE_RUST_TRIM_AGE_DAYS * 86400))
+    local -a batch=()
     now=$(get_epoch_seconds)
-    while IFS= read -r -d '' entry <&3; do
-        identity_rc=0
-        identity=$(mole_deletion_identity "$entry") || identity_rc=$?
-        if mole_rc_signal "$identity_rc"; then
-            stop_rc=$identity_rc
-            break
-        fi
-        if [[ $identity_rc -ne 0 ]]; then
-            # Gone since the listing (a build cleaned it): nothing to take.
-            [[ -e "$entry" || -L "$entry" ]] || continue
-            failed=$((failed + 1))
-            continue
-        fi
-        parent_name="${entry%/*}"
-        parent_name="${parent_name##*/}"
-        if [[ "${entry##*/}" != "incremental" || " ${PURGE_RUST_TRIM_AGED_DIRS[*]} " == *" $parent_name "* ]]; then
-            # An old entry that was modified since it was listed stays.
-            [[ $((now - ${identity##*:})) -gt $age_limit ]] || continue
-        fi
-        if [[ -L "$entry" ]]; then
-            entry_kb=0
-            guard_rc=0
-            _mole_purge_trim_final_guard "$entry" || guard_rc=$?
-            if mole_rc_timeout_or_signal "$guard_rc"; then
-                stop_rc=$guard_rc
-                break
-            fi
-            if [[ $guard_rc -ne 0 ]]; then
-                log_operation "${MOLE_CURRENT_COMMAND:-purge}" "SKIPPED" "$entry" "sink guard denied"
-                failed=$((failed + 1))
-                continue
-            fi
-        else
-            size_rc=0
-            entry_kb=$(get_path_size_kb "$entry" 2> /dev/null) || size_rc=$?
-            if mole_rc_signal "$size_rc"; then
-                stop_rc=$size_rc
-                break
-            fi
-            if [[ $size_rc -ne 0 || ! "$entry_kb" =~ ^[0-9]+$ ]]; then
-                entry_kb=0
-                _PURGE_TRIM_SIZE_PARTIAL=true
-            fi
-        fi
-        # mole_delete can refuse before safe_remove clears the reason, so a
-        # cause left by an earlier item must not be read as this one's.
-        _MOLE_SAFE_REMOVE_SKIP_REASON=""
-        entry_rc=0
-        mole_delete "$entry" false "$identity" || entry_rc=$?
-        if mole_rc_timeout_or_signal "$entry_rc"; then
-            stop_rc=$entry_rc
-            break
-        fi
-        if [[ $entry_rc -ne 0 ]] || [[ "${MOLE_DRY_RUN:-0}" != "1" && (-e "$entry" || -L "$entry") ]]; then
-            failed=$((failed + 1))
-            [[ -z "${_MOLE_SAFE_REMOVE_SKIP_REASON:-}" ]] || skip_reason="$_MOLE_SAFE_REMOVE_SKIP_REASON"
-            continue
-        fi
-        _PURGE_TRIM_REMOVED_COUNT=$((_PURGE_TRIM_REMOVED_COUNT + 1))
-        _PURGE_TRIM_REMOVED_KB=$((_PURGE_TRIM_REMOVED_KB + entry_kb))
+    while [[ $stop_rc -eq 0 ]]; do
+        batch=()
+        while [[ ${#batch[@]} -lt $PURGE_RUST_TRIM_BATCH_MAX ]] && IFS= read -r -d '' entry <&3; do
+            batch+=("$entry")
+        done
+        [[ ${#batch[@]} -gt 0 ]] || break
+        _purge_trim_remove_batch "${batch[@]}" || stop_rc=$?
     done 3< "$list"
     rm -f "$list" # SAFE: this function's own registered temp file
     [[ $stop_rc -eq 0 ]] || return "$stop_rc"

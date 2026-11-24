@@ -153,10 +153,17 @@ by mtime, with profiles found without following a symlink. The plan keeps the
 folder's identities, not the entries. Applying a trim passes the same scan
 root, identity, containment and in-use rechecks as the whole folder, lists the
 entries again from the disk, and hands each to `mole_delete` bound to the
-identity read just before (an old entry modified since is kept), with
-`_mole_purge_trim_final_guard` rebinding the folder and requiring the entry to
-sit where the trim rule puts one (asked directly for a symlinked `incremental`,
-whose link sink has no final hook). The reviewed-plan gate approves only the
+identity read just before (an old entry modified since is kept), in batches of
+at most 32 (`mole_delete_batch_begin`). Within a batch only folder work is
+shared: one stat reads the entries' identities, each parent folder is resolved
+once, and the folder rebind of `_mole_purge_trim_final_guard` and the plan
+gate's read of a kept root each run once. That cannot let a replaced folder
+through, because every entry is bound to the identity read before the batch
+began and rebound to its parent, inode and mtime just before its own removal
+(so an entry rewritten in place mid-batch is kept), and
+the guard still requires each entry to sit where the trim rule puts one, on
+the physical parent the batch bound it to (asked directly for a symlinked
+`incremental`, whose link sink has no final hook). The reviewed-plan gate approves only the
 `incremental`, `deps`, `build` and `.fingerprint` folders of a kept trim, so no
 sink can take the `target` folder or a binary beside them; when those cannot be
 listed in time, the trim is refused as `could not list trim` before any sink. A trim kept with

@@ -490,6 +490,7 @@ EOF
     oplog | grep -F "SKIPPED $HOME/www/rs/target (trim incomplete)" > /dev/null
 }
 
+# shellcheck disable=SC2030 # Bats runs each test in its own subshell.
 @test "purge --apply names a trim whose scope could not be listed while staging" {
     make_rust rs
     make_plan || return 1
@@ -523,4 +524,248 @@ EOF
     [[ "$output" == *"kept=~/www/rs/target (could not list trim)"* ]] || return 1
     [ -d "$HOME/www/rs/target/debug/incremental" ] || return 1
     oplog | grep -F "SKIPPED $HOME/www/rs/target (could not list trim)" > /dev/null
+}
+
+# A Rust project ~/www/$1 whose debug profile holds $2 old deps entries.
+make_rust_deps() {
+    local t="$HOME/www/$1/target" i
+    put 10 "$HOME/www/$1/Cargo.toml" "$OLD_STAMP"
+    put 100 "$t/.rustc_info.json" "$OLD_STAMP"
+    mkdir -p "$t/debug/deps"
+    for ((i = 0; i < $2; i++)); do
+        head -c 2048 /dev/zero > "$t/debug/deps/lib$i.rlib"
+    done
+    touch -t "$OLD_STAMP" "$t/debug/deps/"*
+}
+
+# Apply the reviewed trim of PLAN_ID ($HOME/select.txt, from make_plan) in a
+# shell with Mole's purge libraries, after running the bash given on stdin
+# (stubs and hooks), then print the trim's outcome.
+apply_trim_in_shell() {
+    local hooks
+    hooks=$(cat)
+    purge_lib_shell PLAN_ID="$PLAN_ID" HOOKS="$hooks" << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+source "$PROJECT_ROOT/lib/clean/plan.sh"
+source "$PROJECT_ROOT/lib/clean/purge_plan.sh"
+CLEAN_PLAN_COMMAND=purge
+eval "$HOOKS"
+mkdir -p "$HOME/.cache/mole"
+clean_plan_load_selection "$PLAN_ID" "$HOME/select.txt"
+PURGE_APPLY_PLAN_ID="$PLAN_ID"
+purge_plan_apply
+echo "outcome=${PURGE_RUN_OUTCOME:-done} removed=$_PURGE_TRIM_REMOVED_COUNT"
+EOF
+    # shellcheck disable=SC2031 # status and output come from purge_lib_shell in this same test.
+    printf 'trim apply -> status %s\n%s\n' "$status" "$output"
+}
+
+@test "purge trim rebinds its target once per batch and sizes each entry once" {
+    make_rust_deps rs 40
+    make_plan || return 1
+    plan_item_id "$HOME/www/rs/target" trim > "$HOME/select.txt" || return 1
+    # Every du the trim runs names its operands here.
+    mkdir -p "$HOME/bin"
+    printf '#!/bin/bash\nprintf "%%s\\n" "$@" >> "%s"\nexec /usr/bin/du "$@"\n' "$HOME/du-args" > "$HOME/bin/du"
+    chmod +x "$HOME/bin/du"
+
+    # Counted in files: several of these run in command substitutions.
+    apply_trim_in_shell << 'HOOKS'
+PATH="$HOME/bin:$PATH"
+deps="$HOME/www/rs/target/debug/deps"
+eval "$(declare -f _mole_purge_final_artifact_unchanged | sed '1s/^_mole_purge_final_artifact_unchanged /_real_unchanged /')"
+_mole_purge_final_artifact_unchanged() {
+    echo x >> "$HOME/folder-rebinds"
+    _real_unchanged "$@"
+}
+eval "$(declare -f get_path_size_kb | sed '1s/^get_path_size_kb /_real_size_kb /')"
+get_path_size_kb() {
+    printf '%s\n' "$1" >> "$HOME/size-args"
+    _real_size_kb "$@"
+}
+eval "$(declare -f mole_deletion_identity | sed '1s/^mole_deletion_identity /_real_identity /')"
+mole_deletion_identity() {
+    [[ "$1" != "$deps" ]] || echo x >> "$HOME/root-reads"
+    _real_identity "$@"
+}
+HOOKS
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"outcome=completed removed=40"* ]] || return 1
+    [ -z "$(ls "$HOME/www/rs/target/debug/deps")" ] || return 1
+    [ "$(oplog | grep -c "REMOVED $HOME/www/rs/target/debug/deps/lib")" -eq 40 ] || return 1
+    # Batches of at most 32: the target folder and the plan's deps root are
+    # each read exactly once a batch, not once an entry and not skipped.
+    local batches=$(((40 + 31) / 32))
+    [ "$(wc -l < "$HOME/folder-rebinds")" -eq "$batches" ] || return 1
+    [ "$(cat "$HOME/root-reads" 2> /dev/null | wc -l)" -eq "$batches" ] || return 1
+    # Each entry is measured exactly once, by du or by get_path_size_kb.
+    local i sized
+    for ((i = 0; i < 40; i++)); do
+        sized=$(cat "$HOME/du-args" "$HOME/size-args" 2> /dev/null |
+            grep -cxF "$HOME/www/rs/target/debug/deps/lib$i.rlib" || true)
+        [ "$sized" -eq 1 ] || {
+            echo "lib$i.rlib sized $sized times"
+            return 1
+        }
+    done
+}
+
+@test "purge trim refuses the rest of a batch once its target is swapped for a copy" {
+    make_rust_deps rs 40
+    make_plan || return 1
+    plan_item_id "$HOME/www/rs/target" trim > "$HOME/select.txt" || return 1
+
+    # After the fifth removal the target is replaced by a copy: same names,
+    # same old dates, other inodes.
+    apply_trim_in_shell << 'HOOKS'
+eval "$(declare -f log_operation | sed '1s/^log_operation /_real_log_operation /')"
+log_operation() {
+    _real_log_operation "$@"
+    if [[ "$2" == REMOVED ]]; then
+        REMOVED_ROWS=$((${REMOVED_ROWS:-0} + 1))
+        if [[ $REMOVED_ROWS -eq 5 ]]; then
+            mv "$HOME/www/rs/target" "$HOME/www/rs/target.reviewed"
+            cp -Rp "$HOME/www/rs/target.reviewed" "$HOME/www/rs/target"
+        fi
+    fi
+    return 0
+}
+HOOKS
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"outcome=incomplete removed=5"* ]] || return 1
+    [[ "$output" == *"Skipped 35 "*" of ~/www/rs/target (trim) (changed since review;"* ]] || return 1
+    [ "$(find "$HOME/www/rs/target/debug/deps" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" -eq 35 ] || return 1
+    [ "$(find "$HOME/www/rs/target.reviewed/debug/deps" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" -eq 35 ] || return 1
+    [ "$(oplog | grep -c "REMOVED $HOME/www/rs/target")" -eq 5 ]
+}
+
+@test "purge trim refuses an entry swapped for a symlink after its identity was read" {
+    make_rust_deps rs 40
+    make_plan || return 1
+    plan_item_id "$HOME/www/rs/target" trim > "$HOME/select.txt" || return 1
+    put 4096 "$HOME/outside/keep.rlib" "$OLD_STAMP"
+
+    # Validation runs after the trim read the entry's identity.
+    apply_trim_in_shell << 'HOOKS'
+victim="$HOME/www/rs/target/debug/deps/lib7.rlib"
+eval "$(declare -f validate_path_for_deletion | sed '1s/^validate_path_for_deletion /_real_validate /')"
+validate_path_for_deletion() {
+    if [[ "$1" == "$victim" && ! -L "$victim" && -z "${SWAPPED:-}" ]]; then
+        SWAPPED=1
+        rm -f "$victim"
+        ln -s "$HOME/outside/keep.rlib" "$victim"
+    fi
+    _real_validate "$@"
+}
+HOOKS
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"outcome=incomplete removed=39"* ]] || return 1
+    [ -L "$HOME/www/rs/target/debug/deps/lib7.rlib" ] || return 1
+    [ -f "$HOME/outside/keep.rlib" ] || return 1
+    [ "$(find "$HOME/www/rs/target/debug/deps" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" -eq 1 ]
+}
+
+@test "purge --apply --trash trashes every entry of a large trim with one row each" {
+    make_rust_deps rs 40
+    make_plan || return 1
+    plan_item_id "$HOME/www/rs/target" trim > "$HOME/select.txt" || return 1
+
+    run_purge --apply "$PLAN_ID" --select "$HOME/select.txt" --trash
+    [ "$status" -eq 0 ] || return 1
+    [ -z "$(ls "$HOME/www/rs/target/debug/deps")" ] || return 1
+    [ "$(find "$HOME/test-trash" -maxdepth 1 -name 'lib*.rlib*' | wc -l)" -eq 40 ] || return 1
+    [ "$(oplog | grep -c "TRASHED $HOME/www/rs/target/debug/deps/lib")" -eq 40 ] || return 1
+    if oplog | grep -F "REMOVED $HOME/www/rs/target/" > /dev/null; then
+        return 1
+    fi
+    [ "$(grep -c "	trash	[0-9]*	ok	$HOME/www/rs/target/debug/deps/lib" "$HOME/Library/Logs/mole/deletions.log")" -eq 40 ]
+}
+
+@test "purge trim stops at a signal from its sink and counts only what went" {
+    make_rust_deps rs 40
+    purge_lib_shell T="$HOME/www/rs/target" << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+item_path="$T"
+display_item_path="~/www/rs/target (trim)"
+# The third entry's removal is interrupted. The sink runs rm in a command
+# substitution, so the count lives in a file.
+rm() {
+    if [[ "${!#}" == */debug/deps/* ]]; then
+        echo x >> "$HOME/rm-calls"
+        [[ $(wc -l < "$HOME/rm-calls") -ne 3 ]] || return 130
+    fi
+    command rm "$@"
+}
+_purge_trim_selected_item || echo "rc=$?"
+echo "removed=$_PURGE_TRIM_REMOVED_COUNT"
+EOF
+    [[ "$output" == *"rc=130"* ]] || return 1
+    [[ "$output" == *"removed=2"* ]] || return 1
+    [ "$(find "$HOME/www/rs/target/debug/deps" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" -eq 38 ]
+}
+
+@test "purge trim dry run removes nothing and logs each entry as a preview" {
+    make_rust_deps rs 40
+    purge_lib_shell T="$HOME/www/rs/target" MOLE_DRY_RUN=1 << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+item_path="$T"
+display_item_path="~/www/rs/target (trim)"
+_purge_trim_selected_item || echo "rc=$?"
+echo "removed=$_PURGE_TRIM_REMOVED_COUNT"
+EOF
+    [[ "$output" != *"rc="* ]] || return 1
+    [[ "$output" == *"removed=40"* ]] || return 1
+    [ "$(find "$HOME/www/rs/target/debug/deps" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" -eq 40 ] || return 1
+    [ "$(grep -c "	dry-run	$HOME/www/rs/target/debug/deps/lib" "$HOME/Library/Logs/mole/deletions.log")" -eq 40 ]
+}
+
+@test "purge trim keeps an entry rewritten in place after its batch began" {
+    make_rust_deps rs 40
+    make_plan || return 1
+    plan_item_id "$HOME/www/rs/target" trim > "$HOME/select.txt" || return 1
+
+    # After the fifth removal a build rewrites every entry left in place:
+    # same inodes, new mtimes.
+    apply_trim_in_shell << 'HOOKS'
+eval "$(declare -f log_operation | sed '1s/^log_operation /_real_log_operation /')"
+log_operation() {
+    _real_log_operation "$@"
+    if [[ "$2" == REMOVED ]]; then
+        REMOVED_ROWS=$((${REMOVED_ROWS:-0} + 1))
+        [[ $REMOVED_ROWS -ne 5 ]] || touch "$HOME/www/rs/target/debug/deps/"*
+    fi
+    return 0
+}
+HOOKS
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"outcome=incomplete removed=5"* ]] || return 1
+    [ "$(find "$HOME/www/rs/target/debug/deps" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" -eq 35 ] || return 1
+    [ "$(grep -c "	identity-changed	$HOME/www/rs/target/debug/deps/lib" "$HOME/Library/Logs/mole/deletions.log")" -eq 27 ]
+}
+
+@test "purge trim dry run leaves out an entry the run would refuse as another user's" {
+    make_rust_deps rs 40
+    purge_lib_shell T="$HOME/www/rs/target" MOLE_DRY_RUN=1 << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+item_path="$T"
+display_item_path="~/www/rs/target (trim)"
+# As if a sudo build left this one root-owned.
+_mole_user_sink_refuses_on_ownership() { [[ "$1" == */lib7.rlib ]]; }
+_purge_trim_selected_item || echo "rc=$?"
+echo "removed=$_PURGE_TRIM_REMOVED_COUNT"
+EOF
+    [[ "$output" == *"removed=39"* ]] || return 1
+    [ "$(find "$HOME/www/rs/target/debug/deps" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" -eq 40 ] || return 1
+    if grep -q "	dry-run	$HOME/www/rs/target/debug/deps/lib7.rlib$" "$HOME/Library/Logs/mole/deletions.log"; then
+        return 1
+    fi
+    oplog | grep -F "SKIPPED $HOME/www/rs/target/debug/deps/lib7.rlib (owned by another user)" > /dev/null
 }
