@@ -1,0 +1,487 @@
+{
+  "schema": 1,
+  "command": "clean",
+  "plan_id": "sample-plan",
+  "created_at": "2026-11-24T07:00:00Z",
+  "expires_at": "2026-11-24T08:00:00Z",
+  "free_bytes": 120000000000,
+  "total_bytes": 7506520832,
+  "total_items": 118,
+  "sections": [
+    {
+      "id": "s0",
+      "name": "User caches",
+      "bytes": 1251087488,
+      "items": [
+        {
+          "id": "i1",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example0/item0",
+          "bytes": 4096,
+          "size_known": true,
+          "count": 1,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i2",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example0/item1",
+          "bytes": 32768,
+          "size_known": true,
+          "count": 2,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i3",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example0/item2",
+          "bytes": 1048576,
+          "size_known": true,
+          "count": 3,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i4",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example0/item3",
+          "bytes": 50000000,
+          "size_known": true,
+          "count": 4,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i5",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example0/item4",
+          "bytes": 1200000000,
+          "size_known": true,
+          "count": 5,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i6",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example0/item4/child",
+          "bytes": 8192,
+          "size_known": true,
+          "count": 6,
+          "covered_by": "i5",
+          "default_selected": true
+        },
+        {
+          "id": "i7",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example0/item6",
+          "bytes": 2048,
+          "size_known": true,
+          "count": 7,
+          "covered_by": null,
+          "default_selected": false
+        }
+      ]
+    },
+    {
+      "id": "s1",
+      "name": "Logs",
+      "bytes": 1251087488,
+      "items": [
+        {
+          "id": "i8",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example1/item0",
+          "bytes": 4096,
+          "size_known": true,
+          "count": 1,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i9",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example1/item1",
+          "bytes": 32768,
+          "size_known": true,
+          "count": 2,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i10",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example1/item2",
+          "bytes": 1048576,
+          "size_known": true,
+          "count": 3,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i11",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example1/item3",
+          "bytes": 50000000,
+          "size_known": true,
+          "count": 4,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i12",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example1/item4",
+          "bytes": 1200000000,
+          "size_known": true,
+          "count": 5,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i13",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example1/item4/child",
+          "bytes": 8192,
+          "size_known": true,
+          "count": 6,
+          "covered_by": "i12",
+          "default_selected": true
+        },
+        {
+          "id": "i14",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example1/item6",
+          "bytes": 2048,
+          "size_known": true,
+          "count": 7,
+          "covered_by": null,
+          "default_selected": true
+        }
+      ]
+    },
+    {
+      "id": "s2",
+      "name": "Developer caches",
+      "bytes": 1251087488,
+      "items": [
+        {
+          "id": "i15",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example2/item0",
+          "bytes": 4096,
+          "size_known": true,
+          "count": 1,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i16",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example2/item1",
+          "bytes": 32768,
+          "size_known": true,
+          "count": 2,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i17",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example2/item2",
+          "bytes": 1048576,
+          "size_known": true,
+          "count": 3,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i18",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example2/item3",
+          "bytes": 50000000,
+          "size_known": true,
+          "count": 4,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i19",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example2/item4",
+          "bytes": 1200000000,
+          "size_known": true,
+          "count": 5,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i20",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example2/item4/child",
+          "bytes": 8192,
+          "size_known": true,
+          "count": 6,
+          "covered_by": "i19",
+          "default_selected": true
+        },
+        {
+          "id": "i21",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example2/item6",
+          "bytes": 2048,
+          "size_known": true,
+          "count": 7,
+          "covered_by": null,
+          "default_selected": true
+        }
+      ]
+    },
+    {
+      "id": "s3",
+      "name": "Browsers",
+      "bytes": 1251087488,
+      "items": [
+        {
+          "id": "i22",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example3/item0",
+          "bytes": 4096,
+          "size_known": true,
+          "count": 1,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i23",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example3/item1",
+          "bytes": 32768,
+          "size_known": true,
+          "count": 2,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i24",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example3/item2",
+          "bytes": 1048576,
+          "size_known": true,
+          "count": 3,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i25",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example3/item3",
+          "bytes": 50000000,
+          "size_known": true,
+          "count": 4,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i26",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example3/item4",
+          "bytes": 1200000000,
+          "size_known": true,
+          "count": 5,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i27",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example3/item4/child",
+          "bytes": 8192,
+          "size_known": true,
+          "count": 6,
+          "covered_by": "i26",
+          "default_selected": true
+        },
+        {
+          "id": "i28",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example3/item6",
+          "bytes": 2048,
+          "size_known": true,
+          "count": 7,
+          "covered_by": null,
+          "default_selected": true
+        }
+      ]
+    },
+    {
+      "id": "s4",
+      "name": "Downloads",
+      "bytes": 1251087488,
+      "items": [
+        {
+          "id": "i29",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example4/item0",
+          "bytes": 4096,
+          "size_known": true,
+          "count": 1,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i30",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example4/item1",
+          "bytes": 32768,
+          "size_known": true,
+          "count": 2,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i31",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example4/item2",
+          "bytes": 1048576,
+          "size_known": true,
+          "count": 3,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i32",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example4/item3",
+          "bytes": 50000000,
+          "size_known": true,
+          "count": 4,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i33",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example4/item4",
+          "bytes": 1200000000,
+          "size_known": true,
+          "count": 5,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i34",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example4/item4/child",
+          "bytes": 8192,
+          "size_known": true,
+          "count": 6,
+          "covered_by": "i33",
+          "default_selected": true
+        },
+        {
+          "id": "i35",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example4/item6",
+          "bytes": 2048,
+          "size_known": true,
+          "count": 7,
+          "covered_by": null,
+          "default_selected": true
+        }
+      ]
+    },
+    {
+      "id": "s5",
+      "name": "Maintenance",
+      "bytes": 1251085440,
+      "items": [
+        {
+          "id": "i36",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example5/item0",
+          "bytes": 4096,
+          "size_known": true,
+          "count": 1,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i37",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example5/item1",
+          "bytes": 32768,
+          "size_known": true,
+          "count": 2,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i38",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example5/item2",
+          "bytes": 1048576,
+          "size_known": true,
+          "count": 3,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i39",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example5/item3",
+          "bytes": 50000000,
+          "size_known": true,
+          "count": 4,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i40",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example5/item4",
+          "bytes": 1200000000,
+          "size_known": true,
+          "count": 5,
+          "covered_by": null,
+          "default_selected": true
+        },
+        {
+          "id": "i41",
+          "kind": "path",
+          "path": "/Users/sample/Library/Caches/Example5/item4/child",
+          "bytes": 8192,
+          "size_known": true,
+          "count": 6,
+          "covered_by": "i40",
+          "default_selected": true
+        },
+        {
+          "id": "i42",
+          "kind": "command",
+          "name": "Example cache",
+          "command": "example cache clean",
+          "bytes": 0,
+          "size_known": false,
+          "count": 1,
+          "covered_by": null,
+          "default_selected": true
+        }
+      ]
+    }
+  ],
+  "skipped": [
+    {
+      "section": "System",
+      "name": "System caches",
+      "reason": "needs sudo"
+    },
+    {
+      "section": "Developer caches",
+      "name": "Active cache",
+      "reason": "in use"
+    }
+  ]
+}

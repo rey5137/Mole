@@ -499,6 +499,16 @@ The launchers auto-detect Terminal, iTerm2, Alacritty, kitty, WezTerm, Ghostty, 
 
 </details>
 
+## Mole Review (experimental GUI)
+
+`app/MoleReview/` holds a small native macOS app (SwiftUI, macOS 13+) over the plan-based CLI: scan with `mo clean --dry-run --json`, tick items, confirm, then `mo clean --apply <plan_id> --select <file> --trash`. It needs only the Command Line Tools and sends nothing over the network.
+
+```bash
+cd app/MoleReview
+swift build && swift run MoleReviewChecks   # checks use Fixtures/fake-mo.sh, never a real clean
+./build-app.sh                              # .build/Mole Review.app (ad-hoc signed)
+```
+
 ## Community
 
 Thanks to everyone who helped build Mole. Go follow them. ❤️

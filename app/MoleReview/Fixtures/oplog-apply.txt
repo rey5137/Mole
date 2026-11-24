@@ -1,0 +1,10 @@
+
+# ========== clean run=RUNID session started at 2026-11-24 14:50:00 ==========
+[2026-11-24 14:50:01] [clean run=RUNID] REMOVED /Users/sample/Library/Caches/ExampleApp (12MB)
+[2026-11-24 14:50:02] [clean run=RUNID] SKIPPED /Users/sample/Library/Caches/Changed (changed since review)
+[2026-11-24 14:50:02] [clean run=RUNID] SKIPPED /Users/sample/Library/Caches/Parent (holds unticked item)
+[2026-11-24 14:50:03] [clean run=RUNID] SKIPPED /Users/sample/Library/Caches/Other (not in reviewed plan)
+[2026-11-24 14:50:03] [clean run=RUNID] SKIPPED npm cache clean (needs permanent delete)
+[2026-11-24 14:50:03] [clean run=OTHERRUN] SKIPPED /Users/sample/Library/Caches/NotMine (not in reviewed plan)
+[2026-11-24 14:50:03] [clean-dry-run run=DRYRUN] SKIPPED /Users/sample/Library/Caches/Preview (whitelist)
+# ========== clean session ended at 2026-11-24 14:50:09, 5 items, 12MB ==========
