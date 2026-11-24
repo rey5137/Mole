@@ -242,6 +242,59 @@ SCRIPT
     fi
 }
 
+check_2092_review() {
+    local scenario="$1" fixture="$TEST_DIR/review-$1"
+    mkdir -p "$fixture"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" TARGET_DIR="$fixture" SCENARIO="$scenario" /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+helper_source=$(declare -f safe_sudo_find_delete)
+# shellcheck disable=SC2016 # Match the literal production guard.
+test_guard='[[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]]'
+helper_source=${helper_source/"$test_guard"/false}
+eval "$helper_source"
+_mole_privileged_path_has_mutable_ancestor() { [[ "$SCENARIO" == mutable ]]; }
+get_path_size_kb() { [[ "$3" == readable ]]; printf '4\n'; }
+safe_remove() { /bin/rm -f -- "$1"; }
+oplog_enabled() { return 0; }
+get_timestamp() { printf now; }
+append_log_lines() { shift; printf '%s\n' "$@" >> "$TARGET_DIR/log"; }
+log_operation() { printf '%s\n' "$*" >> "$TARGET_DIR/log"; }
+sudo() {
+    [[ "${1:-}" == -n ]] && shift
+    printf '%s\n' "${1:-}" >> "$TARGET_DIR/calls"
+    case "${1:-}" in
+        true) return 0 ;;
+        test) shift; command test "$@" ;;
+        find) printf '%s\0%s\0' "$TARGET_DIR/a.log" "$TARGET_DIR/b.log" ;;
+        du) printf '4\t%s\n' "${@: -1}" ;;
+        */stat) "$@" ;;
+        xargs)
+            local record rest path
+            while IFS= read -r -d '' record; do
+                rest="${record#*:}"; rest="${rest#*:}"; rest="${rest#*:}"
+                path="${rest#*:}"
+                /bin/rm -f -- "$path"
+                [[ "$SCENARIO" != recreated ]] || touch "$path"
+                printf '%s\0' "$rest"
+            done ;;
+        *) "$@" ;;
+    esac
+}
+dd if=/dev/zero of="$TARGET_DIR/a.log" bs=4096 count=1 2>/dev/null
+dd if=/dev/zero of="$TARGET_DIR/b.log" bs=4096 count=1 2>/dev/null
+blocks_a=$(/usr/bin/stat -f%b "$TARGET_DIR/a.log")
+blocks_b=$(/usr/bin/stat -f%b "$TARGET_DIR/b.log")
+printf 'EXPECTED:%s\n' "$(( (blocks_a + 1) / 2 + (blocks_b + 1) / 2 ))"
+rc=0
+safe_sudo_find_delete "$TARGET_DIR" '*.log' 0 f 1 || rc=$?
+printf 'RESULT:%s:%s:%s\n' "$rc" "$MOLE_SAFE_SUDO_FIND_DELETE_COUNT" "$MOLE_SAFE_SUDO_FIND_DELETE_KB"
+printf 'DU:%s\n' "$(grep -c '^du$' "$TARGET_DIR/calls" || :)"
+if [[ -f "$TARGET_DIR/log" ]]; then cat "$TARGET_DIR/log"; fi
+SCRIPT
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
 @test "validate_path_for_deletion rejects empty path" {
     run /bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; validate_path_for_deletion ''"
     [ "$status" -eq 1 ]
@@ -4335,58 +4388,6 @@ EOF
     [[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
 }
 
-check_2092_review() {
-    local scenario="$1" fixture="$TEST_DIR/review-$1"
-    mkdir -p "$fixture"
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" TARGET_DIR="$fixture" SCENARIO="$scenario" /bin/bash --noprofile --norc <<'SCRIPT'
-set -euo pipefail
-source "$PROJECT_ROOT/lib/core/common.sh"
-helper_source=$(declare -f safe_sudo_find_delete)
-# shellcheck disable=SC2016 # Match the literal production guard.
-test_guard='[[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]]'
-helper_source=${helper_source/"$test_guard"/false}
-eval "$helper_source"
-_mole_privileged_path_has_mutable_ancestor() { [[ "$SCENARIO" == mutable ]]; }
-get_path_size_kb() { [[ "$3" == readable ]]; printf '4\n'; }
-safe_remove() { /bin/rm -f -- "$1"; }
-oplog_enabled() { return 0; }
-get_timestamp() { printf now; }
-append_log_lines() { shift; printf '%s\n' "$@" >> "$TARGET_DIR/log"; }
-log_operation() { printf '%s\n' "$*" >> "$TARGET_DIR/log"; }
-sudo() {
-    [[ "${1:-}" == -n ]] && shift
-    printf '%s\n' "${1:-}" >> "$TARGET_DIR/calls"
-    case "${1:-}" in
-        true) return 0 ;;
-        test) shift; command test "$@" ;;
-        find) printf '%s\0%s\0' "$TARGET_DIR/a.log" "$TARGET_DIR/b.log" ;;
-        du) printf '4\t%s\n' "${@: -1}" ;;
-        */stat) "$@" ;;
-        xargs)
-            local record rest path
-            while IFS= read -r -d '' record; do
-                rest="${record#*:}"; rest="${rest#*:}"; rest="${rest#*:}"
-                path="${rest#*:}"
-                /bin/rm -f -- "$path"
-                [[ "$SCENARIO" != recreated ]] || touch "$path"
-                printf '%s\0' "$rest"
-            done ;;
-        *) "$@" ;;
-    esac
-}
-dd if=/dev/zero of="$TARGET_DIR/a.log" bs=4096 count=1 2>/dev/null
-dd if=/dev/zero of="$TARGET_DIR/b.log" bs=4096 count=1 2>/dev/null
-blocks_a=$(/usr/bin/stat -f%b "$TARGET_DIR/a.log")
-blocks_b=$(/usr/bin/stat -f%b "$TARGET_DIR/b.log")
-printf 'EXPECTED:%s\n' "$(( (blocks_a + 1) / 2 + (blocks_b + 1) / 2 ))"
-rc=0
-safe_sudo_find_delete "$TARGET_DIR" '*.log' 0 f 1 || rc=$?
-printf 'RESULT:%s:%s:%s\n' "$rc" "$MOLE_SAFE_SUDO_FIND_DELETE_COUNT" "$MOLE_SAFE_SUDO_FIND_DELETE_KB"
-printf 'DU:%s\n' "$(grep -c '^du$' "$TARGET_DIR/calls" || :)"
-if [[ -f "$TARGET_DIR/log" ]]; then cat "$TARGET_DIR/log"; fi
-SCRIPT
-    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
-}
 
 @test "#2092 review: mutable ancestors are sized without sudo" {
     check_2092_review mutable
