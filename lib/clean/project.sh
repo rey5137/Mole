@@ -2457,19 +2457,6 @@ _purge_note_review_skip() {
 }$(mole_tilde_path "$1") ($2)"
 }
 
-# The lexical parent of $1 still resolves to the physical folder $2 with the
-# dev:inode $3 recorded at review.
-_purge_reviewed_parent_unchanged() {
-    local path="$1" expected_parent="$2" expected_parent_id="$3"
-    [[ -n "$expected_parent" && -n "$expected_parent_id" ]] || return 1
-    local lexical_parent="${path%/*}" physical_parent="" parent_id=""
-    [[ -n "$lexical_parent" ]] || lexical_parent="/"
-    physical_parent=$(cd -P "$lexical_parent" 2> /dev/null && pwd -P) || return 1
-    [[ "$physical_parent" == "$expected_parent" ]] || return 1
-    parent_id=$("$STAT_BSD" -f '%d:%i' "$physical_parent" 2> /dev/null) || return 1
-    [[ "$parent_id" == "$expected_parent_id" ]]
-}
-
 # Main cleanup function - scans and prompts user to select artifacts to clean.
 # Normal outcomes return zero; the command renders the outcome and maps incomplete
 # work to failure. Signals and deletion-phase timeouts stop the run immediately.
@@ -3710,7 +3697,7 @@ _purge_remove_selected_items() {
         # an artifact whose project was renamed or whose disk is gone was not
         # removed, and falls through to the identity refusal below.
         if [[ -n "${PURGE_APPLY_PLAN_ID:-}" && ! -e "$item_path" && ! -L "$item_path" ]] &&
-            _purge_reviewed_parent_unchanged "$item_path" "$expected_parent" "$expected_parent_id"; then
+            clean_plan_parent_unchanged "$item_path" "$expected_parent" "$expected_parent_id"; then
             echo -e "${GRAY}${ICON_SUCCESS} $display_item_path already removed${NC}"
             already_removed_count=$((already_removed_count + 1))
             continue

@@ -23,6 +23,9 @@ show_installer_help() {
     echo ""
     echo "Options:"
     echo "  --dry-run         Preview installer cleanup without making changes"
+    echo "  --json            With --dry-run, print the preview as a JSON plan"
+    echo "  --apply ID --select FILE  Remove only the item ids FILE lists, from plan ID"
+    echo "  --trash           Move removed installers to the Trash instead of deleting them"
     echo "  --debug           Show detailed operation logs"
     echo "  -h, --help        Show this help message"
 }

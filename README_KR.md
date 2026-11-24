@@ -98,6 +98,9 @@ mo clean --trash             # 정리한 파일을 휴지통으로 이동
 mo purge --dry-run --json    # 항목 id가 있는 JSON 계획으로 미리보기
 mo purge --apply <plan_id> --select kept.txt  # 남긴 항목 id만 삭제
 mo purge --trash             # 삭제할 빌드 산출물을 휴지통으로 이동
+mo installer --dry-run --json # 설치 파일을 id가 있는 JSON 계획으로 미리 보기
+mo installer --apply <plan_id> --select kept.txt  # 남긴 설치 파일 id만 삭제
+mo installer --trash         # 삭제할 설치 파일을 휴지통으로 이동
 mo optimize --whitelist      # 보호할 최적화 규칙 관리
 mo clean --whitelist         # 보호할 캐시 화이트리스트 관리
 mo purge --paths             # 프로젝트 검사 디렉터리 구성

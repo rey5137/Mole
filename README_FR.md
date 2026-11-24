@@ -98,6 +98,9 @@ mo clean --trash             # Mettre les fichiers nettoyés à la Corbeille
 mo purge --dry-run --json    # Aperçu en plan JSON avec identifiants
 mo purge --apply <plan_id> --select kept.txt  # Supprimer seulement les identifiants gardés
 mo purge --trash             # Mettre les artefacts supprimés à la Corbeille
+mo installer --dry-run --json # Aperçu des installateurs en plan JSON avec identifiants
+mo installer --apply <plan_id> --select kept.txt  # Supprimer seulement les installateurs gardés
+mo installer --trash         # Mettre les installateurs supprimés à la Corbeille
 mo optimize --whitelist      # Gérer les règles d'optimisation protégées
 mo clean --whitelist         # Gérer la liste blanche des caches protégés
 mo purge --paths             # Configurer les dossiers de scan de projets

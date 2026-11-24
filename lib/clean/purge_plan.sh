@@ -126,17 +126,6 @@ purge_plan_finish_json() {
     printf '\n'
 }
 
-# The scan root a plan recorded is still one of PURGE_SEARCH_PATHS, the
-# purge paths this run loaded.
-_purge_plan_root_configured() {
-    local root="$1" search_path
-    [[ -n "$root" ]] || return 1
-    for search_path in "${PURGE_SEARCH_PATHS[@]+"${PURGE_SEARCH_PATHS[@]}"}"; do
-        [[ "$search_path" != "$root" ]] || return 0
-    done
-    return 1
-}
-
 # Apply a reviewed plan that clean_plan_load_selection accepted: build the
 # menu run's arrays from the kept records only, narrow every sink to them
 # (MOLE_APPLY_PLAN), and remove them through _purge_remove_selected_items.
@@ -179,7 +168,8 @@ purge_plan_apply() {
         at="${CLEAN_PLAN_R_AUX_AT[$idx]}"
         # The reviewed scan root must still be a configured purge path: a
         # root the user removed from purge_paths since gives no authority.
-        if ! _purge_plan_root_configured "${CLEAN_PLAN_R_AUX[$((at + 6))]}"; then
+        if ! clean_plan_list_has "${CLEAN_PLAN_R_AUX[$((at + 6))]}" \
+            "${PURGE_SEARCH_PATHS[@]+"${PURGE_SEARCH_PATHS[@]}"}"; then
             unconfigured_paths+=("$path")
             continue
         fi
@@ -213,22 +203,7 @@ purge_plan_apply() {
 
     # Every sink also asks the plan: only a kept folder whose dev:inode is
     # still the reviewed one may go, and never an unticked one.
-    local approved
-    approved=$(create_temp_file) || return 1
-    {
-        for ((idx = 0; idx < record_count; idx++)); do
-            path=$(_clean_plan_normalize_path "${CLEAN_PLAN_R_TARGET[$idx]}")
-            if [[ "$selected" == *"$rs${CLEAN_PLAN_R_ID[$idx]}$rs"* ]]; then
-                printf 'P\0%s\0%s\0\0' "$path" "${CLEAN_PLAN_R_DEVINO[$idx]}"
-            else
-                printf 'D\0%s\0\0\0' "$path"
-            fi
-        done
-        printf 'END\0'
-    } > "$approved"
-    MOLE_APPLY_PLAN="$approved"
-    export MOLE_APPLY_PLAN
-    if ! _mole_apply_plan_load; then
+    if ! clean_plan_stage_path_selection; then
         _clean_plan_refuse "the approved items of plan $CLEAN_PLAN_ID could not be staged ($_MOLE_APPLY_PLAN_LOAD_ERROR)." \
             "Run 'mo purge --dry-run --json' to create a new plan, then apply its plan_id."
         PURGE_RUN_OUTCOME="scan_failed"

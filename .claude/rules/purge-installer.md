@@ -2,6 +2,7 @@
 paths:
   - "bin/purge.sh"
   - "bin/installer.sh"
+  - "lib/clean/installer_plan.sh"
   - "lib/clean/project.sh"
   - "lib/clean/purge_shared.sh"
   - "lib/manage/purge_paths.sh"
@@ -38,6 +39,8 @@ paths:
 
 ## Installer (`bin/installer.sh`)
 
-- `bin/installer.sh` owns installer discovery, immutable delete-plan validation, the paginated selection flow, and incomplete-cleanup exit semantics. Run `MOLE_TEST_NO_AUTH=1 bats tests/installer.bats tests/installer_fd.bats tests/installer_zip.bats`.
+- `bin/installer.sh` owns installer discovery, immutable delete-plan validation, the paginated selection flow, and incomplete-cleanup exit semantics. Run `MOLE_TEST_NO_AUTH=1 bats tests/installer.bats tests/installer_fd.bats tests/installer_zip.bats tests/installer_plan.bats`.
+
+- **A reviewed installer run removes only what the user kept** (`lib/clean/installer_plan.sh`, on the shared ledger in `lib/clean/plan.sh`). `mo installer --dry-run --json` runs `collect_installers` exactly as the text preview does, reads each file's identity through `build_installer_delete_plan` (a timeout or signal stops the plan with the error document, an unreadable identity is a `skipped` row), and prints one JSON document on stdout (everything else on stderr): one section per `get_source_display` source, one `path` item per file with clean's item fields, exact `bytes` (`installer_plan_item_bytes`, which the totals use too), `default_selected` false because the menu starts unticked, plus `type` and `name`. The `I` record keeps the exact size, the dev:inode:mtime identity, the scan folder, and the physical parent with its dev:inode. `--apply <plan_id> --select <file>` refuses a plan of another command, stages `MOLE_APPLY_PLAN` (`clean_plan_stage_path_selection`, shared with purge), refuses a kept file that no folder in `INSTALLER_SCAN_PATHS` reaches within the current `MOLE_INSTALLER_SCAN_MAX_DEPTH` (`outside installer folders`; any folder counts, not only the one recorded, because `~/Downloads/Telegram Desktop` nests inside `~/Downloads`) or whose parent or dev:inode changed (`changed since review`), then fills `INSTALLER_DELETE_*` from the plan, never from a fresh read, and calls `execute_installer_delete_plan`, so the size, identity and `mole_delete` checks are the menu run's. Under `INSTALLER_APPLY_PLAN_ID`, `record_installer_delete_failure` logs each refusal `SKIPPED` (a sink refusal named by `_MOLE_SAFE_REMOVE_SKIP_REASON`, a timed-out Trash move included, keeps the sink's own row as the only one) and prints its cause and next step; a file already gone counts as done only while its reviewed parent is unchanged, so a repeat apply exits 0. `--trash` (also with the menu run) sets `MOLE_CLEAN_TRASH`, which `safe_remove` honors for `installer` too. Locked by `tests/installer_plan.bats`.
 
 - Installer menu selection and final deletion confirmation require a successful read. EOF cancels at either boundary, never acts as Enter, even after a selection exists. Locked by `installer selection EOF never confirms the menu or deletion` and `installer final confirmation refuses EOF after a valid selection` in `tests/installer.bats`.

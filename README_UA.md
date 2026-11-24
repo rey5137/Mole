@@ -98,6 +98,9 @@ mo clean --trash             # Переміщати очищені файли в
 mo purge --dry-run --json    # Попередній перегляд як JSON-план з id
 mo purge --apply <plan_id> --select kept.txt  # Видалити лише залишені id
 mo purge --trash             # Переміщати видалені артефакти в Кошик
+mo installer --dry-run --json # Попередній перегляд інсталяторів як JSON-план з id
+mo installer --apply <plan_id> --select kept.txt  # Видалити лише залишені id інсталяторів
+mo installer --trash         # Переміщати видалені інсталятори в Кошик
 mo optimize --whitelist      # Керувати захищеними правилами оптимізації
 mo clean --whitelist         # Керувати захищеними кешами
 mo purge --paths             # Налаштувати теки для пошуку проєктів

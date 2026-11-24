@@ -98,6 +98,9 @@ mo clean --trash             # Move cleaned files to the Trash
 mo purge --dry-run --json    # Preview as a JSON plan with item ids
 mo purge --apply <plan_id> --select kept.txt  # Purge only the kept item ids
 mo purge --trash             # Move purged artifacts to the Trash
+mo installer --dry-run --json # Preview installers as a JSON plan with item ids
+mo installer --apply <plan_id> --select kept.txt  # Remove only the kept installer ids
+mo installer --trash         # Move removed installers to the Trash
 mo optimize --whitelist      # Manage protected optimization rules
 mo clean --whitelist         # Manage protected caches
 mo purge --paths             # Configure project scan directories

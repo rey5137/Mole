@@ -4,8 +4,9 @@
 # the same candidate ledger as a plan; `mo clean --apply <plan_id> --select
 # <file>` cleans only the plan items the user kept. Mole reads the saved ledger
 # back, never the JSON. The sinks in lib/core/file_ops.sh enforce the selection.
-# `mo purge` saves its plans here too (lib/clean/purge_plan.sh); each ledger
-# records the command that made it, and only that command applies it.
+# `mo purge` (lib/clean/purge_plan.sh) and `mo installer`
+# (lib/clean/installer_plan.sh) save their plans here too; each ledger records
+# the command that made it, and only that command applies it.
 
 set -euo pipefail
 
@@ -13,7 +14,7 @@ readonly CLEAN_PLAN_SCHEMA=1
 readonly CLEAN_PLAN_TTL_SEC=3600
 readonly CLEAN_PLAN_MAGIC="MOLEPLAN"
 
-# The command whose plans this run saves and applies: clean or purge.
+# The command whose plans this run saves and applies: clean, purge or installer.
 CLEAN_PLAN_COMMAND="clean"
 CLEAN_PLAN_ID=""
 # Set once `--json` has moved stdout to fd 7, cleared once a document starts.
@@ -264,8 +265,9 @@ clean_plan_save() {
 # The header is magic, schema, created, uid and command. Every record has a
 # kind and nine fields (id, section, target, devino, size_kb,
 # count, size_known, covered_by, extra). Clean writes P (path) and C (command)
-# records; purge writes A (whole artifact folder) records, which add a count
-# and that many purge fields, so a later purge kind can carry its own.
+# records; purge writes A (whole artifact folder) records and installer I
+# (installer file) records, which add a count and that many command fields,
+# so a later kind can carry its own.
 _clean_plan_read() {
     local file="$1"
     CLEAN_PLAN_R_CREATED=""
@@ -296,7 +298,7 @@ _clean_plan_read() {
         # A ledger saved before plans named their command has its first
         # record kind here; it is a clean plan.
         local first_kind=""
-        if [[ "$command" != "clean" && "$command" != "purge" ]]; then
+        if [[ "$command" != "clean" && "$command" != "purge" && "$command" != "installer" ]]; then
             first_kind="$command"
             command="clean"
         fi
@@ -312,7 +314,7 @@ _clean_plan_read() {
                 break
             fi
             case "$command:$kind" in
-                clean:P | clean:C | purge:A) ;;
+                clean:P | clean:C | purge:A | installer:I) ;;
                 *) return 1 ;;
             esac
             IFS= read -r -d '' id &&
@@ -362,13 +364,18 @@ _clean_plan_section_slug() {
 # Print the JSON document of a saved plan. Totals follow the text preview:
 # a row counted under a measured ancestor (covered_by) stays listed but adds
 # nothing, and command items carry no bytes. A record of a command's own kind
-# (purge's A) is printed by <command>_plan_render_item after its id.
+# (purge's A, installer's I) is printed by <command>_plan_render_item after
+# its id; when the command defines <command>_plan_item_bytes, that sets
+# CLEAN_PLAN_ITEM_BYTES to the record's exact size, which the totals use too.
+CLEAN_PLAN_ITEM_BYTES=0
 clean_plan_render_json() {
     local plan_file="$1"
     local plan_id="$2"
     local free_kb="${3:-}"
     _clean_plan_read "$plan_file" || return 1
     local item_renderer="${CLEAN_PLAN_R_COMMAND}_plan_render_item"
+    local bytes_reader="${CLEAN_PLAN_R_COMMAND}_plan_item_bytes"
+    declare -F "$bytes_reader" > /dev/null || bytes_reader=""
 
     local rs=$'\x1f' fs=$'\x1e'
     local -a section_names=()
@@ -392,6 +399,10 @@ clean_plan_render_json() {
         path_ids+="$rs${CLEAN_PLAN_R_TARGET[$idx]}$fs${CLEAN_PLAN_R_ID[$idx]}$rs"
         [[ -z "${CLEAN_PLAN_R_COVERED[$idx]}" ]] || continue
         bytes=$((${CLEAN_PLAN_R_SIZE[$idx]} * 1024))
+        if [[ -n "$bytes_reader" && "${CLEAN_PLAN_R_KIND[$idx]}" != "P" ]]; then
+            "$bytes_reader" "$idx" || return 1
+            bytes="$CLEAN_PLAN_ITEM_BYTES"
+        fi
         section_bytes[found]=$((section_bytes[found] + bytes))
         total_bytes=$((total_bytes + bytes))
         total_items=$((total_items + ${CLEAN_PLAN_R_COUNT[$idx]}))
@@ -560,6 +571,41 @@ _clean_plan_normalize_path() {
     printf '%s' "$path"
 }
 
+# Refuse the reviewable-flag combinations purge and installer do not support
+# ($1 --json, $2 --trash, $3 the --apply plan id, $4 the --select file); $5
+# is the verb a kept item gets and $6 says what a real run sends to the
+# Trash. Each refusal names the conflict and the command to run instead.
+clean_plan_validate_mode_flags() {
+    local json="$1" trash="$2" apply_arg="$3" select_file="$4" verb="$5" trash_subject="$6"
+    local command="$CLEAN_PLAN_COMMAND"
+    if [[ "$json" == "true" && "${MOLE_DRY_RUN:-0}" != "1" ]]; then
+        echo "mo $command --json prints a preview plan and needs --dry-run." >&2
+        echo "Run 'mo $command --dry-run --json'." >&2
+        return 1
+    fi
+    if [[ -n "$select_file" && -z "$apply_arg" ]]; then
+        echo "mo $command --select needs --apply <plan_id>; the plain $command has no selection list." >&2
+        echo "Run 'mo $command --dry-run --json', then 'mo $command --apply <plan_id> --select <file>'." >&2
+        return 1
+    fi
+    if [[ -n "$apply_arg" && -z "$select_file" ]]; then
+        echo "mo $command --apply needs --select <file> listing the item ids to $verb." >&2
+        echo "Run 'mo $command --apply $apply_arg --select <file>'." >&2
+        return 1
+    fi
+    if [[ -n "$apply_arg" && "${MOLE_DRY_RUN:-0}" == "1" ]]; then
+        echo "mo $command --apply runs a reviewed plan and cannot be combined with --dry-run." >&2
+        echo "Run 'mo $command --dry-run --json' to preview, then --apply without --dry-run." >&2
+        return 1
+    fi
+    if [[ "$trash" == "true" && "${MOLE_DRY_RUN:-0}" == "1" ]]; then
+        echo "mo $command --trash changes where $trash_subject; a dry run removes nothing." >&2
+        echo "Run 'mo $command --dry-run' to preview, then 'mo $command --trash'." >&2
+        return 1
+    fi
+    return 0
+}
+
 # Check a plan and a selection for `--apply`: a plan of this user and command,
 # not expired, and a selection that names only its item ids. Sets
 # CLEAN_PLAN_SELECTED_IDS, CLEAN_PLAN_ID and the kept and item counts, with
@@ -670,6 +716,61 @@ clean_plan_load_selection() {
     CLEAN_PLAN_ID="$plan_id"
     CLEAN_APPLY_KEPT_COUNT=$kept
     CLEAN_APPLY_ITEM_COUNT=$record_count
+}
+
+# 0 when $1 is one of the remaining arguments: a scan root a plan recorded is
+# still one this run scans (purge paths, the installer folders).
+clean_plan_list_has() {
+    local value="$1" entry
+    shift
+    [[ -n "$value" ]] || return 1
+    for entry in "$@"; do
+        [[ "$entry" != "$value" ]] || return 0
+    done
+    return 1
+}
+
+# The lexical parent of $1 still resolves to the physical folder $2 with the
+# dev:inode $3 recorded at review: a reviewed item found gone counts as
+# already removed only then (purge, installer).
+clean_plan_parent_unchanged() {
+    local path="$1" expected_parent="$2" expected_parent_id="$3"
+    [[ -n "$expected_parent" && -n "$expected_parent_id" ]] || return 1
+    local lexical_parent="${path%/*}" physical_parent="" parent_id=""
+    [[ -n "$lexical_parent" ]] || lexical_parent="/"
+    physical_parent=$(cd -P "$lexical_parent" 2> /dev/null && pwd -P) || return 1
+    [[ "$physical_parent" == "$expected_parent" ]] || return 1
+    parent_id=$("$STAT_BSD" -f '%d:%i' "$physical_parent" 2> /dev/null) || return 1
+    [[ "$parent_id" == "$expected_parent_id" ]]
+}
+
+# For a command whose plan items are each one whole path (purge, installer):
+# write every record of the loaded plan as the approved-items file the sinks
+# read (MOLE_APPLY_PLAN), P with its recorded dev:inode when the selection
+# kept it and D otherwise, and load it. 1 when it cannot be staged, with
+# _MOLE_APPLY_PLAN_LOAD_ERROR naming why.
+clean_plan_stage_path_selection() {
+    local rs=$'\x1f'
+    local selected="$CLEAN_PLAN_SELECTED_IDS" idx path approved
+    local record_count=${#CLEAN_PLAN_R_ID[@]}
+    if ! approved=$(create_temp_file); then
+        _MOLE_APPLY_PLAN_LOAD_ERROR="no temporary file for the approved items"
+        return 1
+    fi
+    {
+        for ((idx = 0; idx < record_count; idx++)); do
+            path=$(_clean_plan_normalize_path "${CLEAN_PLAN_R_TARGET[$idx]}")
+            if [[ "$selected" == *"$rs${CLEAN_PLAN_R_ID[$idx]}$rs"* ]]; then
+                printf 'P\0%s\0%s\0\0' "$path" "${CLEAN_PLAN_R_DEVINO[$idx]}"
+            else
+                printf 'D\0%s\0\0\0' "$path"
+            fi
+        done
+        printf 'END\0'
+    } > "$approved"
+    MOLE_APPLY_PLAN="$approved"
+    export MOLE_APPLY_PLAN
+    _mole_apply_plan_load
 }
 
 # Check a plan and a selection for `mo clean --apply`, then write the

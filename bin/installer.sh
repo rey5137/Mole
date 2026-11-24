@@ -25,6 +25,11 @@ source "$SCRIPT_DIR/../lib/core/common.sh"
 source "$SCRIPT_DIR/../lib/ui/menu_paginated.sh"
 
 cleanup() {
+    local exit_code="${1:-$?}"
+    # A JSON preview that stops or is cancelled still prints one document.
+    if [[ "$exit_code" != "0" && "${CLEAN_PLAN_JSON_PENDING:-false}" == "true" ]]; then
+        clean_plan_emit_json_error "$exit_code"
+    fi
     if [[ "${IN_ALT_SCREEN:-0}" == "1" ]]; then
         leave_alt_screen
         IN_ALT_SCREEN=0
@@ -33,7 +38,11 @@ cleanup() {
     cleanup_temp_files
 }
 trap cleanup EXIT
-trap 'trap - EXIT; cleanup; exit 130' INT TERM
+trap 'trap - EXIT; cleanup 130; exit 130' INT TERM
+source "$SCRIPT_DIR/../lib/core/history.sh"
+source "$SCRIPT_DIR/../lib/clean/plan.sh"
+source "$SCRIPT_DIR/../lib/clean/installer_plan.sh"
+CLEAN_PLAN_COMMAND="installer"
 
 # Scan configuration
 readonly INSTALLER_SCAN_MAX_DEPTH_DEFAULT=2
@@ -261,6 +270,16 @@ installer_display_text() {
     printf '%s' "$text"
 }
 
+# Display filename of an installer from source $2: Homebrew names often look
+# like sha256--name--version, so a leading [0-9a-f]{64}-- is stripped.
+installer_display_name() {
+    local display_name="${1##*/}"
+    if [[ "$2" == "Homebrew" && "$display_name" =~ ^[0-9a-f]{64}--(.*) ]]; then
+        display_name="${BASH_REMATCH[1]}"
+    fi
+    printf '%s\n' "$display_name"
+}
+
 # Format installer display with alignment - similar to purge command
 format_installer_display() {
     local filename="$1"
@@ -385,16 +404,8 @@ collect_installers() {
         local size_human
         size_human=$(bytes_to_human "$file_size")
 
-        # Get display filename - strip Homebrew hash prefix if present
         local display_name
-        display_name="${file##*/}"
-        if [[ "$source" == "Homebrew" ]]; then
-            # Homebrew names often look like: sha256--name--version
-            # Strip the leading hash if it matches [0-9a-f]{64}--
-            if [[ "$display_name" =~ ^[0-9a-f]{64}--(.*) ]]; then
-                display_name="${BASH_REMATCH[1]}"
-            fi
-        fi
+        display_name=$(installer_display_name "$file" "$source")
 
         # Format display with alignment
         local display
@@ -681,10 +692,16 @@ reset_installer_delete_plan() {
     INSTALLER_DELETE_IDENTITIES=()
 }
 
+# A reviewed --apply also logs the refusal and prints its next step ($3 =
+# logged when the sink already wrote its row).
 record_installer_delete_failure() {
     local file_path="$1"
     local reason="$2"
 
+    if [[ -n "${INSTALLER_APPLY_PLAN_ID:-}" ]]; then
+        [[ "$reason" != "changed since scan" ]] || reason="changed since review"
+        installer_plan_note_refusal "$file_path" "$reason" "${3:-}"
+    fi
     INSTALLER_DELETE_FAILURES+=("$file_path ($reason)")
     total_delete_failed=$((total_delete_failed + 1))
 }
@@ -772,6 +789,7 @@ execute_installer_delete_plan() {
             continue
         fi
 
+        _MOLE_SAFE_REMOVE_SKIP_REASON=""
         if mole_delete "$file_path" false "$planned_identity"; then
             if [[ "${MOLE_DRY_RUN:-0}" == "1" ]] || [[ ! -e "$file_path" && ! -L "$file_path" ]]; then
                 total_size_freed_kb=$((total_size_freed_kb + ((current_size + 1023) / 1024)))
@@ -781,7 +799,12 @@ execute_installer_delete_plan() {
             fi
         else
             local delete_rc=$?
-            record_installer_delete_failure "$file_path" "delete failed"
+            # A plan or Trash refusal names itself and has already been logged.
+            if [[ -n "${_MOLE_SAFE_REMOVE_SKIP_REASON:-}" ]]; then
+                record_installer_delete_failure "$file_path" "$_MOLE_SAFE_REMOVE_SKIP_REASON" logged
+            else
+                record_installer_delete_failure "$file_path" "delete failed"
+            fi
             if mole_rc_timeout_or_signal "$delete_rc"; then
                 return "$delete_rc"
             fi
@@ -840,7 +863,9 @@ delete_selected_installers() {
 
     # Confirm deletion
     echo ""
-    echo -ne "${PURPLE}${ICON_ARROW}${NC} Delete ${#INSTALLER_DELETE_PATHS[@]} installers, ${confirm_human}  ${GREEN}Enter${NC} confirm, ${GRAY}ESC${NC} cancel: "
+    local confirm_action="Delete ${#INSTALLER_DELETE_PATHS[@]} installers"
+    [[ "${MOLE_CLEAN_TRASH:-0}" != "1" ]] || confirm_action="Move ${#INSTALLER_DELETE_PATHS[@]} installers to the Trash"
+    echo -ne "${PURPLE}${ICON_ARROW}${NC} ${confirm_action}, ${confirm_human}  ${GREEN}Enter${NC} confirm, ${GRAY}ESC${NC} cancel: "
 
     if ! IFS= read -r -s -n1 confirm; then
         printf '\n'
@@ -874,6 +899,58 @@ delete_selected_installers() {
     return "$delete_status"
 }
 
+# Name why a scan published nothing (status $1) and what to do next.
+report_installer_scan_failure() {
+    local collect_status="$1"
+    local scan_reason="incomplete"
+    if mole_rc_timeout "$collect_status"; then
+        scan_reason="timed out"
+    elif mole_rc_timeout_or_signal "$collect_status"; then
+        scan_reason="interrupted"
+    fi
+    printf '%sInstaller scan %s%s; no files selected' "$YELLOW" "$scan_reason" "$NC" >&2
+    if [[ -n "$INSTALLER_SCAN_FAILURE_PATH" ]]; then
+        printf ' (%s)' "$(installer_display_text "$INSTALLER_SCAN_FAILURE_PATH")" >&2
+    fi
+    printf '\nCheck that the scan locations are readable and responsive, then retry mo installer.\n' >&2
+}
+
+# `mo installer --dry-run --json`: the same scan as the text preview, then a
+# saved plan printed as JSON on fd 7 instead of the menu. A scan that does not
+# finish returns nonzero, so the EXIT trap prints the error document.
+perform_installer_plan_json() {
+    local collect_status=0
+    collect_installers || collect_status=$?
+    if [[ $collect_status -ne 0 && $collect_status -ne 1 ]]; then
+        printf '\n'
+        report_installer_scan_failure "$collect_status"
+        echo -e "${GRAY}No plan was saved; re-run 'mo installer --dry-run --json' once the scan can finish.${NC}" >&2
+        return "$collect_status"
+    fi
+    local plan_status=0
+    installer_plan_collect || plan_status=$?
+    if [[ $plan_status -ne 0 ]]; then
+        echo -e "${YELLOW}${ICON_WARNING}${NC} A file check did not finish, so no plan was saved." >&2
+        echo -e "${GRAY}Re-run 'mo installer --dry-run --json' once the scan locations respond.${NC}" >&2
+        return "$plan_status"
+    fi
+    clean_plan_emit_json || return 1
+    print_summary_block "Dry run complete - no changes made" \
+        "The review plan was printed as JSON; it expires in one hour."
+    printf '\n'
+}
+
+# Apply a reviewed plan (`mo installer --apply <plan_id> --select <file>`):
+# no scan and no menu; only the kept files are rechecked and removed.
+perform_installer_apply() {
+    echo -e "${PURPLE_BOLD}Remove Installers${NC}"
+    local plan_note="Reviewed plan $CLEAN_PLAN_ID · $CLEAN_APPLY_KEPT_COUNT of $CLEAN_APPLY_ITEM_COUNT items kept"
+    [[ "${MOLE_CLEAN_TRASH:-0}" == "1" ]] && plan_note+=" · to Trash"
+    echo -e "${BLUE}${ICON_ADMIN}${NC} $plan_note"
+    echo ""
+    installer_plan_apply
+}
+
 # Perform the installers cleanup
 perform_installers() {
     # Enter alt screen for scanning and selection
@@ -893,17 +970,7 @@ perform_installers() {
         fi
         printf '\n'
         if [[ $collect_status -ne 1 ]]; then
-            local scan_reason="incomplete"
-            if mole_rc_timeout "$collect_status"; then
-                scan_reason="timed out"
-            elif mole_rc_timeout_or_signal "$collect_status"; then
-                scan_reason="interrupted"
-            fi
-            printf '%sInstaller scan %s%s; no files selected' "$YELLOW" "$scan_reason" "$NC" >&2
-            if [[ -n "$INSTALLER_SCAN_FAILURE_PATH" ]]; then
-                printf ' (%s)' "$(installer_display_text "$INSTALLER_SCAN_FAILURE_PATH")" >&2
-            fi
-            printf '\nCheck that the scan locations are readable and responsive, then retry mo installer.\n' >&2
+            report_installer_scan_failure "$collect_status"
             return "$collect_status"
         fi
         echo -e "${GREEN}${ICON_SUCCESS}${NC} No installer files to clean"
@@ -953,6 +1020,11 @@ show_summary() {
 
         if [[ "$dry_run_mode" == "1" ]]; then
             summary_details+=("Would remove ${GREEN}$total_deleted${NC} installers, free ${GREEN}${freed_mb}MB${NC}")
+        elif [[ "${MOLE_CLEAN_TRASH:-0}" == "1" ]]; then
+            summary_details+=("Moved ${GREEN}$total_deleted${NC} installers to the Trash, ${GREEN}${freed_mb}MB${NC}")
+            if [[ $total_delete_failed -eq 0 ]]; then
+                summary_details+=("Your Mac is cleaner now!")
+            fi
         else
             summary_details+=("Removed ${GREEN}$total_deleted${NC} installers, freed ${GREEN}${freed_mb}MB${NC}")
             if [[ $total_delete_failed -eq 0 ]]; then
@@ -961,6 +1033,9 @@ show_summary() {
         fi
     else
         summary_details+=("No installers were removed")
+    fi
+    if [[ ${INSTALLER_ALREADY_REMOVED:-0} -gt 0 ]]; then
+        summary_details+=("$(mole_count_label "$INSTALLER_ALREADY_REMOVED" installer) already removed since the plan")
     fi
 
     if [[ $total_delete_failed -gt 0 ]]; then
@@ -986,6 +1061,9 @@ show_summary() {
         if [[ $failure_count -gt $failure_limit ]]; then
             summary_details+=("${ICON_WARNING} $((failure_count - failure_limit)) more failed")
         fi
+        if [[ -n "${INSTALLER_APPLY_PLAN_ID:-}" ]]; then
+            summary_details+=("Those files were kept; run mo installer --dry-run --json to review them again")
+        fi
     fi
 
     print_summary_block "$summary_heading" "${summary_details[@]}"
@@ -993,8 +1071,12 @@ show_summary() {
 }
 
 main() {
-    for arg in "$@"; do
-        case "$arg" in
+    local installer_json=false
+    local installer_trash=false
+    local installer_apply_arg=""
+    local installer_select_file=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
             "--help" | "-h")
                 show_installer_help
                 exit 0
@@ -1005,12 +1087,56 @@ main() {
             "--dry-run" | "-n")
                 export MOLE_DRY_RUN=1
                 ;;
+            "--json")
+                installer_json=true
+                ;;
+            "--apply")
+                shift
+                if [[ $# -eq 0 || "$1" == -* ]]; then
+                    echo "Missing plan id for --apply" >&2
+                    echo "Run 'mo installer --dry-run --json' and pass its plan_id." >&2
+                    exit 1
+                fi
+                installer_apply_arg="$1"
+                ;;
+            "--select")
+                shift
+                if [[ $# -eq 0 || "$1" == -* ]]; then
+                    echo "Missing file for --select" >&2
+                    echo "Use 'mo installer --apply <plan_id> --select <file>', the file listing the kept item ids." >&2
+                    exit 1
+                fi
+                installer_select_file="$1"
+                ;;
+            "--trash")
+                installer_trash=true
+                ;;
             *)
-                echo "Unknown option: $arg" >&2
+                echo "Unknown option: $1" >&2
                 exit 1
                 ;;
         esac
+        shift
     done
+
+    clean_plan_validate_mode_flags "$installer_json" "$installer_trash" \
+        "$installer_apply_arg" "$installer_select_file" remove "a real run sends installers" || exit 1
+
+    # MOLE_APPLY_PLAN and MOLE_CLEAN_TRASH come only from this run's flags.
+    unset MOLE_APPLY_PLAN
+    MOLE_CLEAN_TRASH=0
+    [[ "$installer_trash" == "true" ]] && MOLE_CLEAN_TRASH=1
+    export MOLE_CLEAN_TRASH
+    if [[ -n "$installer_apply_arg" ]]; then
+        clean_plan_load_selection "$installer_apply_arg" "$installer_select_file" || exit 1
+        INSTALLER_APPLY_PLAN_ID="$CLEAN_PLAN_ID"
+    fi
+    # The JSON document is the only thing on stdout; every other line of the
+    # preview goes to stderr.
+    if [[ "$installer_json" == "true" ]]; then
+        exec 7>&1 1>&2
+        CLEAN_PLAN_JSON_PENDING=true
+    fi
 
     if [[ "${MOLE_DRY_RUN:-0}" == "1" ]]; then
         echo -e "${YELLOW}${ICON_DRY_RUN} DRY RUN MODE${NC}, No installer files will be removed"
@@ -1018,11 +1144,20 @@ main() {
     fi
 
     hide_cursor
+    if [[ "$installer_json" == "true" ]]; then
+        perform_installer_plan_json || exit $?
+        show_cursor
+        return 0
+    fi
     # Capture the status without tripping errexit: a bare call under set -e
     # would exit the script before the case handler below could report
     # incomplete cleanup.
     local exit_code=0
-    perform_installers || exit_code=$?
+    if [[ -n "$INSTALLER_APPLY_PLAN_ID" ]]; then
+        perform_installer_apply || exit_code=$?
+    else
+        perform_installers || exit_code=$?
+    fi
     show_cursor
 
     case $exit_code in
@@ -1049,7 +1184,12 @@ main() {
             if [[ $total_delete_failed -gt 0 ]]; then
                 show_summary
                 if mole_rc_timeout "$exit_code"; then
-                    echo -e "${YELLOW}${ICON_WARNING}${NC} A file check timed out, so later selections were left in place. Retry mo installer."
+                    local last_failure="${INSTALLER_DELETE_FAILURES[$((${#INSTALLER_DELETE_FAILURES[@]} - 1))]:-}"
+                    if [[ "$last_failure" == *" (move to Trash timed out)" ]]; then
+                        echo -e "${YELLOW}${ICON_WARNING}${NC} The move to the Trash timed out, so later selections were left in place. Retry, or run without --trash."
+                    else
+                        echo -e "${YELLOW}${ICON_WARNING}${NC} A file check timed out, so later selections were left in place. Retry mo installer."
+                    fi
                 fi
             fi
             return "$exit_code"

@@ -50,9 +50,6 @@ ALLOWED_GROUPS: dict[tuple[str, ...], str] = {
         "menu_simple and menu_paginated are deliberately independent modules; "
         "sharing a helper would couple the fallback UI to the paginated one"
     ),
-    ("show_history_help", "show_installer_help"): (
-        "same help frame, different command text; the frame is the shared part and already is"
-    ),
 }
 
 FUNC_START = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\(\)\s*\{\s*$")

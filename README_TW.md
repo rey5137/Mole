@@ -98,6 +98,9 @@ mo clean --trash             # 把清理的檔案移到垃圾桶
 mo purge --dry-run --json    # 以 JSON 計畫預覽建置產物，每項帶 id
 mo purge --apply <plan_id> --select kept.txt  # 只清除保留的產物 id
 mo purge --trash             # 把清除的建置產物移到垃圾桶
+mo installer --dry-run --json # 以 JSON 計畫預覽安裝檔，每項帶 id
+mo installer --apply <plan_id> --select kept.txt  # 只刪除保留的安裝檔 id
+mo installer --trash         # 把刪除的安裝檔移到垃圾桶
 mo optimize --whitelist      # 管理受保護的最佳化規則
 mo clean --whitelist         # 管理受保護的快取白名單
 mo purge --paths             # 設定程式碼專案掃描目錄

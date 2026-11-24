@@ -98,6 +98,9 @@ mo clean --trash             # Przenieś czyszczone pliki do Kosza
 mo purge --dry-run --json    # Podgląd jako plan JSON z identyfikatorami
 mo purge --apply <plan_id> --select kept.txt  # Usuń tylko zachowane identyfikatory
 mo purge --trash             # Przenieś usuwane artefakty do Kosza
+mo installer --dry-run --json # Podgląd instalatorów jako plan JSON z identyfikatorami
+mo installer --apply <plan_id> --select kept.txt  # Usuń tylko zachowane identyfikatory instalatorów
+mo installer --trash         # Przenieś usuwane instalatory do Kosza
 mo optimize --whitelist      # Zarządzanie chronionymi regułami optymalizacji
 mo clean --whitelist         # Zarządzanie chronionymi pamięciami podręcznymi
 mo purge --paths             # Konfiguracja katalogów skanowania projektów

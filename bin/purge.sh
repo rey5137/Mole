@@ -439,7 +439,8 @@ main() {
         shift
     done
 
-    validate_purge_mode_flags "$purge_json" "$purge_trash" "$purge_apply_arg" "$purge_select_file" || exit 1
+    clean_plan_validate_mode_flags "$purge_json" "$purge_trash" "$purge_apply_arg" "$purge_select_file" \
+        purge "a real purge sends artifacts" || exit 1
 
     # MOLE_APPLY_PLAN and MOLE_CLEAN_TRASH come only from this run's flags.
     unset MOLE_APPLY_PLAN
@@ -469,37 +470,6 @@ main() {
     else
         perform_purge
     fi
-}
-
-# Each refusal names the conflict and the command to run instead.
-validate_purge_mode_flags() {
-    local json="$1" trash="$2" apply_arg="$3" select_file="$4"
-    if [[ "$json" == "true" && "${MOLE_DRY_RUN:-0}" != "1" ]]; then
-        echo "mo purge --json prints a preview plan and needs --dry-run." >&2
-        echo "Run 'mo purge --dry-run --json'." >&2
-        return 1
-    fi
-    if [[ -n "$select_file" && -z "$apply_arg" ]]; then
-        echo "mo purge --select needs --apply <plan_id>; the plain purge has no selection list." >&2
-        echo "Run 'mo purge --dry-run --json', then 'mo purge --apply <plan_id> --select <file>'." >&2
-        return 1
-    fi
-    if [[ -n "$apply_arg" && -z "$select_file" ]]; then
-        echo "mo purge --apply needs --select <file> listing the item ids to purge." >&2
-        echo "Run 'mo purge --apply $apply_arg --select <file>'." >&2
-        return 1
-    fi
-    if [[ -n "$apply_arg" && "${MOLE_DRY_RUN:-0}" == "1" ]]; then
-        echo "mo purge --apply runs a reviewed plan and cannot be combined with --dry-run." >&2
-        echo "Run 'mo purge --dry-run --json' to preview, then --apply without --dry-run." >&2
-        return 1
-    fi
-    if [[ "$trash" == "true" && "${MOLE_DRY_RUN:-0}" == "1" ]]; then
-        echo "mo purge --trash changes where a real purge sends artifacts; a dry run removes nothing." >&2
-        echo "Run 'mo purge --dry-run' to preview, then 'mo purge --trash'." >&2
-        return 1
-    fi
-    return 0
 }
 
 if [[ "${MOLE_SKIP_MAIN:-0}" == "1" ]]; then

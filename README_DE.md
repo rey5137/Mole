@@ -98,6 +98,9 @@ mo clean --trash             # Bereinigte Dateien in den Papierkorb legen
 mo purge --dry-run --json    # Vorschau als JSON-Plan mit Element-IDs
 mo purge --apply <plan_id> --select kept.txt  # Nur die behaltenen Element-IDs entfernen
 mo purge --trash             # Entfernte Build-Artefakte in den Papierkorb legen
+mo installer --dry-run --json # Installer als JSON-Plan mit Element-IDs vorschauen
+mo installer --apply <plan_id> --select kept.txt  # Nur die behaltenen Installer-IDs entfernen
+mo installer --trash         # Entfernte Installer in den Papierkorb legen
 mo optimize --whitelist      # Geschützte Optimierungsregeln verwalten
 mo clean --whitelist         # Geschützte Cache-Pfade verwalten
 mo purge --paths             # Projekt-Suchpfade konfigurieren

@@ -475,3 +475,25 @@ SCRIPT
     [[ "$output" == *"no longer a purge path; run mo purge --dry-run --json again"* ]] || return 1
     oplog | grep -F "SKIPPED $HOME/www/alpha/dist (outside purge paths)" > /dev/null
 }
+
+@test "purge --apply --trash logs one row for a timed-out Trash move and keeps the artifact" {
+    make_artifact alpha old 8192
+    make_plan || return 1
+    plan_item_id "$HOME/www/alpha/dist" > "$HOME/select.txt" || return 1
+    # The test Trash move is an mv into the test Trash; this one times out.
+    mkdir -p "$HOME/bin"
+    cat > "$HOME/bin/mv" << EOF
+#!/bin/sh
+case "\$*" in *"$HOME/test-trash/"*) exit 124 ;; esac
+exec /bin/mv "\$@"
+EOF
+    chmod +x "$HOME/bin/mv"
+
+    run --separate-stderr env HOME="$HOME" TMPDIR="$HOME/tmp" MOLE_TEST_NO_AUTH=1 PATH="$HOME/bin:$PATH" \
+        MOLE_TEST_TRASH_DIR="$HOME/test-trash" "$PROJECT_ROOT/mole" purge \
+        --apply "$PLAN_ID" --select "$HOME/select.txt" --trash < /dev/null
+    [ "$status" -ne 0 ] || return 1
+    [ -f "$HOME/www/alpha/dist/blob.bin" ] || return 1
+    oplog | grep -F "FAILED $HOME/www/alpha/dist (move to Trash timed out)" > /dev/null || return 1
+    [ "$(oplog | grep -c -F " $HOME/www/alpha/dist (")" -eq 1 ]
+}

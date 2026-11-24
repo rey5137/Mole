@@ -145,6 +145,19 @@ listed in the summary, naming a failed Trash move as such; an unticked
 artifact is never handed to a sink. An artifact counts as already removed
 only while its scan root and reviewed parent folder are unchanged.
 
+A reviewed `mo installer --apply <plan_id> --select <file>` reads a plan that
+`mo installer --dry-run --json` saved after the same scan as the text preview
+(`lib/clean/installer_plan.sh`); a clean or purge plan is refused, and an
+installer plan by both. Each kept file must still be reached by a folder
+installer scans now, at the depth it scans now, and its physical parent folder
+and dev:inode must match the review.
+The rest go to the menu run's own `execute_installer_delete_plan` with the
+size and the dev:inode:mtime identity recorded at review, never ones read at
+apply time, so a file that changed is kept, and `mole_delete` binds that
+identity and asks the reviewed-plan gate again. Each refusal is logged
+`SKIPPED` with a fixed reason and printed with its next step; a file counts
+as already removed only while its reviewed parent folder is unchanged.
+
 ## Layer 2: `# SAFE: <reason>` contract for raw `rm`
 
 The validator is opt-in: a contributor could bypass it by writing `rm -rf`
@@ -224,8 +237,9 @@ Apple's `/usr/bin/trash` first, then an atomic no-overwrite rename into the
 per-volume Trash, and uses Finder AppleScript only as the last fallback.
 This gives users the standard Apple-native "Put Back" recovery flow.
 `mo clean`'s batched cleanup path, `mo purge`, and `mo installer` delete
-permanently unless `mo purge --trash` routes purge's removals, or
-`mo clean --trash` clean's user-level deletions,
+permanently unless `mo purge --trash` routes purge's removals,
+`mo installer --trash` installer's, or `mo clean --trash` clean's user-level
+deletions,
 through the same Trash mover (under clean, root-owned items, owner commands, `tmutil` and
 `simctl` deletes are then skipped as `needs permanent delete` and listed in the
 summary, never removed); `mo uninstall --permanent` opts out of Trash, and

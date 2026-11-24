@@ -1763,11 +1763,15 @@ mole_clean_command_allowed() {
     return 0
 }
 
-# `mo clean --trash` and `mo purge --trash` send safe_remove deletions to the
-# user's Trash instead. Each command sets MOLE_CLEAN_TRASH from its own flags.
+# `mo clean --trash`, `mo purge --trash` and `mo installer --trash` send
+# safe_remove deletions to the user's Trash instead. Each command sets
+# MOLE_CLEAN_TRASH from its own flags.
 _mole_clean_trash_active() {
     [[ "${MOLE_CLEAN_TRASH:-0}" == "1" ]] || return 1
-    [[ "${MOLE_CURRENT_COMMAND:-}" == "clean" || "${MOLE_CURRENT_COMMAND:-}" == "purge" ]]
+    case "${MOLE_CURRENT_COMMAND:-}" in
+        clean | purge | installer) return 0 ;;
+    esac
+    return 1
 }
 
 # Under `mo clean --trash`, a step that cannot move its target to the Trash
@@ -1809,6 +1813,7 @@ _mole_clean_move_to_trash() {
         log_operation "${MOLE_CURRENT_COMMAND:-clean}" "FAILED" "$path" "move to Trash timed out"
         MOLE_CLEAN_REMOVAL_TIMEOUTS=$((${MOLE_CLEAN_REMOVAL_TIMEOUTS:-0} + 1))
         _mole_record_removal_timeout_path "$path"
+        _MOLE_SAFE_REMOVE_SKIP_REASON="move to Trash timed out"
         return 124
     fi
     if [[ $trash_rc -eq $MOLE_ERR_PRIVACY_DENIED ]]; then
@@ -1821,7 +1826,8 @@ _mole_clean_move_to_trash() {
 }
 
 # Why the last safe_remove refused, when its caller words that cause itself:
-# a reviewed-plan refusal or a failed Trash move. Empty for every other cause.
+# a reviewed-plan refusal or a failed or timed-out Trash move (each already
+# logged). Empty for every other cause.
 _MOLE_SAFE_REMOVE_SKIP_REASON=""
 
 safe_remove() {
@@ -2814,6 +2820,13 @@ mole_delete() {
             return 1
             ;;
     esac
+    # Under `--trash` of clean, purge or installer, the permanent leg below
+    # hands a user-level item to safe_remove, whose Trash leg moves it; the
+    # deletions log names that move as one.
+    local log_mode="$mode"
+    if [[ "$mode" == "permanent" && "$needs_sudo" != "true" && ! -L "$path" ]] && _mole_clean_trash_active; then
+        log_mode="trash"
+    fi
 
     # Nothing to do if path does not exist (but a broken symlink still counts).
     if [[ ! -e "$path" && ! -L "$path" ]]; then
@@ -2831,18 +2844,18 @@ mole_delete() {
     if mole_rc_timeout_or_signal "$validation_rc"; then
         local validation_status="interrupted"
         mole_rc_timeout "$validation_rc" && validation_status="timed-out"
-        _mole_delete_log "$mode" "unknown" "$validation_status" "$path"
+        _mole_delete_log "$log_mode" "unknown" "$validation_status" "$path"
         return "$validation_rc"
     fi
     if [[ $validation_rc -ne 0 ]]; then
-        _mole_delete_log "$mode" "0" "rejected" "$path"
+        _mole_delete_log "$log_mode" "0" "rejected" "$path"
         log_operation "${MOLE_CURRENT_COMMAND:-uninstall}" "SKIPPED" "$path" "${_MOLE_VALIDATION_REASON:-protected}"
         return 1
     fi
     local plan_rc=0
     _mole_apply_plan_gate "$path" || plan_rc=$?
     if [[ $plan_rc -ne 0 ]]; then
-        _mole_delete_log "$mode" "0" "rejected" "$path"
+        _mole_delete_log "$log_mode" "0" "rejected" "$path"
         return "$plan_rc"
     fi
 
@@ -2852,7 +2865,7 @@ mole_delete() {
         # Finder also fails for some package-installed apps even after its native
         # authorization dialog (#1266). Keep both Trash and permanent modes
         # fail-closed and direct the user to perform the app move themselves.
-        _mole_delete_log "$mode" "unknown" "mutable-parent" "$path"
+        _mole_delete_log "$log_mode" "unknown" "mutable-parent" "$path"
         debug_log "Refusing privileged delete below mutable parent: $path"
         return "$MOLE_ERR_MUTABLE_PARENT"
     fi
@@ -2888,7 +2901,7 @@ mole_delete() {
         if mole_rc_timeout_or_signal "$du_rc"; then
             local cancel_status="interrupted"
             mole_rc_timeout "$du_rc" && cancel_status="timed-out"
-            _mole_delete_log "$mode" "$size_kb" "$cancel_status" "$path"
+            _mole_delete_log "$log_mode" "$size_kb" "$cancel_status" "$path"
             return "$du_rc"
         fi
     fi
@@ -2898,7 +2911,7 @@ mole_delete() {
     local expected_target_id=""
     if [[ -n "$expected_identity" ]]; then
         if ! _mole_snapshot_path_identity "$path"; then
-            _mole_delete_log "$mode" "$size_kb" "identity-changed" "$path"
+            _mole_delete_log "$log_mode" "$size_kb" "identity-changed" "$path"
             return 1
         fi
         expected_parent="$_MOLE_PATH_SNAPSHOT_PARENT"
@@ -2910,16 +2923,16 @@ mole_delete() {
         if mole_rc_timeout_or_signal "$identity_rc"; then
             local identity_status="interrupted"
             mole_rc_timeout "$identity_rc" && identity_status="timed-out"
-            _mole_delete_log "$mode" "$size_kb" "$identity_status" "$path"
+            _mole_delete_log "$log_mode" "$size_kb" "$identity_status" "$path"
             return "$identity_rc"
         fi
         if [[ $identity_rc -ne 0 || "$current_identity" != "$expected_identity" ||
             "$expected_target_id" != "${expected_identity%:*}" ||
             "$expected_target_id" != "${current_identity%:*}" ]]; then
             if [[ -n "$expected_file_sha256" ]]; then
-                _mole_report_unverified_delete "$path" "$mode" "$size_kb"
+                _mole_report_unverified_delete "$path" "$log_mode" "$size_kb"
             else
-                _mole_delete_log "$mode" "$size_kb" "identity-changed" "$path"
+                _mole_delete_log "$log_mode" "$size_kb" "identity-changed" "$path"
                 debug_log "Refusing deletion after selected path identity changed: $path"
             fi
             return 1
@@ -2933,22 +2946,22 @@ mole_delete() {
         if mole_rc_timeout_or_signal "$hash_rc"; then
             local hash_status="interrupted"
             mole_rc_timeout "$hash_rc" && hash_status="timed-out"
-            _mole_delete_log "$mode" "$size_kb" "$hash_status" "$path"
+            _mole_delete_log "$log_mode" "$size_kb" "$hash_status" "$path"
             return "$hash_rc"
         fi
         if [[ $hash_rc -ne 0 || "$current_sha256" != "$expected_file_sha256" ]]; then
-            _mole_report_unverified_delete "$path" "$mode" "$size_kb"
+            _mole_report_unverified_delete "$path" "$log_mode" "$size_kb"
             return 1
         fi
         if ! _mole_path_matches_identity "$path" "$expected_parent" \
             "$expected_parent_id" "$expected_target_id"; then
-            _mole_report_unverified_delete "$path" "$mode" "$size_kb"
+            _mole_report_unverified_delete "$path" "$log_mode" "$size_kb"
             return 1
         fi
     fi
 
     if ! _mole_expected_path_absent "$expected_absent_path"; then
-        _mole_report_unverified_delete "$path" "$mode" "$size_kb" "$MOLE_ERR_APP_REAPPEARED"
+        _mole_report_unverified_delete "$path" "$log_mode" "$size_kb" "$MOLE_ERR_APP_REAPPEARED"
         return 1
     fi
 
@@ -2959,7 +2972,7 @@ mole_delete() {
             "$expected_target_id" || ownership_rc=$?
         mole_rc_timeout_or_signal "$ownership_rc" && return "$ownership_rc"
         if [[ $ownership_rc -ne 0 ]]; then
-            _mole_report_unverified_delete "$path" "$mode" "$size_kb" "$ownership_rc"
+            _mole_report_unverified_delete "$path" "$log_mode" "$size_kb" "$ownership_rc"
             return "$ownership_rc"
         fi
     fi
@@ -2974,17 +2987,17 @@ mole_delete() {
         if mole_rc_timeout_or_signal "$preview_rc"; then
             local preview_status="interrupted"
             mole_rc_timeout "$preview_rc" && preview_status="timed-out"
-            _mole_delete_log "$mode" "$size_kb" "$preview_status" "$path"
+            _mole_delete_log "$log_mode" "$size_kb" "$preview_status" "$path"
             return "$preview_rc"
         fi
         debug_log "[DRY RUN] Would delete ($mode): $path"
-        _mole_delete_log "$mode" "$size_kb" "dry-run" "$path"
+        _mole_delete_log "$log_mode" "$size_kb" "dry-run" "$path"
         return 0
     fi
 
     if [[ "$needs_sudo" == "true" ]]; then
         if [[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]]; then
-            _mole_delete_log "$mode" "$size_kb" "sudo-blocked-test-mode" "$path"
+            _mole_delete_log "$log_mode" "$size_kb" "sudo-blocked-test-mode" "$path"
             return 1
         fi
     fi
@@ -3023,7 +3036,7 @@ mole_delete() {
         fi
         if [[ $trash_rc -eq $MOLE_ERR_OWNER_UNVERIFIED ||
             $trash_rc -eq $MOLE_ERR_APP_REAPPEARED ]]; then
-            _mole_report_unverified_delete "$path" "$mode" "$size_kb" "$trash_rc"
+            _mole_report_unverified_delete "$path" "$log_mode" "$size_kb" "$trash_rc"
             return 1
         fi
         if mole_rc_timeout_or_signal "$trash_rc"; then
@@ -3073,7 +3086,7 @@ mole_delete() {
     local status_label="ok"
     if [[ $rc -eq $MOLE_ERR_OWNER_UNVERIFIED ||
         $rc -eq $MOLE_ERR_APP_REAPPEARED ]]; then
-        _mole_report_unverified_delete "$path" "$mode" "$size_kb" "$rc"
+        _mole_report_unverified_delete "$path" "$log_mode" "$size_kb" "$rc"
         return 1
     fi
     if [[ $rc -eq $MOLE_ERR_MUTABLE_PARENT ]]; then
@@ -3085,7 +3098,7 @@ mole_delete() {
     elif [[ $rc -ne 0 ]]; then
         status_label="error"
     fi
-    _mole_delete_log "$mode" "$size_kb" "$status_label" "$path"
+    _mole_delete_log "$log_mode" "$size_kb" "$status_label" "$path"
     return "$rc"
 }
 

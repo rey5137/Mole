@@ -98,6 +98,9 @@ mo clean --trash             # Mover os arquivos limpos para o Lixo
 mo purge --dry-run --json    # Pré-visualização como plano JSON com ids
 mo purge --apply <plan_id> --select kept.txt  # Remover só os ids mantidos
 mo purge --trash             # Mover os artefatos removidos para o Lixo
+mo installer --dry-run --json # Pré-visualizar instaladores como plano JSON com ids
+mo installer --apply <plan_id> --select kept.txt  # Remover só os ids de instaladores mantidos
+mo installer --trash         # Mover os instaladores removidos para o Lixo
 mo optimize --whitelist      # Gerencia regras de otimização protegidas
 mo clean --whitelist         # Gerencia caches protegidos
 mo purge --paths             # Configura as pastas de busca de projetos

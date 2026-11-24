@@ -98,6 +98,9 @@ mo clean --trash             # クリーンしたファイルをゴミ箱へ移�
 mo purge --dry-run --json    # 項目 id 付きの JSON プランでプレビュー
 mo purge --apply <plan_id> --select kept.txt  # 残した項目 id だけを削除
 mo purge --trash             # 削除するビルド成果物をゴミ箱へ移動
+mo installer --dry-run --json # インストーラーを id 付き JSON プランでプレビュー
+mo installer --apply <plan_id> --select kept.txt  # 残したインストーラー id だけを削除
+mo installer --trash         # 削除するインストーラーをゴミ箱へ移動
 mo optimize --whitelist      # 保護する最適化ルールの管理
 mo clean --whitelist         # 保護するキャッシュホワイトリストの管理
 mo purge --paths             # プロジェクト検索ディレクトリの設定
