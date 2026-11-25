@@ -1,4 +1,6 @@
 import Foundation
+import AppKit
+import CryptoKit
 import MoleReviewCore
 import MoleReviewUI
 
@@ -662,5 +664,273 @@ check("full disk access probe: a readable folder is granted, a refused one denie
         && FullDiskAccess.settingsURL == "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
 }
 
+// MARK: admin password handoff and quit
+
+let samplePassword = "s3cret sample pw"
+func sha256(_ s: String) -> String { SHA256.hash(data: Data(s.utf8)).map { String(format: "%02x", $0) }.joined() }
+func secretEnv(_ tag: String) -> (env: [String: String], report: URL, envDump: URL, fdDump: URL, argv: URL) {
+    let report = scratch.appendingPathComponent("\(tag)-secret"), envDump = scratch.appendingPathComponent("\(tag)-env")
+    let fdDump = scratch.appendingPathComponent("\(tag)-fds"), argv = scratch.appendingPathComponent("\(tag)-argv")
+    var e = fakeEnv(argv: argv.path)
+    e["FAKE_MO_SECRET_REPORT"] = report.path; e["FAKE_MO_ENV_DUMP"] = envDump.path; e["FAKE_MO_FD_DUMP"] = fdDump.path
+    return (e, report, envDump, fdDump, argv)
+}
+func read(_ u: URL) -> String { (try? String(contentsOf: u, encoding: .utf8)) ?? "" }
+
+check("admin password: empty or multi-line is refused, clear forgets, description never shows it") {
+    let pw = AdminPassword()
+    guard !pw.set(""), !pw.isSet, !pw.set("a\nb"), !pw.set("a\rb"), !pw.isSet else { return false }
+    guard pw.set(samplePassword), pw.isSet, !pw.description.contains(samplePassword), !"\(pw)".contains("s3cret") else { return false }
+    pw.clear()
+    return !pw.isSet && pw.description == "AdminPassword(empty)"
+}
+check("an apply gets the admin password on its pipe only: fd 5 named in the env, never in env or argv") {
+    let pw = AdminPassword(); pw.set(samplePassword)
+    let t = secretEnv("apply")
+    let p = try plan("plan-sample.json")
+    let r = MoleService.runApply(.clean, runner: MoleRunner(executable: fake), planId: p.planId, selectFile: "/tmp/sel",
+                                 trash: true, planSkipped: [], extraEnvironment: t.env, secret: pw)
+    let report = read(t.report), env = read(t.envDump), argv = read(t.argv)
+    return r.exitCode == 0 && pw.isSet
+        && report == "env-fd=5\nlen=\(samplePassword.count) sha=\(sha256(samplePassword))\n"
+        && !env.isEmpty && !env.contains("s3cret") && env.contains("MOLE_SUDO_PASSWORD_FD=5\n")
+        && !argv.isEmpty && !argv.contains("s3cret")
+}
+check("only stdin, stdout, stderr and the password fd reach the child") {
+    let pw = AdminPassword(); pw.set(samplePassword)
+    let t = secretEnv("fds")
+    _ = MoleRunner(executable: fake).run(arguments: ["clean"], extraEnvironment: t.env, secret: pw)
+    let t2 = secretEnv("fds-none")
+    _ = MoleRunner(executable: fake).run(arguments: ["clean"], extraEnvironment: t2.env)
+    return read(t.fdDump) == "5\n" && read(t2.fdDump) == ""
+}
+check("a scan gets no password fd, and an MOLE_SUDO_PASSWORD_FD in the app's environment never reaches it") {
+    setenv("MOLE_SUDO_PASSWORD_FD", "5", 1)
+    defer { unsetenv("MOLE_SUDO_PASSWORD_FD") }
+    let t = secretEnv("scan")
+    let r = MoleRunner(executable: fake).run(arguments: MoleService.scanArguments(.clean), extraEnvironment: t.env)
+    return r.exitCode == 0 && read(t.report) == "env-fd=unset\nno-pipe\n" && !read(t.envDump).contains("MOLE_SUDO_PASSWORD_FD")
+}
+check("an apply Mole reports as authentication failed is marked, others are not") {
+    let out = scratch.appendingPathComponent("auth-failed.txt")
+    try "  · \(MoleService.authenticationFailedLine)\n".write(to: out, atomically: true, encoding: .utf8)
+    var env = fakeEnv(); env["FAKE_MO_STDOUT_FILE"] = out.path
+    let failed = MoleService.runApply(.clean, runner: MoleRunner(executable: fake), planId: "abc", selectFile: "/tmp/sel",
+                                      trash: true, planSkipped: [], extraEnvironment: env)
+    let fine = MoleService.runApply(.clean, runner: MoleRunner(executable: fake), planId: "abc", selectFile: "/tmp/sel",
+                                    trash: true, planSkipped: [], extraEnvironment: fakeEnv())
+    return failed.authenticationFailed && !fine.authenticationFailed
+        && MoleService.authenticationFailedLine == "Authentication failed, continuing with user-level cleanup"
+}
+check("quit: stopping every runner ends a running fake mo and its grandchild, and reports when they are gone") {
+    let pidfile = scratch.appendingPathComponent("quit-grandchild.pid")
+    let runner = MoleRunner(executable: fake)
+    runner.termGraceSeconds = 2
+    var env = fakeEnv(); env["FAKE_MO_PIDFILE"] = pidfile.path
+    let done = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async { _ = runner.run(arguments: ["clean", "--apply", "--slow"], extraEnvironment: env); done.signal() }
+    let t0 = Date()
+    while read(pidfile).isEmpty && Date().timeIntervalSince(t0) < 5 { usleep(50_000) }
+    guard let gc = pid_t(read(pidfile).trimmingCharacters(in: .whitespacesAndNewlines)), alive(gc), runner.isRunning,
+          !MoleRunner.waitUntilStopped([runner], timeout: 0.2) else { return false }
+    runner.cancel()
+    let stopped = MoleRunner.waitUntilStopped([runner], timeout: 12)
+    usleep(200_000)
+    return stopped && !runner.isRunning && done.wait(timeout: .now() + 1) == .success && !alive(gc)
+        && MoleRunner.waitUntilStopped([MoleRunner(executable: fake)], timeout: 0)
+}
+
+// MARK: the app's admin password, at the model level
+
+/// A fixture plan dated now, so `canApply` holds against the real clock.
+func freshReview(_ name: String) throws -> ReviewState {
+    let f = ISO8601DateFormatter()
+    let text = try String(contentsOf: fixtures.appendingPathComponent(name), encoding: .utf8)
+        .replacingOccurrences(of: "2026-11-24T07:00:00Z", with: f.string(from: Date().addingTimeInterval(-60)))
+        .replacingOccurrences(of: "2026-11-24T08:00:00Z", with: f.string(from: Date().addingTimeInterval(3600)))
+    guard case .plan(let p) = try PlanDocument.decode(Data(text.utf8)) else { throw MoleError("not a plan: \(name)") }
+    return ReviewState(plan: p)
+}
+@MainActor func stage(_ m: AppModel, _ cmd: MoleCommand, _ fixture: String) throws -> Bool {
+    m.command = cmd; m.review = try freshReview(fixture); m.phase = .review; m.result = nil
+    return m.canApply
+}
+/// Runs the main run loop until the apply `start` begins has finished (the model hops back to the main actor).
+@MainActor func applied(_ m: AppModel, _ start: () -> Void) -> Bool {
+    start()
+    let t0 = Date()
+    while m.phase != .result && Date().timeIntervalSince(t0) < 15 { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+    return m.phase == .result
+}
+/// The fake mo's environment for the model's runs, which pass none of their own: `MOLE_PATH`
+/// picks the fake (Settings' command is empty in this process), the rest it reads.
+func withModelFake<T>(_ vars: [String: String], _ body: () throws -> T) rethrows -> T {
+    let all = vars.merging(["MOLE_PATH": fake, "FAKE_MO_EXIT": "0"]) { a, _ in a }
+    for (k, v) in all { setenv(k, v, 1) }
+    defer { for k in all.keys { unsetenv(k) } }
+    return try body()
+}
+
+check("model: a clean asks for the admin password once per launch; purge and installer never ask; empty is refused") {
+    try MainActor.assumeIsolated {
+        let m = AppModel()
+        m.command = .clean
+        guard m.needsAdminPassword(.clean), !m.needsAdminPassword(.purge), !m.needsAdminPassword(.installer) else { return false }
+        m.confirmApply()
+        guard m.askingPassword, !m.submitAdminPassword(""), !m.hasAdminPassword, !m.adminPassword.isSet else { return false }
+        guard m.submitAdminPassword(samplePassword), m.hasAdminPassword, m.adminPassword.isSet, !m.askingPassword,
+              !m.needsAdminPassword(.clean) else { return false }
+        m.confirmApply()
+        guard !m.askingPassword else { return false }
+        _ = try stage(m, .purge, "purge-sample.json")
+        m.command = .purge
+        m.confirmApply()
+        return !m.askingPassword
+    }
+}
+check("model: every clean apply hands the kept password on its pipe; purge gets no fd; Mole's refusal clears it") {
+    let report = scratch.appendingPathComponent("model-secret"), authOut = scratch.appendingPathComponent("model-auth-failed.txt")
+    try "  · \(MoleService.authenticationFailedLine)\n".write(to: authOut, atomically: true, encoding: .utf8)
+    let handed = "env-fd=5\nlen=\(samplePassword.count) sha=\(sha256(samplePassword))\n", none = "env-fd=unset\nno-pipe\n"
+    return try withModelFake(["FAKE_MO_SECRET_REPORT": report.path]) {
+        try MainActor.assumeIsolated {
+            let m = AppModel()
+            guard m.resolvedCommand == fake else { print("  resolved \(m.resolvedCommand), not the fake"); return false }
+            // First clean: the sheet's Continue runs it.
+            guard try stage(m, .clean, "plan-sample.json") else { return false }
+            m.confirmApply()
+            guard m.askingPassword, applied(m, { m.submitAdminPassword(samplePassword) }), read(report) == handed else { return false }
+            // Second clean: no sheet, the same password again (one pipe per run, nothing consumed).
+            try? FileManager.default.removeItem(at: report)
+            guard try stage(m, .clean, "plan-sample.json"), applied(m, { m.confirmApply() }), !m.askingPassword,
+                  read(report) == handed, m.result?.notes.contains(AppModel.passwordRejectedNote) == false else { return false }
+            // Purge never uses sudo: no fd, though a password is kept.
+            guard try stage(m, .purge, "purge-sample.json"), applied(m, { m.confirmApply() }), read(report) == none,
+                  m.hasAdminPassword else { return false }
+            // Mole says the password was refused: it is forgotten, the result says so, the next clean asks.
+            setenv("FAKE_MO_STDOUT_FILE", authOut.path, 1)
+            defer { unsetenv("FAKE_MO_STDOUT_FILE") }
+            guard try stage(m, .clean, "plan-sample.json"), applied(m, { m.confirmApply() }), read(report) == handed else { return false }
+            guard !m.hasAdminPassword, !m.adminPassword.isSet, m.adminPasswordRejected,
+                  m.result?.notes.contains(AppModel.passwordRejectedNote) == true,
+                  m.result?.notes.contains(where: { $0.contains("s3cret") }) == false else { return false }
+            _ = try stage(m, .clean, "plan-sample.json")
+            m.confirmApply()
+            return m.askingPassword && m.phase == .review
+        }
+    }
+}
+check("model: Skip runs the clean with no password fd and stops asking; Forget zeroes a kept password") {
+    let report = scratch.appendingPathComponent("model-skip")
+    return try withModelFake(["FAKE_MO_SECRET_REPORT": report.path]) {
+        try MainActor.assumeIsolated {
+            let m = AppModel()
+            guard try stage(m, .clean, "plan-sample.json") else { return false }
+            m.confirmApply()
+            guard m.askingPassword, applied(m, { m.skipAdminPassword() }), read(report) == "env-fd=unset\nno-pipe\n",
+                  m.adminSkipped, !m.needsAdminPassword(.clean) else { return false }
+            _ = try stage(m, .clean, "plan-sample.json")
+            m.confirmApply()
+            guard m.phase == .applying, !m.askingPassword, applied(m, {}) else { return false }
+            let f = AppModel()
+            f.submitAdminPassword(samplePassword)
+            guard f.hasAdminPassword, f.adminPassword.isSet else { return false }
+            f.forgetAdminPassword()
+            return !f.hasAdminPassword && !f.adminPassword.isSet && f.needsAdminPassword(.clean)
+        }
+    }
+}
+
+check("admin password: up to 1 KB is kept, a longer one is refused and drops what was kept") {
+    let pw = AdminPassword()
+    guard pw.set(String(repeating: "a", count: AdminPassword.maxBytes)), pw.isSet else { return false }
+    return !pw.set(String(repeating: "a", count: AdminPassword.maxBytes + 1)) && !pw.isSet
+        && !pw.set(String(repeating: "é", count: AdminPassword.maxBytes / 2 + 1)) && !pw.isSet
+}
+check("model: Cancel on the password step goes back to the review, applies nothing and does not count as Skip") {
+    let report = scratch.appendingPathComponent("model-cancel")
+    return try withModelFake(["FAKE_MO_SECRET_REPORT": report.path]) {
+        try MainActor.assumeIsolated {
+            let m = AppModel()
+            guard try stage(m, .clean, "plan-sample.json") else { return false }
+            m.showConfirm = true
+            m.confirmApply()
+            guard m.askingPassword else { return false }
+            m.cancelAdminPassword()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+            return !m.askingPassword && !m.showConfirm && m.phase == .review && !m.adminSkipped && !m.hasAdminPassword
+                && m.needsAdminPassword(.clean) && !FileManager.default.fileExists(atPath: report.path)
+        }
+    }
+}
+
+/// Runs the main run loop until `done` holds or `seconds` pass.
+@MainActor func spin(_ seconds: TimeInterval, until done: () -> Bool) -> Bool {
+    let t0 = Date()
+    while !done() && Date().timeIntervalSince(t0) < seconds { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+    return done()
+}
+func pidIn(_ u: URL, within seconds: TimeInterval = 5) -> pid_t? {
+    let t0 = Date()
+    while read(u).isEmpty && Date().timeIntervalSince(t0) < seconds { usleep(50_000) }
+    return pid_t(read(u).trimmingCharacters(in: .whitespacesAndNewlines))
+}
+@MainActor func quittingDelegate(_ m: AppModel, stop: Bool, asked: @escaping (MoleCommand) -> Void,
+                                 reopened: @escaping () -> Void, replied: @escaping (Bool) -> Void) -> AppDelegate {
+    let d = AppDelegate()
+    d.model = m
+    d.confirmQuit = { asked($0); return stop }
+    d.showMainWindow = reopened
+    d.replyToTerminate = { _, ok in replied(ok) }
+    return d
+}
+
+check("quit during an apply, the app's own path: Keep Running reopens the window, Stop and Quit ends mo and its child") {
+    let pidfile = scratch.appendingPathComponent("quit-apply.pid")
+    return try withModelFake(["FAKE_MO_SLOW_APPLY": "1", "FAKE_MO_PIDFILE": pidfile.path]) {
+        try MainActor.assumeIsolated {
+            let app = NSApplication.shared
+            let m = AppModel()
+            guard try stage(m, .clean, "plan-sample.json") else { return false }
+            m.confirmApply()
+            m.skipAdminPassword()
+            guard m.phase == .applying, let gc = pidIn(pidfile), alive(gc) else { return false }
+            var asked: [MoleCommand] = [], reopened = 0, replies: [Bool] = []
+            let keep = quittingDelegate(m, stop: false, asked: { asked.append($0) }, reopened: { reopened += 1 },
+                                        replied: { replies.append($0) })
+            guard keep.applicationShouldTerminate(app) == .terminateCancel, asked == [.clean], reopened == 1,
+                  alive(gc), m.phase == .applying else { return false }
+            let stop = quittingDelegate(m, stop: true, asked: { asked.append($0) }, reopened: { reopened += 1 },
+                                        replied: { replies.append($0) })
+            guard stop.applicationShouldTerminate(app) == .terminateLater, asked == [.clean, .clean] else { return false }
+            guard spin(AppDelegate.stopWaitSeconds + 3, until: { replies == [true] && m.phase == .result }) else { return false }
+            usleep(200_000)
+            return !alive(gc) && !m.hasRunningWork && reopened == 1
+        }
+    }
+}
+check("quit while an apply reads its history: the read counts as running work and is stopped too") {
+    let pidfile = scratch.appendingPathComponent("quit-history.pid")
+    return try withModelFake(["FAKE_MO_SLOW_HISTORY": "1", "FAKE_MO_HISTORY_PIDFILE": pidfile.path]) {
+        try MainActor.assumeIsolated {
+            let app = NSApplication.shared
+            let m = AppModel()
+            guard try stage(m, .clean, "plan-sample.json") else { return false }
+            m.confirmApply()
+            m.skipAdminPassword()
+            // The apply itself is over; only `mo history --json` runs now.
+            guard let gc = pidIn(pidfile), alive(gc), m.phase == .applying, m.hasRunningWork else { return false }
+            var replies: [Bool] = []
+            let d = quittingDelegate(m, stop: true, asked: { _ in }, reopened: {}, replied: { replies.append($0) })
+            guard d.applicationShouldTerminate(app) == .terminateLater else { return false }
+            guard spin(AppDelegate.stopWaitSeconds + 3, until: { replies == [true] && m.phase == .result }) else { return false }
+            usleep(200_000)
+            return !alive(gc) && !m.hasRunningWork
+        }
+    }
+}
+
+// exit() skips the top-level defer, so the scratch folder goes here.
+try? FileManager.default.removeItem(at: scratch)
 if failures > 0 { print("\(failures) check(s) failed"); exit(1) }
 print("all checks passed")

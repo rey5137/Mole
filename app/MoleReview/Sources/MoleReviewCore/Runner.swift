@@ -22,6 +22,39 @@ private final class Locked<T> {
     func with<R>(_ body: (inout T) -> R) -> R { lock.lock(); defer { lock.unlock() }; return body(&value) }
 }
 
+extension MoleRunner {
+    /// A pipe holding `secret` and a newline, write end already closed; returns the read
+    /// end, close-on-exec and numbered 10 or higher so it is never `passwordFD` itself.
+    static func secretPipe(_ secret: AdminPassword) -> Int32? {
+        var fds: [Int32] = [-1, -1]
+        guard pipe(&fds) == 0 else { return nil }
+        let readFD = fcntl(fds[0], F_DUPFD_CLOEXEC, 10)
+        close(fds[0])
+        // Nothing is written unless the child's end exists.
+        guard readFD >= 0 else { close(fds[1]); return nil }
+        _ = fcntl(fds[1], F_SETFD, FD_CLOEXEC)
+        // A failed write returns EPIPE instead of killing the app with SIGPIPE.
+        _ = fcntl(fds[1], F_SETNOSIGPIPE, 1)
+        func writeAll(_ p: UnsafeRawPointer, _ n: Int) -> Bool {
+            var off = 0
+            while off < n {
+                let w = write(fds[1], p + off, n - off)
+                if w < 0 { if errno == EINTR { continue }; return false }
+                off += w
+            }
+            return true
+        }
+        let wrote = secret.withBytes { buf -> Bool in
+            guard let base = buf.baseAddress else { return false }
+            var nl: UInt8 = 0x0A
+            return writeAll(base, buf.count) && writeAll(&nl, 1)
+        } ?? false
+        close(fds[1])
+        guard wrote else { close(readFD); return nil }
+        return readFD
+    }
+}
+
 /// Cuts a byte stream into lines. A `\r` rewrite (a spinner redrawing its line)
 /// keeps only the text after the last one.
 public final class LineSplitter {
@@ -58,7 +91,10 @@ public final class LineSplitter {
 public final class MoleRunner {
     public let executable: String
     public var termGraceSeconds: Double = 5
-    private let state = Locked((pid: pid_t(0), cancelled: false, finished: false))
+    /// The fd a run's admin password arrives on in `mo` (`MOLE_SUDO_PASSWORD_FD`, lib/core/sudo.sh).
+    /// 3, 4, 7 and 9 are taken by Mole's own redirections.
+    public static let passwordFD: Int32 = 5
+    private let state = Locked((pid: pid_t(0), cancelled: false, finished: false, inRun: false))
 
     public init(executable: String) { self.executable = executable }
 
@@ -82,6 +118,29 @@ public final class MoleRunner {
             return st.pid > 0 && !st.finished
         }
         guard running else { return }
+        escalate()
+    }
+
+    /// True from the moment `run` starts until it returns.
+    public var isRunning: Bool { state.with { $0.inRun } }
+
+    /// Blocks until none of `runners` is inside `run`, or `timeout` passes; false on timeout.
+    public static func waitUntilStopped(_ runners: [MoleRunner], timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while runners.contains(where: { $0.isRunning }) {
+            if Date() >= deadline { return false }
+            usleep(50_000)
+        }
+        return true
+    }
+
+    /// SIGTERM to the whole group now, for the app's last moment (`applicationWillTerminate`).
+    public func terminateNow() {
+        state.with { $0.cancelled = true }
+        _ = signalGroup(SIGTERM)
+    }
+
+    private func escalate() {
         _ = signalGroup(SIGINT)
         let grace = termGraceSeconds
         DispatchQueue.global().asyncAfter(deadline: .now() + grace) { [self] in
@@ -98,21 +157,43 @@ public final class MoleRunner {
     /// stdout for the JSON document and passes none. Stdout is cut into lines only when
     /// `onStdoutLine` is set or `collectStdoutLines` asks for `stdoutLines`: a plan's JSON is
     /// many MB and nothing reads it by line. Both callbacks run on reader threads.
+    /// `secret`: the admin password, written once to a pipe whose read end the child gets on
+    /// `passwordFD` (named in `MOLE_SUDO_PASSWORD_FD`); the write end is closed before the
+    /// child starts and the read end right after, in this process. Without one, the variable
+    /// is removed from the child's environment. The secret never enters argv or the environment.
     public func run(arguments: [String], extraEnvironment: [String: String] = [:], timeout: TimeInterval? = nil,
                     onStderrLine: ((String) -> Void)? = nil, onStdoutLine: ((String) -> Void)? = nil,
-                    collectStdoutLines: Bool = false) -> RunResult {
-        if state.with({ $0.cancelled }) {
+                    collectStdoutLines: Bool = false, secret: AdminPassword? = nil) -> RunResult {
+        let proceed = state.with { st -> Bool in
+            guard !st.cancelled else { return false }
+            st.pid = 0; st.finished = false; st.inRun = true
+            return true
+        }
+        guard proceed else {
             var r = RunResult()
             r.cancelled = true
             r.exitCode = 130
             return r
         }
-        state.with { $0.pid = 0; $0.finished = false }
+        defer { state.with { $0.inRun = false } }
         var env = ProcessInfo.processInfo.environment
         env["MOLE_NO_COLOR"] = "1"
         env["NO_COLOR"] = "1"
         for (k, v) in extraEnvironment { env[k] = v }
+        env["MOLE_SUDO_PASSWORD_FD"] = nil
         var result = RunResult()
+
+        var secretReadFD: Int32 = -1
+        defer { if secretReadFD >= 0 { close(secretReadFD) } }
+        if let secret, secret.isSet {
+            guard let fd = MoleRunner.secretPipe(secret) else {
+                result.launchError = "Could not hand the admin password to \(executable)."
+                result.exitCode = 127
+                return result
+            }
+            secretReadFD = fd
+            env["MOLE_SUDO_PASSWORD_FD"] = String(MoleRunner.passwordFD)
+        }
 
         let outPipe = Pipe(), errPipe = Pipe()
         var fa: posix_spawn_file_actions_t? = nil
@@ -120,9 +201,12 @@ public final class MoleRunner {
         posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0)
         posix_spawn_file_actions_adddup2(&fa, outPipe.fileHandleForWriting.fileDescriptor, 1)
         posix_spawn_file_actions_adddup2(&fa, errPipe.fileHandleForWriting.fileDescriptor, 2)
+        if secretReadFD >= 0 { posix_spawn_file_actions_adddup2(&fa, secretReadFD, MoleRunner.passwordFD) }
         var attr: posix_spawnattr_t? = nil
         posix_spawnattr_init(&attr)
-        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETPGROUP))
+        // Only the fds named above reach the child: no other run's pipes, and no secret pipe
+        // another run is setting up at the same moment.
+        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT))
         posix_spawnattr_setpgroup(&attr, 0)
         defer { posix_spawn_file_actions_destroy(&fa); posix_spawnattr_destroy(&attr) }
 
@@ -134,13 +218,16 @@ public final class MoleRunner {
         let rc = posix_spawn(&pid, executable, &fa, &attr, argv, envp)
         try? outPipe.fileHandleForWriting.close()
         try? errPipe.fileHandleForWriting.close()
+        if secretReadFD >= 0 { close(secretReadFD); secretReadFD = -1 }
         guard rc == 0 else {
             result.launchError = "Cannot run \(executable): \(String(cString: strerror(rc)))"
             result.exitCode = 127
             return result
         }
         let timedOutFlag = Locked(false)
-        state.with { $0.pid = pid }
+        // A cancel that came after the start check but before the pid was known signalled
+        // nothing; send it now so no `mo` outlives a cancel (or the app's quit).
+        if state.with({ st -> Bool in st.pid = pid; return st.cancelled }) { escalate() }
         result.spawnedAt = Date()
         if let t = timeout {
             DispatchQueue.global().asyncAfter(deadline: .now() + t) { [self] in

@@ -329,3 +329,261 @@ EOF
         [[ "$hints" == "$expected" ]] || { echo "case=$case_spec hints=$hints $output"; return 1; }
     done
 }
+
+# Mole Review hands the admin password to `mo clean --apply` on an inherited
+# pipe named by MOLE_SUDO_PASSWORD_FD. Every case stubs sudo and osascript as
+# shell functions, so no real authentication runs.
+_sudo_fd_script() {
+    cat << 'SCRIPT'
+unset MOLE_TEST_MODE MOLE_TEST_NO_AUTH
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/core/sudo.sh"
+log="$BATS_TEST_TMPDIR/calls"
+: > "$log"
+sudo() {
+    case "$1" in
+        -n) return 1 ;;
+        -k) return 0 ;;
+        -S)
+            local got
+            IFS= read -r got
+            printf 'sudo-stdin:%s\n' "$got" >> "$log"
+            [[ "$got" == "${ACCEPT:-}" ]]
+            ;;
+        *) return 1 ;;
+    esac
+}
+osascript() {
+    echo osascript >> "$log"
+    printf '%s\n' "${DIALOG_ANSWER:-}"
+}
+_mole_sudo_tty_path() { :; }
+SCRIPT
+}
+
+@test "request_sudo_access takes the app's password from its fd once per process" {
+    # shellcheck disable=SC2016 # The inner bash expands these, not this one.
+    run env PROJECT_ROOT="$PROJECT_ROOT" BATS_TEST_TMPDIR="$BATS_TEST_TMPDIR" ACCEPT="s3cret sample" \
+        /bin/bash -c "$(_sudo_fd_script)"'
+        exec 5< <(printf "%s\n" "s3cret sample")
+        export MOLE_SUDO_PASSWORD_FD=5
+        set -x
+        rc1=0; request_sudo_access "Admin" || rc1=$?
+        rc2=0; request_sudo_access "Admin" || rc2=$?
+        set +x
+        [[ -e /dev/fd/5 ]] && echo "FD5=open" || echo "FD5=closed"
+        echo "ENV=${MOLE_SUDO_PASSWORD_FD:-unset} RC=$rc1,$rc2"
+        cat "$log" | sed "s/s3cret sample/SECRET/" > "$log.shown"
+        mv "$log.shown" "$log.out"
+    '
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"RC=0,0"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"FD5=closed"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"ENV=unset"* ]] || { echo "$output"; return 1; }
+    # The secret never shows in stdout or stderr, xtrace included.
+    [[ "$output" != *"s3cret"* ]] || { echo "$output"; return 1; }
+    [ "$(grep -c '^sudo-stdin:SECRET$' "$BATS_TEST_TMPDIR/calls.out")" -eq 2 ] || return 1
+    if grep -q osascript "$BATS_TEST_TMPDIR/calls.out"; then return 1; fi
+}
+
+@test "request_sudo_access falls back to the dialog when the password fd is missing, invalid or empty" {
+    local case_name
+    for case_name in unset letters notopen regularfile emptypipe; do
+        # shellcheck disable=SC2016 # The inner bash expands these, not this one.
+        run env PROJECT_ROOT="$PROJECT_ROOT" BATS_TEST_TMPDIR="$BATS_TEST_TMPDIR" ACCEPT="dialog-pw" \
+            DIALOG_ANSWER="dialog-pw" CASE="$case_name" /bin/bash -c "$(_sudo_fd_script)"'
+            case "$CASE" in
+                unset) unset MOLE_SUDO_PASSWORD_FD ;;
+                letters) export MOLE_SUDO_PASSWORD_FD=abc ;;
+                notopen) export MOLE_SUDO_PASSWORD_FD=77 ;;
+                regularfile)
+                    printf "file-pw\n" > "$BATS_TEST_TMPDIR/pw.txt"
+                    exec 5< "$BATS_TEST_TMPDIR/pw.txt"
+                    export MOLE_SUDO_PASSWORD_FD=5 ;;
+                emptypipe)
+                    exec 5< <(:)
+                    export MOLE_SUDO_PASSWORD_FD=5 ;;
+            esac
+            rc=0; request_sudo_access "Admin" || rc=$?
+            echo "RC=$rc"
+            cat "$log"
+        '
+        [ "$status" -eq 0 ] || { echo "$case_name: $output"; return 1; }
+        [[ "$output" == *"RC=0"* ]] || { echo "$case_name: $output"; return 1; }
+        [[ "$output" == *"osascript"* ]] || { echo "$case_name: $output"; return 1; }
+        [[ "$output" == *"sudo-stdin:dialog-pw"* ]] || { echo "$case_name: $output"; return 1; }
+        [[ "$output" != *"file-pw"* ]] || { echo "$case_name: $output"; return 1; }
+    done
+}
+
+@test "a rejected fd password fails without a dialog and is not tried again" {
+    # shellcheck disable=SC2016 # The inner bash expands these, not this one.
+    run env PROJECT_ROOT="$PROJECT_ROOT" BATS_TEST_TMPDIR="$BATS_TEST_TMPDIR" ACCEPT="right" \
+        DIALOG_ANSWER="right" /bin/bash -c "$(_sudo_fd_script)"'
+        exec 5< <(printf "wrong\n")
+        export MOLE_SUDO_PASSWORD_FD=5
+        rc1=0; request_sudo_access "Admin" || rc1=$?
+        rc2=0; ensure_sudo_session "Admin" || rc2=$?
+        echo "RC=$rc1,$rc2 TRIES=$(grep -c "^sudo-stdin:" "$log")"
+        grep -q osascript "$log" && echo "DIALOG=shown" || echo "DIALOG=none"
+    '
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"RC=1,1 TRIES=1"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"DIALOG=none"* ]]
+}
+
+@test "request_sudo_access prompts on a terminal and never authenticates with the fd password there" {
+    # shellcheck disable=SC2016 # The inner bash expands these, not this one.
+    run python3 -c 'import pty, sys; pty.spawn(sys.argv[1:])' /bin/bash -c '
+        unset MOLE_TEST_MODE MOLE_TEST_NO_AUTH
+        source "'"$PROJECT_ROOT"'/lib/core/common.sh"
+        source "'"$PROJECT_ROOT"'/lib/core/sudo.sh"
+        sudo() {
+            case "$1" in
+                -n) return 1 ;;
+                -k) return 0 ;;
+                -S) echo "FD-SUDO"; return 0 ;;
+                *) return 1 ;;
+            esac
+        }
+        is_clamshell_mode() { return 0; }
+        _request_password() { echo "TERMINAL-PROMPT"; return 0; }
+        safe_clear_lines() { :; }
+        _mole_touchid_hint() { :; }
+        exec 5< <(printf "pw\n")
+        export MOLE_SUDO_PASSWORD_FD=5
+        rc=0; request_sudo_access "Admin" || rc=$?
+        echo "RC=$rc"
+        [[ -e /dev/fd/5 ]] && echo "FD5=open" || echo "FD5=closed"
+        echo "ENV=${MOLE_SUDO_PASSWORD_FD:-unset}"
+    '
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"TERMINAL-PROMPT"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"RC=0"* ]] || { echo "$output"; return 1; }
+    # The fd is still taken off so no child inherits it; only the terminal authenticates.
+    [[ "$output" == *"FD5=closed"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"ENV=unset"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"FD-SUDO"* ]]
+}
+
+@test "test mode never reads the password fd or calls sudo" {
+    # shellcheck disable=SC2016 # The inner bash expands these, not this one.
+    run env PROJECT_ROOT="$PROJECT_ROOT" BATS_TEST_TMPDIR="$BATS_TEST_TMPDIR" ACCEPT="pw" \
+        /bin/bash -c "$(_sudo_fd_script)"'
+        export MOLE_TEST_NO_AUTH=1
+        exec 5< <(printf "pw\n")
+        export MOLE_SUDO_PASSWORD_FD=5
+        rc1=0; request_sudo_access "Admin" || rc1=$?
+        rc2=0; ensure_sudo_session "Admin" || rc2=$?
+        echo "RC=$rc1,$rc2 ENV=${MOLE_SUDO_PASSWORD_FD:-unset} CALLS=$(grep -c . "$log")"
+    '
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"RC=1,1 ENV=5 CALLS=0"* ]]
+}
+
+@test "stop_sudo_session drops the fd password copy" {
+    # shellcheck disable=SC2016 # The inner bash expands these, not this one.
+    run env PROJECT_ROOT="$PROJECT_ROOT" BATS_TEST_TMPDIR="$BATS_TEST_TMPDIR" ACCEPT="pw" \
+        /bin/bash -c "$(_sudo_fd_script)"'
+        _start_sudo_keepalive() { echo 1; }
+        _stop_sudo_keepalive() { :; }
+        exec 5< <(printf "pw\n")
+        export MOLE_SUDO_PASSWORD_FD=5
+        rc1=0; ensure_sudo_session "Admin" || rc1=$?
+        stop_sudo_session
+        rc2=0; request_sudo_access "Admin" || rc2=$?
+        echo "RC=$rc1,$rc2 COPY=${_MOLE_SUDO_FD_PASSWORD:-empty} TRIES=$(grep -c "^sudo-stdin:" "$log")"
+    '
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"RC=0,1 COPY=empty TRIES=1"* ]]
+}
+
+@test "an adopted sudo ticket still takes the password fd off before any child starts" {
+    # shellcheck disable=SC2016 # The inner bash expands these, not this one.
+    run env PROJECT_ROOT="$PROJECT_ROOT" BATS_TEST_TMPDIR="$BATS_TEST_TMPDIR" ACCEPT="s3cret sample" \
+        /bin/bash -c "$(_sudo_fd_script)"'
+        _start_sudo_keepalive() { echo 1; }
+        _stop_sudo_keepalive() { :; }
+        ticket=yes
+        sudo() {
+            case "$1" in
+                -n)
+                    echo "sudo -n fd5=$([[ -e /dev/fd/5 ]] && echo open || echo closed)" >> "$log"
+                    [[ "$ticket" == yes ]]
+                    ;;
+                -k) return 0 ;;
+                -S)
+                    local got
+                    IFS= read -r got
+                    printf "sudo-stdin:%s\n" "$got" >> "$log"
+                    [[ "$got" == "$ACCEPT" ]]
+                    ;;
+                *) return 1 ;;
+            esac
+        }
+        exec 5< <(printf "%s\n" "s3cret sample")
+        export MOLE_SUDO_PASSWORD_FD=5
+        rc1=0; adopt_sudo_session || rc1=$?
+        [[ -e /dev/fd/5 ]] && echo "FD5=open" || echo "FD5=closed"
+        echo "ENV=${MOLE_SUDO_PASSWORD_FD:-unset}"
+        rc2=0; request_sudo_access "Admin" || rc2=$?
+        ticket=no
+        rc3=0; request_sudo_access "Admin" || rc3=$?
+        echo "RC=$rc1,$rc2,$rc3"
+        sed "s/s3cret sample/SECRET/" "$log"
+    '
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"FD5=closed"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"ENV=unset"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"RC=0,0,0"* ]] || { echo "$output"; return 1; }
+    # Even the ticket probes ran without the fd, and the copy served the later request.
+    [[ "$output" != *"sudo -n fd5=open"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"sudo-stdin:SECRET"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"osascript"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"s3cret"* ]]
+}
+
+@test "loading Mole takes the password fd at once, a second load keeps the copy, an exported copy is ignored" {
+    local case_name
+    for case_name in handed forged; do
+        # shellcheck disable=SC2016 # The inner bash expands these, not this one.
+        run env PROJECT_ROOT="$PROJECT_ROOT" BATS_TEST_TMPDIR="$BATS_TEST_TMPDIR" CASE="$case_name" \
+            /bin/bash -c '
+            unset MOLE_TEST_MODE MOLE_TEST_NO_AUTH
+            log="$BATS_TEST_TMPDIR/calls"
+            : > "$log"
+            if [[ "$CASE" == handed ]]; then
+                exec 5< <(printf "s3cret sample\n")
+                export MOLE_SUDO_PASSWORD_FD=5
+            else
+                export _MOLE_SUDO_FD_STATE=have _MOLE_SUDO_FD_PASSWORD=forged-pw
+            fi
+            source "$PROJECT_ROOT/lib/core/common.sh"
+            [[ -e /dev/fd/5 ]] && echo "FD5=open" || echo "FD5=closed"
+            echo "ENV=${MOLE_SUDO_PASSWORD_FD:-unset}"
+            source "$PROJECT_ROOT/lib/core/sudo.sh"
+            sudo() {
+                case "$1" in
+                    -n) return 1 ;;
+                    -k) return 0 ;;
+                    -S) local got; IFS= read -r got; echo "sudo-stdin:$got" >> "$log"; [[ "$got" == "s3cret sample" ]] ;;
+                    *) return 1 ;;
+                esac
+            }
+            osascript() { echo osascript >> "$log"; printf "\n"; }
+            _mole_sudo_tty_path() { :; }
+            rc=0; request_sudo_access "Admin" || rc=$?
+            echo "RC=$rc"
+            sed "s/s3cret sample/SECRET/" "$log"
+        '
+        [ "$status" -eq 0 ] || { echo "$case_name: $output"; return 1; }
+        [[ "$output" == *"FD5=closed"* && "$output" == *"ENV=unset"* ]] || { echo "$case_name: $output"; return 1; }
+        [[ "$output" != *"s3cret"* ]] || { echo "$case_name: $output"; return 1; }
+        case "$case_name" in
+            handed) [[ "$output" == *"RC=0"* && "$output" == *"sudo-stdin:SECRET"* && "$output" != *"osascript"* ]] ||
+                { echo "$case_name: $output"; return 1; } ;;
+            forged) [[ "$output" != *"forged-pw"* && "$output" == *"osascript"* ]] ||
+                { echo "$case_name: $output"; return 1; } ;;
+        esac
+    done
+}

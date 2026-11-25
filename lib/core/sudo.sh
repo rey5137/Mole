@@ -117,6 +117,121 @@ _request_password() {
     return 1
 }
 
+# The password an app handed over on MOLE_SUDO_PASSWORD_FD, read once per
+# process: unread (fd not read yet), none (no usable password, so the normal
+# prompt applies), have (cached below), rejected (sudo refused it), cleared
+# (the session ended and the copy was dropped).
+# bin/clean.sh sources this file twice (directly and through common.sh), so a
+# second load keeps what the first one read; a value from the environment
+# (exported) is never trusted and starts over.
+if [[ -z "${_MOLE_SUDO_FD_STATE+x}" || "$(declare -p _MOLE_SUDO_FD_STATE 2> /dev/null)" == "declare -x"* ]]; then
+    unset _MOLE_SUDO_FD_STATE _MOLE_SUDO_FD_PASSWORD
+    _MOLE_SUDO_FD_STATE="unread"
+    _MOLE_SUDO_FD_PASSWORD=""
+fi
+
+# Prints the terminal to authenticate on, or nothing when there is none.
+_mole_sudo_tty_path() {
+    local tty_path="/dev/tty"
+    if [[ ! -r "$tty_path" || ! -w "$tty_path" ]]; then
+        tty_path=$(tty 2> /dev/null || echo "")
+        if [[ -z "$tty_path" || ! -r "$tty_path" || ! -w "$tty_path" ]]; then
+            tty_path=""
+        fi
+    fi
+    printf '%s' "$tty_path"
+}
+
+# True when no terminal can take a password: none at all, or a /dev/tty that
+# passes the permission test but cannot be opened (a child of an app has no
+# controlling terminal), or stdin is not a terminal.
+_mole_sudo_no_usable_tty() {
+    local tty_path="$1"
+    [[ -z "$tty_path" ]] && return 0
+    { : <> "$tty_path"; } 2> /dev/null || return 0
+    [[ -t 0 ]] || return 0
+    return 1
+}
+
+# True when an app offered a password on a pipe.
+mole_sudo_password_fd_offered() {
+    mole_sudo_take_password_fd
+    [[ "$_MOLE_SUDO_FD_STATE" == "have" ]] && return 0
+    [[ "$_MOLE_SUDO_FD_STATE" == "unread" && -n "${MOLE_SUDO_PASSWORD_FD:-}" ]]
+}
+
+# Takes the password off MOLE_SUDO_PASSWORD_FD into this process's memory,
+# closes the fd and unsets the variable, so no child Mole starts afterwards
+# (brew, xcrun, owner commands, workers, sudo itself) inherits either. Runs
+# when this file loads and again at every sudo entry point, whichever path
+# (an adopted ticket, NOPASSWD) the run takes; the copy waits for a later
+# request_sudo_access. Test mode never reads the fd. Always returns 0.
+mole_sudo_take_password_fd() {
+    [[ "$_MOLE_SUDO_FD_STATE" == "unread" && -n "${MOLE_SUDO_PASSWORD_FD:-}" ]] || return 0
+    [[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]] && return 0
+    local had_xtrace=false
+    if [[ $- == *x* ]]; then
+        had_xtrace=true
+        { set +x; } 2> /dev/null
+    fi
+    _mole_sudo_take_password_fd_quiet
+    [[ "$had_xtrace" == true ]] && set -x
+    return 0
+}
+
+_mole_sudo_take_password_fd_quiet() {
+    _MOLE_SUDO_FD_STATE="none"
+    local fd="${MOLE_SUDO_PASSWORD_FD:-}"
+    unset MOLE_SUDO_PASSWORD_FD
+    [[ "$fd" =~ ^[1-9][0-9]{0,2}$ && "$fd" -ge 3 && "$fd" -le 255 ]] || return 0
+    [[ -p "/dev/fd/$fd" ]] || return 0
+    local password=""
+    IFS= read -r -t 5 -u "$fd" password 2> /dev/null || true
+    eval "exec ${fd}<&-" 2> /dev/null || true
+    [[ -n "$password" ]] || return 0
+    _MOLE_SUDO_FD_PASSWORD="$password"
+    password=""
+    _MOLE_SUDO_FD_STATE="have"
+    return 0
+}
+
+# MOLE_SUDO_PASSWORD_FD names an inherited file descriptor, a pipe the app
+# (Mole Review) wrote the admin password to as one line and then closed. The
+# variable carries only the fd number, never the secret. The fd is read once,
+# closed so no later child inherits it, and the variable unset so a nested mo
+# does not try again. Used only when no terminal can take a password.
+# Returns 0 when sudo accepted the password, 1 when it refused it (now and on
+# every later call, without falling back to a dialog the app did not expect),
+# 2 when no password was offered (unset, invalid, not a pipe, or empty).
+_mole_sudo_auth_from_fd() {
+    local had_xtrace=false rc=0
+    if [[ $- == *x* ]]; then
+        had_xtrace=true
+        { set +x; } 2> /dev/null
+    fi
+    _mole_sudo_auth_from_fd_quiet || rc=$?
+    [[ "$had_xtrace" == true ]] && set -x
+    return "$rc"
+}
+
+_mole_sudo_auth_from_fd_quiet() {
+    [[ "$_MOLE_SUDO_FD_STATE" != "unread" ]] || _mole_sudo_take_password_fd_quiet
+
+    case "$_MOLE_SUDO_FD_STATE" in
+        rejected | cleared) return 1 ;;
+        have) ;;
+        *) return 2 ;;
+    esac
+
+    sudo -k 2> /dev/null
+    if printf '%s\n' "$_MOLE_SUDO_FD_PASSWORD" | sudo -S -p "" -v > /dev/null 2>&1; then
+        return 0
+    fi
+    _MOLE_SUDO_FD_PASSWORD=""
+    _MOLE_SUDO_FD_STATE="rejected"
+    return 1
+}
+
 request_sudo_access() {
     local prompt_msg="${1:-Admin access required}"
 
@@ -125,20 +240,27 @@ request_sudo_access() {
         return 1
     fi
 
+    mole_sudo_take_password_fd
+
     # Check if already have sudo access
     if sudo -n true 2> /dev/null; then
         return 0
     fi
 
     # Detect if running in TTY environment
-    local tty_path="/dev/tty"
+    local tty_path
+    tty_path=$(_mole_sudo_tty_path)
     local is_gui_mode=false
+    [[ -n "$tty_path" ]] || is_gui_mode=true
 
-    if [[ ! -r "$tty_path" || ! -w "$tty_path" ]]; then
-        tty_path=$(tty 2> /dev/null || echo "")
-        if [[ -z "$tty_path" || ! -r "$tty_path" || ! -w "$tty_path" ]]; then
-            is_gui_mode=true
-        fi
+    # A password handed over by an app comes first when no terminal can take
+    # one; with none offered, the prompts below run as before.
+    if [[ "$_MOLE_SUDO_FD_STATE" != "unread" || -n "${MOLE_SUDO_PASSWORD_FD:-}" ]] &&
+        _mole_sudo_no_usable_tty "$tty_path"; then
+        local fd_rc=0
+        _mole_sudo_auth_from_fd || fd_rc=$?
+        [[ $fd_rc -eq 0 ]] && return 0
+        [[ $fd_rc -eq 1 ]] && return 1
     fi
 
     # GUI mode: use osascript for password dialog
@@ -305,6 +427,7 @@ has_sudo_session() {
         return 1
     fi
 
+    mole_sudo_take_password_fd
     sudo -n true 2> /dev/null
 }
 
@@ -313,6 +436,8 @@ adopt_sudo_session() {
         MOLE_SUDO_ESTABLISHED="false"
         return 1
     fi
+
+    mole_sudo_take_password_fd
 
     if [[ "$MOLE_SUDO_ESTABLISHED" == "true" && -n "$MOLE_SUDO_KEEPALIVE_PID" ]]; then
         if has_sudo_session; then
@@ -439,4 +564,9 @@ stop_sudo_session() {
         MOLE_SUDO_KEEPALIVE_PID=""
     fi
     MOLE_SUDO_ESTABLISHED="false"
+    _MOLE_SUDO_FD_PASSWORD=""
+    [[ "$_MOLE_SUDO_FD_STATE" != "have" ]] || _MOLE_SUDO_FD_STATE="cleared"
 }
+
+# An app's password fd is taken as Mole loads, before anything can start a child.
+mole_sudo_take_password_fd

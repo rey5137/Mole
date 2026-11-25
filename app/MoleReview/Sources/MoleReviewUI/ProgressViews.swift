@@ -316,6 +316,11 @@ public struct SettingsView: View {
         "Using \(model.resolvedCommand). Leave empty to use $MOLE_PATH, the checkout's mole, or mo in Homebrew or ~/.local/bin."
     }
     private let accessNote = "Turn on Mole Review in System Settings, then reopen the app."
+    private var passwordNote: String {
+        if model.hasAdminPassword { return "Kept in memory for clean runs until you quit Mole Review." }
+        if model.adminSkipped { return "Skipped for this launch: cleans run without admin access." }
+        return "Not kept. Mole Review asks before the next clean."
+    }
 
     public var body: some View {
         if standIn {
@@ -333,6 +338,12 @@ public struct SettingsView: View {
                 }
                 Text(FullDiskAccess.why).font(.caption).foregroundStyle(.secondary)
                 Text(accessNote).font(.caption).foregroundStyle(.secondary)
+                Text("Admin password").font(.headline).padding(.top, 8)
+                HStack {
+                    Text(passwordNote)
+                    Spacer()
+                    Text("Forget admin password").modifier(ButtonLook()).disabled(!model.hasAdminPassword)
+                }
                 Spacer()
             }.padding(20).frame(width: 520)
         } else {
@@ -349,6 +360,13 @@ public struct SettingsView: View {
                     }
                     Text(FullDiskAccess.why).font(.caption).foregroundStyle(.secondary)
                     Text(accessNote).font(.caption).foregroundStyle(.secondary)
+                }
+                Section("Admin password") {
+                    HStack {
+                        Text(passwordNote)
+                        Spacer()
+                        Button("Forget admin password") { model.forgetAdminPassword() }.disabled(!model.hasAdminPassword)
+                    }
                 }
             }
             .formStyle(.grouped)

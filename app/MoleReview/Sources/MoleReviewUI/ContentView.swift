@@ -17,7 +17,9 @@ public struct ContentView: View {
             case .result: ResultView()
             }
         }
-        .sheet(isPresented: $model.showConfirm) { ConfirmSheet() }
+        .sheet(isPresented: $model.showConfirm) {
+            if model.askingPassword { PasswordSheet() } else { ConfirmSheet() }
+        }
     }
 }
 
@@ -361,7 +363,7 @@ public struct ConfirmSheet: View {
             HStack {
                 Spacer()
                 Button("Cancel", role: .cancel) { model.showConfirm = false }.keyboardShortcut(.cancelAction).modifier(ButtonLook())
-                Button(model.useTrash ? "Move \(bytes) to Trash" : "Delete \(bytes) permanently", role: .destructive) { model.apply() }
+                Button(model.useTrash ? "Move \(bytes) to Trash" : "Delete \(bytes) permanently", role: .destructive) { model.confirmApply() }
                     .keyboardShortcut(.defaultAction).modifier(ButtonLook(prominent: true, destructive: true))
                     .disabled(!model.canApply)
             }
@@ -369,6 +371,49 @@ public struct ConfirmSheet: View {
     }
 }
 
+/// The confirm sheet's second step before this launch's first clean (scans, purge and
+/// installer never ask). The field's text is dropped as soon as the model has the bytes.
+public struct PasswordSheet: View {
+    @EnvironmentObject var model: AppModel
+    @Environment(\.renderStandIn) private var standIn
+    @State private var password = ""
+    public init() {}
+
+    private func submit() {
+        guard !password.isEmpty else { return }
+        let typed = password
+        password = ""
+        model.submitAdminPassword(typed)
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Admin password").font(.title2)
+            Text("Mole needs your Mac password to clean system caches. It is kept in memory until you quit Mole Review.")
+                .fixedSize(horizontal: false, vertical: true)
+            if model.adminPasswordRejected {
+                Text("The last password was not accepted.").font(.callout).foregroundStyle(.orange)
+            }
+            if standIn {
+                Text("Password").foregroundStyle(.secondary).padding(6).frame(maxWidth: .infinity, alignment: .leading)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.2)))
+            } else {
+                SecureField("Password", text: $password).textFieldStyle(.roundedBorder).onSubmit(submit)
+            }
+            Text("Skip cleans without admin access: system caches are skipped and listed afterwards, and Mole Review does not ask again until you quit it.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Button("Skip") { password = ""; model.skipAdminPassword() }.modifier(ButtonLook())
+                Spacer()
+                Button("Cancel", role: .cancel) { password = ""; model.cancelAdminPassword() }
+                    .keyboardShortcut(.cancelAction).modifier(ButtonLook())
+                Button("Continue", action: submit)
+                    .keyboardShortcut(.defaultAction).modifier(ButtonLook(prominent: true))
+                    .disabled(password.isEmpty)
+            }
+        }.padding(20).frame(width: 460)
+    }
+}
 
 // MARK: stand-ins for the snapshot renderer
 //

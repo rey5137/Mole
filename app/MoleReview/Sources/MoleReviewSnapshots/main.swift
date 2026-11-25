@@ -186,8 +186,23 @@ let shots: [Shot] = perCommand(.clean, "clean") + perCommand(.purge, "purge") + 
     Shot(name: "error-other-plan") { d in
         wrapped(model(.idle, .purge) { $0.failure = ScanFailure(.planMismatch, MoleService.planMismatch("clean", .purge)) }, dark: d, ContentView())
     },
-    Shot(name: "settings", width: 520, height: 430) { d in
-        wrapped(model(.idle), dark: d, width: 520, height: 430, SettingsView())
+    Shot(name: "settings", width: 520, height: 500) { d in
+        wrapped(model(.idle), dark: d, width: 520, height: 500, SettingsView())
+    },
+    Shot(name: "settings-password-kept", width: 520, height: 500) { d in
+        wrapped(model(.idle) { $0.submitAdminPassword("sample-password") }, dark: d, width: 520, height: 500, SettingsView())
+    },
+    Shot(name: "password-sheet") { d in
+        wrapped(model(.review) { reviewState($0); $0.askingPassword = true }, dark: d, PasswordSheet().background(dark(d)))
+    },
+    Shot(name: "password-sheet-rejected") { d in
+        wrapped(model(.review) { reviewState($0); $0.askingPassword = true; $0.adminPasswordRejected = true }, dark: d,
+                PasswordSheet().background(dark(d)))
+    },
+    Shot(name: "clean-result-password-rejected") { d in
+        wrapped(model(.result) {
+            var r = resultOf(.clean); r.notes.append(AppModel.passwordRejectedNote); $0.result = r; feed($0, applyClean)
+        }, dark: d, ContentView())
     },
 ]
 
@@ -220,6 +235,45 @@ let shots: [Shot] = perCommand(.clean, "clean") + perCommand(.purge, "purge") + 
     return failed
 }
 
-let failed = MainActor.assumeIsolated { render() }
+/// The quit confirm is an NSAlert (it must work with the window already closing), which
+/// ImageRenderer cannot draw. Its content view is drawn straight into a bitmap over the
+/// window background: `cacheDisplay` fills the bitmap opaque white under the glass
+/// backdrop. Headless, the alert shows a folder icon where the app shows its own.
+@MainActor func renderQuitAlert() -> Int {
+    var failed = 0
+    for dark in [false, true] {
+        let file = "quit-confirm-\(dark ? "dark" : "light").png"
+        guard let look = NSAppearance(named: dark ? .darkAqua : .aqua) else { failed += 1; continue }
+        NSApp.appearance = look
+        defer { NSApp.appearance = nil }
+        let alert = AppDelegate.quitAlert(.clean)
+        alert.window.appearance = look
+        alert.layout()
+        guard let view = alert.window.contentView,
+              let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(view.bounds.width), pixelsHigh: Int(view.bounds.height),
+                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                         colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
+              let ctx = NSGraphicsContext(bitmapImageRep: rep) else {
+            print("FAIL \(file): no image"); failed += 1; continue
+        }
+        rep.size = view.bounds.size
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = ctx
+        look.performAsCurrentDrawingAppearance {
+            NSColor.windowBackgroundColor.setFill()
+            view.bounds.fill()
+            view.displayIgnoringOpacity(view.bounds, in: ctx)
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        guard let png = rep.representation(using: .png, properties: [:]) else { print("FAIL \(file): no PNG"); failed += 1; continue }
+        do { try png.write(to: outDir.appendingPathComponent(file)) } catch {
+            print("FAIL \(file): cannot write PNG: \(error.localizedDescription)"); failed += 1; continue
+        }
+        print("ok   \(file) \(rep.pixelsWide)x\(rep.pixelsHigh)")
+    }
+    return failed
+}
+
+let failed = MainActor.assumeIsolated { render() + renderQuitAlert() }
 if failed > 0 { print("\(failed) snapshot(s) failed"); exit(1) }
 print("all snapshots rendered")

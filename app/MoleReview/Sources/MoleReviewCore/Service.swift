@@ -135,9 +135,12 @@ public struct ApplyResult {
     public var failureNote: String?
     /// Things the result view must say: an ambiguous run, unavailable skip reasons.
     public var notes: [String]
-    public init(exitCode: Int32, session: HistorySession?, skipped: [SkippedGroup], failureNote: String?, notes: [String] = []) {
+    /// Mole refused the admin password it was handed (`MoleService.authenticationFailed`).
+    public var authenticationFailed: Bool
+    public init(exitCode: Int32, session: HistorySession?, skipped: [SkippedGroup], failureNote: String?, notes: [String] = [],
+                authenticationFailed: Bool = false) {
         self.exitCode = exitCode; self.session = session; self.skipped = skipped
-        self.failureNote = failureNote; self.notes = notes
+        self.failureNote = failureNote; self.notes = notes; self.authenticationFailed = authenticationFailed
     }
 }
 
@@ -145,6 +148,13 @@ extension MoleService {
     public static let ambiguousRunNote = ambiguousRunNote(.clean)
     public static func ambiguousRunNote(_ command: MoleCommand) -> String {
         "Couldn't tell this run apart from another mo \(command.rawValue), so no totals are shown."
+    }
+
+    /// Mole's clean gate prints this line when sudo refused the password (bin/clean.sh,
+    /// `prompt_for_system_clean` and the non-interactive gate).
+    public static let authenticationFailedLine = "Authentication failed, continuing with user-level cleanup"
+    public static func authenticationFailed(_ lines: [String]) -> Bool {
+        lines.contains { $0.contains(authenticationFailedLine) }
     }
 
     /// Runs `--apply` (never retried), then reads what happened. `--apply` prints its
@@ -155,17 +165,23 @@ extension MoleService {
     /// before it exited. None or several shows a note instead of a guess, with skip
     /// reasons from the run's own output. With a session, its `run_id` selects the rows
     /// of the operations log named by `history --json`.
+    /// `secret` goes to the apply run only (on a pipe, see `MoleRunner.run`), never to the
+    /// `history --json` read after it. That read runs on `historyRunner` when given, so the
+    /// caller can cancel it too (quitting must leave no `mo` behind).
     public static func runApply(_ command: MoleCommand = .clean, runner: MoleRunner, planId: String, selectFile: String,
                                 trash: Bool, planSkipped: [SkippedEntry], extraEnvironment: [String: String] = [:],
+                                secret: AdminPassword? = nil, historyRunner: MoleRunner? = nil,
                                 onStderrLine: ((String) -> Void)? = nil, onStdoutLine: ((String) -> Void)? = nil) -> ApplyResult {
         let res = runner.run(arguments: applyArguments(command, planId: planId, selectFile: selectFile, trash: trash),
                              extraEnvironment: extraEnvironment, onStderrLine: onStderrLine, onStdoutLine: onStdoutLine,
-                             collectStdoutLines: true)
+                             collectStdoutLines: true, secret: secret)
+        let authFailed = authenticationFailed(res.stdoutLines + res.stderrLines)
         if res.spawnedAt == nil {
             let why = res.launchError ?? "Cancelled before cleaning started; nothing was cleaned."
-            return ApplyResult(exitCode: res.exitCode, session: nil, skipped: [], failureNote: why)
+            return ApplyResult(exitCode: res.exitCode, session: nil, skipped: [], failureNote: why,
+                               authenticationFailed: authFailed)
         }
-        let hist = MoleRunner(executable: runner.executable).run(arguments: ["history", "--json"],
+        let hist = (historyRunner ?? MoleRunner(executable: runner.executable)).run(arguments: ["history", "--json"],
                                                                   extraEnvironment: extraEnvironment, timeout: 30)
         let spawnedAt = res.spawnedAt!, exitedAt = res.exitedAt ?? Date()
         var notes: [String] = []
@@ -200,7 +216,8 @@ extension MoleService {
             groups = fromOutput
         }
         let note = res.launchError ?? (res.cancelled ? "Cancelled; some items may already be cleaned." : nil)
-        return ApplyResult(exitCode: res.exitCode, session: session, skipped: groups, failureNote: note, notes: notes)
+        return ApplyResult(exitCode: res.exitCode, session: session, skipped: groups, failureNote: note, notes: notes,
+                           authenticationFailed: authFailed)
     }
 }
 

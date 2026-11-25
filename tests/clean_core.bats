@@ -1113,6 +1113,76 @@ SCRIPT
     [[ "$output" == *"MOLE_SUDO_KEEPALIVE_PID=keepalive-pid"* ]]
 }
 
+@test "non-interactive mo clean authenticates with a password an app hands over on its fd" {
+    local answer
+    for answer in right wrong none ticket; do
+        run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=0 \
+            ANSWER="$answer" /bin/bash --noprofile --norc << 'SCRIPT'
+set -euo pipefail
+TRACE="$HOME/sudo-fd.log"
+> "$TRACE"
+source "$PROJECT_ROOT/bin/clean.sh"
+DRY_RUN=false
+EXTERNAL_VOLUME_TARGET=""
+sudo() {
+    case "${1:-}" in
+        -S)
+            local got
+            IFS= read -r got
+            printf 'sudo -S\n' >> "$TRACE"
+            [[ "$got" == "right" ]]
+            ;;
+        -k) return 0 ;;
+        -n)
+            printf 'sudo %s fd5=%s\n' "$*" "$([[ -e /dev/fd/5 ]] && echo open || echo closed)" >> "$TRACE"
+            [[ "$ANSWER" == ticket ]]
+            ;;
+        *) printf 'sudo %s\n' "$*" >> "$TRACE"; return 1 ;;
+    esac
+}
+osascript() { printf 'osascript\n' >> "$TRACE"; }
+_start_sudo_keepalive() { echo "keepalive-pid"; }
+_stop_sudo_keepalive() { :; }
+if [[ "$ANSWER" != none ]]; then
+    exec 5< <(printf '%s\n' "$ANSWER")
+    export MOLE_SUDO_PASSWORD_FD=5
+fi
+start_cleanup
+cat "$TRACE"
+printf 'SYSTEM_CLEAN=%s\n' "$SYSTEM_CLEAN"
+printf 'FD5=%s ENV=%s\n' "$([[ -e /dev/fd/5 ]] && echo open || echo closed)" "${MOLE_SUDO_PASSWORD_FD:-unset}"
+SCRIPT
+        [ "$status" -eq 0 ] || { echo "$answer: $output"; return 1; }
+        [[ "$output" != *"osascript"* ]] || { echo "$answer: $output"; return 1; }
+        # Whatever path the gate takes, the fd is gone before anything runs.
+        [[ "$output" == *"FD5=closed ENV=unset"* ]] || { echo "$answer: $output"; return 1; }
+        [[ "$output" != *"fd5=open"* ]] || { echo "$answer: $output"; return 1; }
+        case "$answer" in
+            right)
+                [[ "$output" == *"sudo -S"* ]] || { echo "$answer: $output"; return 1; }
+                [[ "$output" == *"admin access granted"* ]] || { echo "$answer: $output"; return 1; }
+                [[ "$output" == *"SYSTEM_CLEAN=true"* ]] || { echo "$answer: $output"; return 1; }
+                ;;
+            wrong)
+                [[ "$output" == *"Authentication failed, continuing with user-level cleanup"* ]] || { echo "$answer: $output"; return 1; }
+                [[ "$output" == *"SYSTEM_CLEAN=false"* ]] || { echo "$answer: $output"; return 1; }
+                ;;
+            none)
+                # No password offered: nothing asks, system caches are skipped as before.
+                [[ "$output" != *"sudo -S"* ]] || { echo "$answer: $output"; return 1; }
+                [[ "$output" == *"System-level cleanup skipped, requires sudo"* ]] || { echo "$answer: $output"; return 1; }
+                [[ "$output" == *"SYSTEM_CLEAN=false"* ]] || { echo "$answer: $output"; return 1; }
+                ;;
+            ticket)
+                # A ticket already there (or NOPASSWD): adopted, the password never used.
+                [[ "$output" == *"sudo session active"* ]] || { echo "$answer: $output"; return 1; }
+                [[ "$output" != *"sudo -S"* ]] || { echo "$answer: $output"; return 1; }
+                [[ "$output" == *"SYSTEM_CLEAN=true"* ]] || { echo "$answer: $output"; return 1; }
+                ;;
+        esac
+    done
+}
+
 @test "mo clean emits OSC 7501 at lifecycle transitions only on terminal stderr" {
     run python3 "$PROJECT_ROOT/tests/clean_program_status_pty.py"
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }

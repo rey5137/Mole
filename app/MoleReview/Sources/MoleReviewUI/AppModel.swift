@@ -84,6 +84,10 @@ public final class AppModel: ObservableObject {
     public func refreshFullDiskAccess() { fullDiskAccess = FullDiskAccess.status() }
 
     private var runners: [MoleCommand: MoleRunner] = [:]
+    /// The `history --json` read each apply makes after it, kept apart from `runners` so the
+    /// tab's Cancel still lets it read what was done; quitting stops it too.
+    private var historyRunners: [MoleCommand: MoleRunner] = [:]
+    private var allRunners: [MoleRunner] { Array(runners.values) + Array(historyRunners.values) }
     private var batchers: [MoleCommand: LineBatcher] = [:]
     private var ticker: Timer?
 
@@ -189,14 +193,88 @@ public final class AppModel: ObservableObject {
 
     public func cancel() { runners[command]?.cancel() }
 
+    /// A scan, version check or apply is still running in some tab. An apply counts from the
+    /// moment it starts until its result is in, gaps between its two `mo` runs included.
+    public var hasRunningWork: Bool { applyingCommand != nil || allRunners.contains { $0.isRunning } }
+
+    /// Cancels every tab's run, an apply's history read included (the runner's INT, TERM, KILL
+    /// ladder; a runner not started yet never starts), and returns the runners, so quitting
+    /// can wait for them to stop.
+    @discardableResult
+    public func stopAllRuns() -> [MoleRunner] {
+        let all = allRunners
+        all.forEach { $0.cancel() }
+        return all
+    }
+
+    /// Last resort as the app exits: SIGTERM to every group still running.
+    public func terminateAllRuns() { allRunners.forEach { $0.terminateNow() } }
+
+    // MARK: admin password
+
+    /// The admin password for this launch, in memory only (see `AdminPassword`). Only clean
+    /// applies get it: purge and installer never use sudo, and scans never get it.
+    public let adminPassword = AdminPassword()
+    /// Mirrors `adminPassword.isSet` for views.
+    @Published public private(set) var hasAdminPassword = false
+    /// Skip in the password sheet: clean applies run without admin access, and nothing asks
+    /// again, until the app quits.
+    @Published public private(set) var adminSkipped = false
+    /// The confirm sheet shows the password step instead (one sheet, so no second sheet races the first).
+    @Published public var askingPassword = false
+    /// Mole refused the last password; the sheet says so when it asks again.
+    @Published public var adminPasswordRejected = false
+
+    public static let passwordRejectedNote =
+        "Your Mac password was not accepted, so system caches were skipped. Mole Review asks again before the next clean."
+
+    /// A clean apply asks for the password first, once per launch.
+    public func needsAdminPassword(_ cmd: MoleCommand) -> Bool { cmd == .clean && !hasAdminPassword && !adminSkipped }
+
+    /// The confirm sheet's run button: the password step when this launch has none yet, else the apply.
+    public func confirmApply() {
+        if needsAdminPassword(command) { askingPassword = true } else { apply() }
+    }
+
+    /// Continue in the password sheet: keeps the password and applies. False (nothing kept,
+    /// nothing run) for an empty one.
+    @discardableResult
+    public func submitAdminPassword(_ password: String) -> Bool {
+        guard adminPassword.set(password) else { return false }
+        hasAdminPassword = true
+        adminPasswordRejected = false
+        apply()
+        return true
+    }
+
+    /// Cancel in the password sheet: back to the review, nothing applied, nothing skipped.
+    public func cancelAdminPassword() {
+        askingPassword = false
+        tab.showConfirm = false
+    }
+
+    /// Skip in the password sheet: applies without admin access and stops asking for this launch.
+    public func skipAdminPassword() {
+        adminSkipped = true
+        apply()
+    }
+
+    /// Settings' "Forget admin password": the bytes are zeroed and the next clean asks again.
+    public func forgetAdminPassword() {
+        adminPassword.clear()
+        hasAdminPassword = false
+    }
+
     public func apply() {
         now = Date()   // expiry is checked against the clock, never a stale tick
+        askingPassword = false
         guard canApply, var state = review, state.plan.command == command.rawValue else { return }
         let cmd = command
         let path = resolvedCommand
         let trash = useTrash
         let planSkipped = state.plan.skipped
         let planId = state.plan.planId
+        let secret = cmd == .clean ? adminPassword : nil
         state.searchText = ""
         let file: URL
         do { file = try state.writeSelectionFile() } catch {
@@ -210,21 +288,31 @@ public final class AppModel: ObservableObject {
         startTicker()
         let r = MoleRunner(executable: path)
         runners[cmd] = r
+        let history = MoleRunner(executable: path)
+        historyRunners[cmd] = history
         let batcher = makeBatcher(cmd)
         DispatchQueue.global().async { [me = self] in
             // An apply prints its progress on stdout (and any error on stderr); both feed the log.
             let out = MoleService.runApply(cmd, runner: r, planId: planId, selectFile: file.path, trash: trash,
-                                           planSkipped: planSkipped, onStderrLine: { batcher.add($0) },
+                                           planSkipped: planSkipped, secret: secret, historyRunner: history,
+                                           onStderrLine: { batcher.add($0) },
                                            onStdoutLine: { batcher.add($0) })
             try? FileManager.default.removeItem(at: file)
             Task { @MainActor [out] in me.finishApply(cmd, out) }
         }
     }
 
-    private func finishApply(_ cmd: MoleCommand, _ r: ApplyResult) {
+    private func finishApply(_ cmd: MoleCommand, _ result: ApplyResult) {
         flush(cmd)
         batchers[cmd] = nil
         runners[cmd] = nil
+        historyRunners[cmd] = nil
+        var r = result
+        if r.authenticationFailed {
+            forgetAdminPassword()
+            adminPasswordRejected = true
+            r.notes.append(Self.passwordRejectedNote)
+        }
         tabs[cmd]!.result = r; tabs[cmd]!.phase = .result
         stopTicker()
     }

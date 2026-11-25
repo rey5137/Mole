@@ -1761,6 +1761,18 @@ start_cleanup() {
         if adopt_sudo_session; then
             SYSTEM_CLEAN=true
             echo "  ${ICON_LIST} System-level cleanup enabled, sudo session active"
+        elif mole_sudo_password_fd_offered; then
+            # An app (Mole Review) handed the password over a pipe: authenticate
+            # with it instead of skipping. With no password offered nothing asks.
+            mole_report_program_status blocked auth
+            if ensure_sudo_session "System cleanup requires admin access"; then
+                SYSTEM_CLEAN=true
+                echo "  ${ICON_LIST} System-level cleanup enabled, admin access granted"
+            else
+                SYSTEM_CLEAN=false
+                echo -e "  ${ICON_LIST} ${YELLOW}Authentication failed${NC}, continuing with user-level cleanup"
+            fi
+            mole_report_program_status working
         else
             SYSTEM_CLEAN=false
             echo "  ${ICON_LIST} System-level cleanup skipped, requires sudo"
