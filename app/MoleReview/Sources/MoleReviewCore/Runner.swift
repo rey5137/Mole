@@ -30,9 +30,12 @@ public final class MoleRunner {
 
     public init(executable: String) { self.executable = executable }
 
-    private func signalGroup(_ sig: Int32) -> Bool {
+    /// `only` limits the signal to that run: a timeout armed by an earlier run of this
+    /// runner (the `--version` check before a scan) must not reach a later run.
+    private func signalGroup(_ sig: Int32, only: pid_t? = nil) -> Bool {
         state.with { st in
             guard st.pid > 0, !st.finished else { return false }
+            if let only, st.pid != only { return false }
             return killpg(st.pid, sig) == 0
         }
     }
@@ -104,9 +107,9 @@ public final class MoleRunner {
         result.spawnedAt = Date()
         if let t = timeout {
             DispatchQueue.global().asyncAfter(deadline: .now() + t) { [self] in
-                if signalGroup(SIGTERM) {
+                if signalGroup(SIGTERM, only: pid) {
                     timedOutFlag.with { $0 = true }
-                    DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) { [self] in _ = signalGroup(SIGKILL) }
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) { [self] in _ = signalGroup(SIGKILL, only: pid) }
                 }
             }
         }

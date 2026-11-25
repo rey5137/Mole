@@ -23,6 +23,12 @@ let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("mol
 try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
 defer { try? FileManager.default.removeItem(at: scratch) }
 
+check("a timeout armed by an earlier run of a runner never stops its next run (version check, then scan)") {
+    let r = MoleRunner(executable: "/bin/sleep")
+    let first = r.run(arguments: ["0"], timeout: 1)
+    let second = r.run(arguments: ["3"])
+    return first.exitCode == 0 && second.exitCode == 0 && !second.timedOut
+}
 check("decode sample plan") {
     let p = try plan("plan-sample.json")
     return p.schema == 1 && !p.sections.isEmpty && p.planId.count > 4 && p.expiresAt > p.createdAt
