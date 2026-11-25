@@ -709,6 +709,45 @@ SCRIPT
     [[ "$output" == *"OUTSIDE_RC=1"* && "$output" == *"DONE"* ]]
 }
 
+@test "S9 reviewed plan index preserves literal paths and fails closed on reload" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 \
+        /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+first="$HOME/space [*] _ café"
+second="$HOME/space [*] _ cafe"
+third="$HOME/line
+break"
+mkdir -p "$first" "$second" "$third"
+first_id=$(/usr/bin/stat -f %d:%i "$first")
+second_id=$(/usr/bin/stat -f %d:%i "$second")
+third_id=$(/usr/bin/stat -f %d:%i "$third")
+MOLE_APPLY_PLAN="$HOME/one.plan"
+printf 'P\0%s\0%s\0\0P\0%s\0wrong\0\0P\0%s\0%s\0\0P\0%s\0%s\0\0END\0' \
+    "$first" "$first_id" "$first" "$second" "$second_id" "$third" "$third_id" > "$MOLE_APPLY_PLAN"
+# A caller's environment cannot inject an identity into the internal index.
+_mole_apply_plan_key "$first"
+printf -v "$_MOLE_APPLY_PLAN_KEY" '%s' "$second_id"
+export "$_MOLE_APPLY_PLAN_KEY"
+for path in "$first" "$second" "$third"; do
+    mole_apply_plan_allows "$path" || exit 1
+    [[ "$_MOLE_APPLY_PLAN_MATCHED_SELF" == true ]] || exit 1
+done
+MOLE_APPLY_PLAN="$HOME/two.plan"
+printf 'P\0%s\0%s\0\0END\0' "$second" "$second_id" > "$MOLE_APPLY_PLAN"
+mole_apply_plan_allows "$second" || exit 1
+if mole_apply_plan_allows "$first"; then exit 1; fi
+[[ "$_MOLE_APPLY_PLAN_REASON" == 'not in reviewed plan' ]] || exit 1
+MOLE_APPLY_PLAN="$HOME/truncated.plan"
+printf 'P\0%s\0%s\0\0' "$first" "$first_id" > "$MOLE_APPLY_PLAN"
+if mole_apply_plan_allows "$first"; then exit 1; fi
+[[ "$_MOLE_APPLY_PLAN_REASON" == 'reviewed plan unavailable' ]] || exit 1
+printf 'literal paths, duplicate, reload and truncation checked\n'
+SCRIPT
+    [ "$status" -eq 0 ] || { printf '%s\n' "$output"; return 1; }
+    [[ "$output" == *'literal paths, duplicate, reload and truncation checked'* ]]
+}
+
 @test "a reviewed plan refuses a kept root replaced since review and every path when its file is gone" {
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 PRELUDE="$PLAN_FUNNEL_PRELUDE" \
         /bin/bash --noprofile --norc << 'SCRIPT'

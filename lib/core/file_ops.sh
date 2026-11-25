@@ -1552,7 +1552,6 @@ _mole_user_sink_refuses_on_ownership() {
 # inherited value is honored; a missing, foreign or truncated file refuses
 # every path. Paths holding the two separator bytes are never kept.
 _MOLE_APPLY_PLAN_LOADED=""
-_MOLE_APPLY_PLAN_ROOTS=""
 _MOLE_APPLY_PLAN_DESELECTED=""
 _MOLE_APPLY_PLAN_COMMANDS=""
 _MOLE_APPLY_PLAN_REASON=""
@@ -1561,10 +1560,28 @@ _MOLE_APPLY_PLAN_MATCHED_ID=""
 _MOLE_APPLY_PLAN_MATCHED_SELF=false
 # Kept roots read unchanged during the open mole_delete batch.
 _MOLE_APPLY_PLAN_BATCH_ROOTS=""
+_MOLE_APPLY_PLAN_KEY=""
 declare -a _MOLE_APPLY_PLAN_COMMAND_KEYS=()
 declare -a _MOLE_APPLY_PLAN_COMMAND_TEXTS=()
 readonly _MOLE_APPLY_PLAN_RS=$'\x1f'
 readonly _MOLE_APPLY_PLAN_FS=$'\x1e'
+
+# Kept paths are indexed one variable per path, the name holding every path
+# byte in hex (Bash 3.2 has no associative arrays), so lookup is literal,
+# different paths cannot collide, and its cost does not depend on the plan's
+# size. The joined string this replaced took `${roots#*"$rs$path$fs"}`, which
+# Bash matches against every prefix in turn: its cost grew with the square of
+# the item's offset, and an apply over a 2,400-item section slowed from 0.3 s
+# to 16 s an item.
+_mole_apply_plan_key() {
+    local LC_ALL=C path="$1" byte hex i
+    _MOLE_APPLY_PLAN_KEY="_MOLE_APPLY_PLAN_ENTRY_"
+    for ((i = 0; i < ${#path}; i++)); do
+        printf -v byte '%d' "'${path:i:1}"
+        printf -v hex '%02x' "$((byte & 255))"
+        _MOLE_APPLY_PLAN_KEY+="$hex"
+    done
+}
 
 # The approved-items file holds NUL-separated records of four fields, ended by
 # END: `P path devino ""` for a kept path, `D path "" ""` for an unticked one,
@@ -1573,9 +1590,14 @@ _mole_apply_plan_load() {
     local file="${MOLE_APPLY_PLAN:-}"
     [[ -n "$file" ]] || return 1
     [[ "$_MOLE_APPLY_PLAN_LOADED" == "$file" ]] && return 0
+    # Clear both the previous index and any inherited variable with this
+    # prefix. An environment value must never stand in for a reviewed record.
+    local index_key
+    while IFS= read -r index_key; do
+        unset "$index_key"
+    done < <(compgen -A variable _MOLE_APPLY_PLAN_ENTRY_)
     _MOLE_APPLY_PLAN_LOADED=""
     _MOLE_APPLY_PLAN_LOAD_ERROR="reviewed plan unavailable"
-    _MOLE_APPLY_PLAN_ROOTS=""
     _MOLE_APPLY_PLAN_DESELECTED=""
     _MOLE_APPLY_PLAN_COMMANDS=""
     _MOLE_APPLY_PLAN_COMMAND_KEYS=()
@@ -1583,7 +1605,7 @@ _mole_apply_plan_load() {
     [[ -f "$file" && ! -L "$file" && -O "$file" && -r "$file" ]] || return 1
 
     local rs="$_MOLE_APPLY_PLAN_RS" fs="$_MOLE_APPLY_PLAN_FS"
-    local kind first second third roots="" deselected="" commands="" complete=false
+    local kind first second third deselected="" commands="" complete=false
     local -a command_keys=() command_texts=()
     while IFS= read -r -d '' kind; do
         if [[ "$kind" == "END" ]]; then
@@ -1603,7 +1625,12 @@ _mole_apply_plan_load() {
             continue
         fi
         case "$kind" in
-            P) roots+="$rs$first$fs$second$rs" ;;
+            P)
+                _mole_apply_plan_key "$first"
+                if ! declare -p "$_MOLE_APPLY_PLAN_KEY" > /dev/null 2>&1; then
+                    printf -v "$_MOLE_APPLY_PLAN_KEY" '%s' "$second"
+                fi
+                ;;
             D) deselected+="$rs$first$rs" ;;
             C)
                 commands+="$rs$first$fs$second$rs"
@@ -1615,7 +1642,6 @@ _mole_apply_plan_load() {
     done < "$file"
     [[ "$complete" == "true" ]] || return 1
 
-    _MOLE_APPLY_PLAN_ROOTS="$roots"
     _MOLE_APPLY_PLAN_DESELECTED="$deselected"
     _MOLE_APPLY_PLAN_COMMANDS="$commands"
     if [[ ${#command_keys[@]} -gt 0 ]]; then
@@ -1663,9 +1689,9 @@ mole_apply_plan_allows() {
             _MOLE_APPLY_PLAN_REASON="not in reviewed plan"
             return 1
         fi
-        if [[ "$_MOLE_APPLY_PLAN_ROOTS" == *"$rs$candidate$fs"* ]]; then
-            local planned_identity="${_MOLE_APPLY_PLAN_ROOTS#*"$rs$candidate$fs"}"
-            planned_identity="${planned_identity%%"$rs"*}"
+        _mole_apply_plan_key "$candidate"
+        if declare -p "$_MOLE_APPLY_PLAN_KEY" > /dev/null 2>&1; then
+            local planned_identity="${!_MOLE_APPLY_PLAN_KEY}"
             # Within one mole_delete batch (mole_delete_batch_begin) a kept
             # root read unchanged answers again: it is a folder, and each path
             # of the batch is bound to the dev:inode its caller read before

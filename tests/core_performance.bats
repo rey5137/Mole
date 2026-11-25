@@ -17,6 +17,40 @@ setup() {
     source "$PROJECT_ROOT/lib/core/base.sh"
 }
 
+@test "S9 reviewed plan gate scales for many kept section items" {
+    run python3 - "$PROJECT_ROOT" "$TEST_DATA_DIR" <<'PY'
+import os, subprocess, sys, time
+root, fixture = sys.argv[1:]
+script = r'''
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/file_ops.sh"
+mole_deletion_identity() { printf '123:456:1\n'; }
+_mole_apply_plan_load
+for ((i=0; i<COUNT; i++)); do
+    printf -v path '/Users/sample/Library/Containers/com.apple.geod/Data/tmp/file%05d' "$i"
+    mole_apply_plan_allows "$path"
+    [[ "$_MOLE_APPLY_PLAN_MATCHED_ID" == '123:456' ]] || exit 1
+done
+'''
+times = []
+for count in (80, 160):
+    plan = os.path.join(fixture, 'approved-%d' % count)
+    with open(plan, 'wb') as f:
+        for i in range(count):
+            path = '/Users/sample/Library/Containers/com.apple.geod/Data/tmp/file%05d' % i
+            f.write(('P\0%s\0%s\0\0' % (path, '123:456')).encode())
+        f.write(b'END\0')
+    env = dict(os.environ, PROJECT_ROOT=root, MOLE_APPLY_PLAN=plan, COUNT=str(count), HOME=fixture)
+    start = time.monotonic()
+    subprocess.run(['/bin/bash', '--noprofile', '--norc', '-c', script], env=env, check=True, timeout=40)
+    times.append(time.monotonic() - start)
+print('80=%.3fs 160=%.3fs ratio=%.2f' % (times[0], times[1], times[1] / times[0]))
+assert times[1] / times[0] < 3.2
+PY
+    printf '%s\n' "$output"
+    [ "$status" -eq 0 ]
+}
+
 @test "Perl timeout backend backs off short polls and preserves command status" {
     [[ -x /usr/bin/perl ]] || skip "Perl fallback unavailable"
     run /bin/bash --noprofile --norc <<'EOF'
