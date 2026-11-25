@@ -202,6 +202,60 @@ check("cancel escalates to SIGTERM when SIGINT is ignored") {
     let r = runner.run(arguments: [])
     return r.cancelled && Date().timeIntervalSince(t0) < 6
 }
+// The app starts every run from a GCD worker, whose thread blocks most signals; a spawned
+// child inherits that mask (and any ignored disposition) across exec, and bash never unblocks
+// them, so `mo` and all its children could only be stopped by SIGKILL.
+check("a run started from a GCD worker gets default dispositions and an empty mask for INT, TERM, HUP, QUIT, PIPE") {
+    let probe = """
+    use POSIX qw(:signal_h);
+    my $set = POSIX::SigSet->new; sigprocmask(SIG_BLOCK, undef, $set);
+    for my $n (qw(INT TERM HUP QUIT PIPE)) {
+        my $num = eval "POSIX::SIG$n()";
+        my $old = POSIX::SigAction->new; sigaction($num, undef, $old);
+        my $h = $old->handler; $h = "DEFAULT" if !defined $h || $h eq "";
+        printf "%s blocked=%d disp=%s\\n", $n, $set->ismember($num) ? 1 : 0, $h;
+    }
+    """
+    let done = DispatchSemaphore(value: 0)
+    var r = RunResult()
+    DispatchQueue.global().async {
+        // Ignore PIPE in the parent too, as many apps do: the child must still get the default.
+        let old = signal(SIGPIPE, SIG_IGN)
+        r = MoleRunner(executable: "/usr/bin/perl").run(arguments: ["-e", probe], collectStdoutLines: true)
+        signal(SIGPIPE, old)
+        done.signal()
+    }
+    done.wait()
+    let want = ["INT", "TERM", "HUP", "QUIT", "PIPE"].map { "\($0) blocked=0 disp=DEFAULT" }
+    if r.stdoutLines != want { print("     child saw: \(r.stdoutLines)") }
+    return r.stdoutLines == want
+}
+// Mole's own traps (bin/clean.sh traps INT and TERM) must be what stops it, not a default
+// signal death or the SIGKILL that follows. The fake's traps exit 30 and 43, which no signal
+// death gives (the runner reports one as 128 + signo).
+check("cancel (SIGINT) and quit (SIGTERM) stop a fake mo started from a GCD worker through its own traps") {
+    func stop(_ how: @escaping (MoleRunner) -> Void) -> (RunResult, TimeInterval) {
+        let runner = MoleRunner(executable: fake)
+        runner.termGraceSeconds = 2
+        let done = DispatchSemaphore(value: 0)
+        var r = RunResult()
+        DispatchQueue.global().async {
+            r = runner.run(arguments: ["clean", "--apply"], extraEnvironment: ["FAKE_MO_SIGNAL_LOOP": "1"])
+            done.signal()
+        }
+        usleep(700_000)
+        let t0 = Date()
+        how(runner)
+        // Bounds a run the signal never stopped: cancel's escalation ends in SIGKILL (137).
+        DispatchQueue.global().asyncAfter(deadline: .now() + 3) { runner.cancel() }
+        done.wait()
+        return (r, Date().timeIntervalSince(t0))
+    }
+    let (int, intTook) = stop { $0.cancel() }
+    let (term, termTook) = stop { $0.terminateNow() }
+    print("     INT: exit \(int.exitCode) in \(String(format: "%.1f", intTook)) s; TERM: exit \(term.exitCode) in \(String(format: "%.1f", termTook)) s")
+    return int.cancelled && int.exitCode == 30 && intTook < 2 && term.exitCode == 43 && termTook < 2
+}
 func histTime(_ t: String) -> Date {
     let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "yyyy-MM-dd HH:mm:ss"
     return f.date(from: t)!

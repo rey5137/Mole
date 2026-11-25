@@ -653,6 +653,16 @@ cleanup() {
     # Background jobs ignore SIGINT.
     stop_project_cache_prefetch 2> /dev/null || true
 
+    # A run a signal or an error ended still closes its session, with the rows
+    # it reported so far; a finished run already closed it in perform_cleanup.
+    # Only the main shell writes it: a group signal that lands in a just-forked
+    # subshell before bash resets its traps can run this trap there too, with
+    # the same $$ (one TERM test run logged the end twice).
+    if [[ "${_MOLE_OPLOG_RUN_COMMAND:-}" == "clean" ]] &&
+        [[ "$(exec /bin/sh -c 'echo "$PPID"' 2> /dev/null)" == "$$" ]]; then
+        log_operation_session_end "clean" "${files_cleaned:-0}" "${total_size_cleaned:-0}" 2> /dev/null || true
+    fi
+
     cleanup_temp_files
 
     stop_sudo_session

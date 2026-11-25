@@ -69,18 +69,25 @@ MOCK
     chmod +x "$STUB_BIN"/*
 }
 
-# Run `mo clean ARGS` through the real pipeline with stdout and stderr apart.
-run_plan_clean() {
+# The environment every real-pipeline `mo clean` run here gets, in
+# PLAN_CLEAN_ENV for `env`.
+plan_clean_env() {
     # Loose probe budgets: a 2s process-table probe timing out on a loaded
     # runner cancels the preview and fails the case for no product reason.
-    run --separate-stderr env HOME="$HOME" TMPDIR="$HOME/tmp" \
-        MOLE_TIMEOUT_QUICK_DETECT_SEC=15 MOLE_TIMEOUT_MEDIUM_PROBE_SEC=30 \
-        MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=1 MOLE_TEST_TRASH_DIR="${PLAN_TEST_TRASH_DIR:-}" \
-        MOLE_CHROME_APP_PATHS="$HOME/none/Chrome.app" MOLE_EDGE_APP_PATHS="$HOME/none/Edge.app" \
-        MOLE_BRAVE_APP_PATHS="$HOME/none/Brave.app" MOLE_EXTERNAL_VOLUMES_ROOT="$HOME/none" \
-        MOLE_XCODE_DOCUMENTATION_CACHE_DIR="$HOME/none" MOLE_XCODE_XCTEST_DEVICES_DIR="$HOME/none" \
-        MOLE_XCODE_SYSTEM_CORESIMULATOR_CACHE_DIR="$HOME/none" \
-        PATH="$STUB_BIN:$PATH" "$PROJECT_ROOT/mole" clean "$@"
+    PLAN_CLEAN_ENV=(HOME="$HOME" TMPDIR="$HOME/tmp"
+        MOLE_TIMEOUT_QUICK_DETECT_SEC=15 MOLE_TIMEOUT_MEDIUM_PROBE_SEC=30
+        MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=1 MOLE_TEST_TRASH_DIR="${PLAN_TEST_TRASH_DIR:-}"
+        MOLE_CHROME_APP_PATHS="$HOME/none/Chrome.app" MOLE_EDGE_APP_PATHS="$HOME/none/Edge.app"
+        MOLE_BRAVE_APP_PATHS="$HOME/none/Brave.app" MOLE_EXTERNAL_VOLUMES_ROOT="$HOME/none"
+        MOLE_XCODE_DOCUMENTATION_CACHE_DIR="$HOME/none" MOLE_XCODE_XCTEST_DEVICES_DIR="$HOME/none"
+        MOLE_XCODE_SYSTEM_CORESIMULATOR_CACHE_DIR="$HOME/none"
+        PATH="$STUB_BIN:$PATH")
+}
+
+# Run `mo clean ARGS` through the real pipeline with stdout and stderr apart.
+run_plan_clean() {
+    plan_clean_env
+    run --separate-stderr env "${PLAN_CLEAN_ENV[@]}" "$PROJECT_ROOT/mole" clean "$@"
     # Bats shows this only when the case fails: the status and the run's end.
     printf 'mo clean %s -> status %s\n%s\n' "$*" "$status" "$(printf '%s\n' "$stderr" | tail -n 12)"
 }
@@ -424,6 +431,139 @@ PY
     if grep -F "REMOVED $HOME/Library/Caches/AppA" "$HOME/Library/Logs/mole/operations.log" > /dev/null; then
         return 1
     fi
+}
+
+# Save a plan over five cache folders with all of them kept, and put a slow
+# `mv` on PATH for moves into the test Trash: it records each start in
+# $HOME/moves.log, then sleeps 3 s before moving.
+plan_slow_trash_apply_fixture() {
+    plan_stub_toolchains
+    local n
+    for n in 1 2 3 4 5; do
+        mkdir -p "$HOME/Library/Caches/Slow$n"
+        dd if=/dev/zero of="$HOME/Library/Caches/Slow$n/f.bin" bs=1024 count=16 2> /dev/null
+    done
+    plan_clean_env
+    env "${PLAN_CLEAN_ENV[@]}" "$PROJECT_ROOT/mole" clean --dry-run --json \
+        > "$HOME/plan.json" 2> "$HOME/dry-run.err" || {
+        tail -n 12 "$HOME/dry-run.err"
+        return 1
+    }
+    python3 - "$HOME/plan.json" > "$HOME/select.txt" << 'PY'
+import json, sys
+plan = json.load(open(sys.argv[1]))
+for section in plan["sections"]:
+    for item in section["items"]:
+        if "/Library/Caches/Slow" in (item.get("path") or ""):
+            print(item["id"])
+PY
+    [ "$(grep -c . "$HOME/select.txt")" -eq 5 ] || return 1
+    PLAN_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["plan_id"])' "$HOME/plan.json")
+    PLAN_TEST_TRASH_DIR="$HOME/test-trash"
+    cat > "$STUB_BIN/mv" << MOCK
+#!/bin/bash
+if [[ "\${2:-}" == "$PLAN_TEST_TRASH_DIR"/* ]]; then
+    printf '%s\n' "\$1" >> "$HOME/moves.log"
+    /bin/sleep 3
+fi
+exec /bin/mv "\$@"
+MOCK
+    chmod +x "$STUB_BIN/mv"
+}
+
+# Start `mo clean --apply --trash` in its own process group with default
+# signal dispositions, as Mole Review does, wait (up to 90 s, for a loaded
+# parallel run) until its second Trash move is under way, send $1 to the
+# whole group and wait at most 10 s for it to end. Sets APPLY_STATUS,
+# APPLY_SECONDS (signal to exit), MOVES_AT_SIGNAL and MOVES_AT_END; a run
+# still alive is killed and fails the case.
+plan_signal_slow_trash_apply() {
+    local sig="$1"
+    plan_clean_env
+    rm -f "$HOME/moves.log" "$HOME/apply.pid" "$HOME/apply.status"
+    /usr/bin/perl -e '
+        my ($pidfile, $statusfile, @cmd) = @ARGV;
+        my $pid = fork() // exit 125;
+        # A background job starts with INT and QUIT ignored, and bash cannot
+        # trap a signal ignored at entry; the app spawns with defaults.
+        if ($pid == 0) { setpgrp(0, 0); $SIG{$_} = "DEFAULT" for qw(INT QUIT TERM HUP); exec @cmd; exit 127; }
+        open(my $fh, ">", $pidfile) or exit 125; print $fh "$pid\n"; close $fh;
+        waitpid($pid, 0);
+        my $rc = ($? & 127) ? 128 + ($? & 127) : $? >> 8;
+        open($fh, ">", "$statusfile.tmp") or exit 125; print $fh "$rc\n"; close $fh;
+        rename("$statusfile.tmp", $statusfile);
+    ' "$HOME/apply.pid" "$HOME/apply.status" \
+        env "${PLAN_CLEAN_ENV[@]}" "$PROJECT_ROOT/mole" clean --apply "$PLAN_ID" \
+        --select "$HOME/select.txt" --trash > "$HOME/apply.out" 2>&1 &
+    local launcher=$! i pid=""
+    for ((i = 0; i < 900; i++)); do
+        [[ -s "$HOME/apply.pid" ]] && pid=$(< "$HOME/apply.pid")
+        [[ -n "$pid" && -f "$HOME/moves.log" && $(grep -c . "$HOME/moves.log") -ge 2 ]] && break
+        [[ -f "$HOME/apply.status" ]] && break
+        /bin/sleep 0.1
+    done
+    MOVES_AT_SIGNAL=$(grep -c . "$HOME/moves.log" 2> /dev/null || true)
+    [[ -n "$pid" && ! -f "$HOME/apply.status" ]] || {
+        printf 'apply ended before the second move: %s\n' "$(tail -n 5 "$HOME/apply.out")"
+        return 1
+    }
+    local started=$SECONDS
+    kill -s "$sig" -- "-$pid"
+    for ((i = 0; i < 100; i++)); do
+        [[ -f "$HOME/apply.status" ]] && break
+        /bin/sleep 0.1
+    done
+    APPLY_SECONDS=$((SECONDS - started))
+    if [[ ! -f "$HOME/apply.status" ]]; then
+        kill -s KILL -- "-$pid" 2> /dev/null || true
+        wait "$launcher" 2> /dev/null || true
+        printf '%s left the apply running past 10 s\n' "$sig"
+        return 1
+    fi
+    wait "$launcher" 2> /dev/null || true
+    APPLY_STATUS=$(< "$HOME/apply.status")
+    MOVES_AT_END=$(grep -c . "$HOME/moves.log" 2> /dev/null || true)
+    printf '%s: status %s after %ss, moves %s at signal, %s at end\n' \
+        "$sig" "$APPLY_STATUS" "$APPLY_SECONDS" "$MOVES_AT_SIGNAL" "$MOVES_AT_END"
+}
+
+# The apply's own session in operations.log: its start row, TRASHED rows and
+# end row, by the run id of the last `clean` session started.
+plan_last_apply_session() {
+    local log="$HOME/Library/Logs/mole/operations.log" run_id
+    run_id=$(grep -o '# ========== clean run=[^ ]* session started' "$log" | tail -n 1 | sed 's/.*run=\([^ ]*\) .*/\1/')
+    [[ -n "$run_id" ]] || return 1
+    grep -F "run=$run_id" "$log"
+}
+
+@test "S8: clean --apply --trash stops at the item in flight on INT or TERM to its group and logs the session end" {
+    plan_slow_trash_apply_fixture
+
+    plan_signal_slow_trash_apply INT
+    [ "$APPLY_STATUS" -eq 130 ] || return 1
+    # Loose for a loaded runner; a run that went on to the next item would
+    # start another 3 s move, which the move count below catches.
+    [ "$APPLY_SECONDS" -le 8 ] || return 1
+    # The first move finished; the second was under way and nothing started after.
+    [ "$MOVES_AT_END" -eq "$MOVES_AT_SIGNAL" ] || return 1
+    local session
+    session=$(plan_last_apply_session)
+    printf '%s\n' "$session"
+    [ "$(grep -c 'TRASHED ' <<< "$session")" -eq 1 ] || return 1
+    grep -q 'session ended at' <<< "$session" || return 1
+    [ "$(grep -c 'session ended at' <<< "$session")" -eq 1 ] || return 1
+
+    plan_signal_slow_trash_apply TERM
+    [ "$APPLY_STATUS" -eq 143 ] || return 1
+    [ "$APPLY_SECONDS" -le 8 ] || return 1
+    [ "$MOVES_AT_END" -eq "$MOVES_AT_SIGNAL" ] || return 1
+    session=$(plan_last_apply_session)
+    printf '%s\n' "$session"
+    [ "$(grep -c 'TRASHED ' <<< "$session")" -eq 1 ] || return 1
+    [ "$(grep -c 'session ended at' <<< "$session")" -eq 1 ] || return 1
+    # Two moves completed, one per run; the others stay where they were.
+    [ "$(find "$HOME/test-trash" -mindepth 1 -maxdepth 1 -name 'Slow*' | wc -l | tr -d ' ')" -eq 2 ] || return 1
+    [ "$(find "$HOME/Library/Caches" -mindepth 1 -maxdepth 1 -name 'Slow*' | wc -l | tr -d ' ')" -eq 3 ]
 }
 
 @test "clean refuses flag combinations the reviewable clean does not support" {

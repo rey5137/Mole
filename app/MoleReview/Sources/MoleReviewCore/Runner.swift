@@ -206,8 +206,21 @@ public final class MoleRunner {
         posix_spawnattr_init(&attr)
         // Only the fds named above reach the child: no other run's pipes, and no secret pipe
         // another run is setting up at the same moment.
-        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT))
+        // A child inherits the spawning thread's signal mask and every ignored disposition.
+        // Runs start on a GCD worker, which blocks INT, TERM, HUP and QUIT, and bash never
+        // unblocks them: cancel's SIGINT and SIGTERM stayed pending and only SIGKILL stopped
+        // `mo`, mid-item and with no session end logged. Start the child with an empty mask
+        // and these signals at their defaults.
+        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT
+                                              | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF))
         posix_spawnattr_setpgroup(&attr, 0)
+        var noSignals = sigset_t()
+        sigemptyset(&noSignals)
+        posix_spawnattr_setsigmask(&attr, &noSignals)
+        var defaultSignals = sigset_t()
+        sigemptyset(&defaultSignals)
+        for sig in [SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGPIPE] { sigaddset(&defaultSignals, sig) }
+        posix_spawnattr_setsigdefault(&attr, &defaultSignals)
         defer { posix_spawn_file_actions_destroy(&fa); posix_spawnattr_destroy(&attr) }
 
         let argv = ([executable] + arguments).map { strdup($0) } + [nil]
