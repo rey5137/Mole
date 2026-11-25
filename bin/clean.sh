@@ -1720,6 +1720,7 @@ start_cleanup() {
     echo ""
 
     if [[ -n "$CLEAN_PLAN_ID" && "$DRY_RUN" != "true" ]]; then
+        log_operation_print_run_id
         local plan_note="Reviewed plan $CLEAN_PLAN_ID · $CLEAN_APPLY_KEPT_COUNT of $CLEAN_APPLY_ITEM_COUNT items kept"
         [[ "$CLEAN_TRASH" == "true" ]] && plan_note+=" · to Trash"
         echo -e "${BLUE}${ICON_ADMIN}${NC} $plan_note"

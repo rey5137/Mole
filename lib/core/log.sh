@@ -400,6 +400,14 @@ log_operation_session_start() {
         "# ========== $log_command session started at $timestamp =========="
 }
 
+# Name the run of a reviewed --apply on stdout, one plain line in a fixed
+# grammar (`Run id: <id>`) that Mole Review reads to pick its own session out
+# of mo history. Silent without a session, as under MO_NO_OPLOG=1.
+log_operation_print_run_id() {
+    [[ -n "$_MOLE_OPLOG_RUN_ID" ]] || return 0
+    printf 'Run id: %s\n' "$_MOLE_OPLOG_RUN_ID"
+}
+
 # shellcheck disable=SC2329
 log_operation_session_end() {
     local command="${1:-mole}" log_command

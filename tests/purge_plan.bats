@@ -149,6 +149,28 @@ PY
     [ -f "$HOME/www/beta/dist/blob.bin" ]
 }
 
+@test "purge --apply prints its run id once and no other purge run does" {
+    make_artifact alpha old 8192
+    make_plan || return 1
+    plan_item_id "$HOME/www/alpha/dist" > "$HOME/select.txt" || return 1
+    run_purge --dry-run
+    [ "$(printf '%s\n' "$output" | grep -c '^Run id: ')" -eq 0 ] || return 1
+
+    run_purge --apply "$PLAN_ID" --select "$HOME/select.txt"
+    [ "$status" -eq 0 ] || return 1
+    [ "$(printf '%s\n' "$output" | grep -c '^Run id: ')" -eq 1 ] || return 1
+    local id
+    id=$(printf '%s\n' "$output" | sed -n 's/^Run id: //p')
+    oplog | grep -F "[purge run=$id] REMOVED $HOME/www/alpha/dist" > /dev/null || return 1
+
+    make_artifact beta old 4096
+    make_plan || return 1
+    plan_item_id "$HOME/www/beta/dist" > "$HOME/select.txt" || return 1
+    MO_NO_OPLOG=1 run_purge --apply "$PLAN_ID" --select "$HOME/select.txt"
+    [ "$status" -eq 0 ] || return 1
+    [ "$(printf '%s\n' "$output" | grep -c '^Run id: ')" -eq 0 ]
+}
+
 @test "purge --apply refuses an unknown, expired or cross-command plan and an id not in it" {
     make_artifact alpha old 8192
     make_plan || return 1

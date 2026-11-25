@@ -34,6 +34,10 @@ cleanup() {
         leave_alt_screen
         IN_ALT_SCREEN=0
     fi
+    # An exit nothing else ended (an error, a signal) still closes the session.
+    if [[ "$_MOLE_OPLOG_RUN_COMMAND" == "installer" ]]; then
+        log_operation_session_end "installer" "${total_deleted:-0}" "${total_size_freed_kb:-0}"
+    fi
     show_cursor
     cleanup_temp_files
 }
@@ -1143,9 +1147,14 @@ main() {
         printf '\n'
     fi
 
+    log_operation_session_start "installer"
+    if [[ -n "$INSTALLER_APPLY_PLAN_ID" ]]; then
+        log_operation_print_run_id
+    fi
     hide_cursor
     if [[ "$installer_json" == "true" ]]; then
         perform_installer_plan_json || exit $?
+        log_operation_session_end "installer" 0 0
         show_cursor
         return 0
     fi
@@ -1158,6 +1167,7 @@ main() {
     else
         perform_installers || exit_code=$?
     fi
+    log_operation_session_end "installer" "${total_deleted:-0}" "${total_size_freed_kb:-0}"
     show_cursor
 
     case $exit_code in

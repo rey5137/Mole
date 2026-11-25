@@ -416,13 +416,33 @@ check("purge apply with no purge session in the window names purge in its note")
     let res = runApply(.purge, applyEnv(oplog: try freshLog(), run: "RP2", history: "history.json", rows: nil))
     return res.session == nil && res.notes == [MoleService.ambiguousRunNote(.purge)] && res.notes[0].contains("mo purge")
 }
-check("installer apply (no run markers) reads its own rows written while it ran, never older or other-command rows") {
+check("installer apply reads its own run by the printed run id, never older or other-command rows") {
     let log = try freshLog("[2026-01-01 00:00:00] [installer] SKIPPED /old (changed since review)\n")
-    let res = runApply(.installer, applyEnv(oplog: log, run: "", history: "history-installer.json", rows: "oplog-apply-installer.txt"))
+    var env = applyEnv(oplog: log, run: "RI1", history: "history-installer.json", rows: "oplog-apply-installer.txt")
+    env["FAKE_MO_PRINT_RUN_ID"] = "1"
+    let res = runApply(.installer, env)
     let names = res.skipped.flatMap { $0.names }
-    return res.session?.command == "installer" && res.session?.trashed == 1 && res.session?.skipped == 1
+    return res.session?.command == "installer" && res.session?.runId == "RI1" && res.session?.trashed == 1
         && res.session?.sizeBytes == 3_000_000 && names == ["/Users/sample/Desktop/Tool Setup.pkg"]
         && res.skipped.map({ $0.reason }) == ["changed since review"] && res.notes.isEmpty
+}
+check("the printed run id picks its session even when another overlapping session exists") {
+    var env = applyEnv(oplog: try freshLog(), run: "R2", history: "history-ambiguous.json")
+    env["FAKE_MO_PRINT_RUN_ID"] = "1"
+    let res = apply(env)
+    return res.session?.runId == "R2" && res.notes.isEmpty
+}
+check("a printed run id that history does not list is not guessed at") {
+    var env = applyEnv(oplog: try freshLog(), run: "R2", history: "history.json")
+    env["FAKE_MO_PRINT_RUN_ID"] = "1"
+    env["FAKE_MO_HISTORY_FILE"] = fixtures.appendingPathComponent("history-purge.json").path
+    let res = apply(env)
+    return res.session == nil && res.notes == [MoleService.ambiguousRunNote]
+}
+check("run id line: parsed from stdout, nothing else counts") {
+    func id(_ t: String) -> String? { History.runId(fromOutput: Data(t.utf8)) }
+    return id("Run id: 2026-1-2\nmore\n") == "2026-1-2" && id("x\nRun id: abc\n") == "abc"
+        && id("") == nil && id("Run id: \n") == nil && id("Run id: a b\n") == nil && id("the Run id: a\n") == nil
 }
 check("operation rows: exact command only, dry-run and other commands never match") {
     let log = "[2026-11-24 14:50:01] [purge run=A] TRASHED /x (12MB)\n[2026-11-24 14:50:01] [purge-dry-run run=B] SKIPPED /y (z)\n"
@@ -462,13 +482,5 @@ check("header item counts: purge counts rows (a trim is one row), clean keeps it
     let c = ReviewState(plan: try plan("tricky.json"))
     return s.itemCounts == (2, 5) && c.itemCounts == (c.selectedItems, c.plan.totalItems) && c.itemCounts == (7, 7)
 }
-check("installer run size: a removed symlink counts 0 bytes, not an unknown total") {
-    let log = "[2026-11-24 14:50:01] [installer] TRASHED /Users/sample/Downloads/A.dmg (3.00MB)\n"
-        + "[2026-11-24 14:50:02] [installer] REMOVED /Users/sample/Downloads/Link.dmg (symlink)\n"
-        + "[2026-11-24 14:50:03] [installer] TRASHED /Users/sample/Downloads/B.pkg (512KB)\n"
-    let sess = History.windowSession("installer", rows: OperationRow.parse(log, command: "installer"))
-    return sess?.sizeBytes == 3_512_000 && sess?.items == 3 && sess?.removed == 1 && sess?.trashed == 2
-}
-
 if failures > 0 { print("\(failures) check(s) failed"); exit(1) }
 print("all checks passed")

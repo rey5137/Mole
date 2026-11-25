@@ -77,11 +77,11 @@ setup() {
 @test "completion bash includes current clean, analyze, history, and purge options only" {
 	run "$PROJECT_ROOT/bin/completion.sh" bash
 	[ "$status" -eq 0 ]
-	[[ "$output" == *"--dry-run -n --external --whitelist --debug --help -h"* ]] || return 1
+	[[ "$output" == *"--dry-run -n --external --whitelist --json --apply --select --trash --debug --help -h"* ]] || return 1
 	[[ "$output" == *"--json --help -h"* ]] || return 1
 	[[ "$output" == *"--json --limit --help -h"* ]] || return 1
-	[[ "$output" == *"--paths --dry-run -n --yes --include-empty --debug --help -h"* ]] || return 1
-	[[ "$output" != *"--select"* ]] || return 1
+	[[ "$output" == *"--paths --dry-run -n --yes --include-empty --json --apply --select --trash --debug --help -h"* ]] || return 1
+	[[ "$output" == *"--dry-run -n --json --apply --select --trash --debug --help -h"* ]] || return 1
 	[[ "$output" != *"--categories"* ]] || return 1
 	[[ "$output" != *"--exclude-paths"* ]]
 }
@@ -117,7 +117,10 @@ setup() {
 	[[ "$output" == *"--limit"* ]] || return 1
 	[[ "$output" == *"--include-empty"* ]] || return 1
 	[[ "$output" == *"--yes[Confirm unattended cleanup of eligible artifacts]"* ]] || return 1
-	[[ "$output" != *"--select"* ]] || return 1
+	[[ "$output" == *"--apply[Apply a reviewed plan by id]"* ]] || return 1
+	[[ "$output" == *"--select[File listing the item ids to keep]:file:_files"* ]] || return 1
+	[[ "$output" == *"--trash[Move items to the Trash]"* ]] || return 1
+	[[ "$output" == *"installer)"* ]] || return 1
 	[[ "$output" != *"--categories"* ]] || return 1
 	[[ "$output" != *"--exclude-paths"* ]]
 }
@@ -147,7 +150,10 @@ setup() {
 	[[ "$output" == *"-l json"* ]] || return 1
 	[[ "$output" == *"-l limit"* ]] || return 1
 	[[ "$output" == *"-l include-empty"* ]] || return 1
-	[[ "$output" != *"-l select"* ]] || return 1
+	[[ "$output" == *"__fish_seen_subcommand_from clean\" -l apply"* ]] || return 1
+	[[ "$output" == *"__fish_seen_subcommand_from purge\" -l select -r -F"* ]] || return 1
+	[[ "$output" == *"__fish_seen_subcommand_from installer\" -l trash"* ]] || return 1
+	[[ "$output" == *"__fish_seen_subcommand_from installer\" -l json"* ]] || return 1
 	[[ "$output" != *"-l categories"* ]] || return 1
 	[[ "$output" != *"-l exclude-paths"* ]]
 }

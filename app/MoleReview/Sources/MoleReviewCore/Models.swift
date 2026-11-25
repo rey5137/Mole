@@ -36,9 +36,6 @@ public enum MoleCommand: String, CaseIterable, Identifiable {
         case .installer: return ["path"]
         }
     }
-    /// `mo installer` writes no session markers (no `log_operation_session_start`),
-    /// so its rows carry no run id and `mo history` merges back-to-back runs.
-    public var writesRunMarkers: Bool { self != .installer }
 }
 
 /// One row of a plan section. `kind` is "path", "command" (clean) or "trim"

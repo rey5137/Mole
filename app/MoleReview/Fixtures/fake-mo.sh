@@ -5,6 +5,7 @@
 # `--slow`: spawn a background grandchild `sleep` (pid written to FAKE_MO_PIDFILE), then wait.
 # `history --json`: prints FAKE_MO_HISTORY_FILE with RUNID replaced by FAKE_MO_RUN_ID, and
 #   OPLOG replaced by FAKE_MO_OPLOG (the `logs.operations` path).
+# FAKE_MO_PRINT_RUN_ID: set, `--apply` prints `Run id: <FAKE_MO_RUN_ID>` on stdout like a current mo.
 # FAKE_MO_STATE: `<command> --apply` records its start and end time here (history's STARTED/ENDED).
 # `<command> --apply` (clean, purge or installer alike): appends FAKE_MO_OPLOG_ROWS (real
 #   operations.log row formats, RUNID replaced, NOW by the current time) to FAKE_MO_OPLOG, as a
@@ -24,6 +25,7 @@ fi
 if [[ "$*" == *"--apply"* && -n "${FAKE_MO_OPLOG:-}" && -n "${FAKE_MO_OPLOG_ROWS:-}" ]]; then
     sed -e "s|RUNID|${FAKE_MO_RUN_ID:-}|g" -e "s|NOW|$(date '+%Y-%m-%d %H:%M:%S')|g" "$FAKE_MO_OPLOG_ROWS" >> "$FAKE_MO_OPLOG"
 fi
+[[ "$*" == *"--apply"* && -n "${FAKE_MO_PRINT_RUN_ID:-}" ]] && echo "Run id: ${FAKE_MO_RUN_ID:-}"
 [[ -n "${FAKE_MO_STDERR:-}" ]] && printf '%s\n' "$FAKE_MO_STDERR" >&2
 [[ -n "${FAKE_MO_STDOUT_FILE:-}" ]] && cat "$FAKE_MO_STDOUT_FILE"
 for a in "$@"; do

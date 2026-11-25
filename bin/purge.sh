@@ -466,6 +466,7 @@ main() {
     fi
     hide_cursor
     if [[ -n "$PURGE_APPLY_PLAN_ID" ]]; then
+        log_operation_print_run_id
         perform_purge_apply
     else
         perform_purge

@@ -118,6 +118,7 @@ PY
     [ -f "$HOME/Downloads/App.dmg" ] && [ -f "$HOME/Desktop/Tool Setup.pkg" ]
 }
 
+# shellcheck disable=SC2030 # Bats runs each test in its own subshell.
 @test "installer --apply removes only the kept files and a repeat is a no-op" {
     make_installer Downloads/App.dmg 3000
     make_installer Downloads/Other.pkg 4000
@@ -140,6 +141,97 @@ PY
     [ "$status" -eq 0 ] || return 1
     [[ "$output" == *"~/Downloads/App.dmg already removed"* ]] || return 1
     [ -f "$HOME/Downloads/Other.pkg" ]
+}
+
+# The stdout lines naming a run, and the one id they carry.
+run_id_lines() {
+    # shellcheck disable=SC2031 # output comes from run_installer in the calling test.
+    printf '%s\n' "$output" | grep -c '^Run id: ' || true
+}
+
+@test "installer --apply prints its run id once and the log rows carry it" {
+    make_installer Downloads/App.dmg 3000
+    make_plan || return 1
+    plan_item_id "$HOME/Downloads/App.dmg" > "$HOME/select.txt" || return 1
+
+    run_installer --apply "$PLAN_ID" --select "$HOME/select.txt"
+    [ "$status" -eq 0 ] || return 1
+    [ "$(run_id_lines)" -eq 1 ] || return 1
+    local id
+    id=$(printf '%s\n' "$output" | sed -n 's/^Run id: //p')
+    [[ "$id" =~ ^[0-9]+-[0-9]+-[0-9]+-[0-9]+$ ]] || return 1
+    oplog | grep -F "[installer run=$id] REMOVED $HOME/Downloads/App.dmg" > /dev/null || return 1
+    oplog | grep -F "# ========== installer run=$id session started" > /dev/null || return 1
+    oplog | grep -E "# ========== installer run=$id session ended at .*, 1 items," > /dev/null
+}
+
+@test "installer prints no run id outside --apply or with the log disabled" {
+    make_installer Downloads/App.dmg 3000
+    run_installer --dry-run
+    [ "$(run_id_lines)" -eq 0 ] || return 1
+    run_installer --dry-run --json
+    [ "$(run_id_lines)" -eq 0 ] || return 1
+    make_plan || return 1
+    plan_item_id "$HOME/Downloads/App.dmg" > "$HOME/select.txt" || return 1
+    MO_NO_OPLOG=1 run_installer --apply "$PLAN_ID" --select "$HOME/select.txt"
+    [ "$status" -eq 0 ] || return 1
+    [ "$(run_id_lines)" -eq 0 ]
+}
+
+@test "installer writes a session marker pair on every exit path and names a dry run" {
+    # Nothing found.
+    run_installer
+    [ "$status" -eq 0 ] || return 1
+    [ "$(oplog | grep -c '# ========== installer run=.* session started')" -eq 1 ] || return 1
+    [ "$(oplog | grep -c '# ========== installer run=.* session ended at .*, 0 items, 0B')" -eq 1 ] || return 1
+
+    # A dry run, text and JSON, is a preview session.
+    make_installer Downloads/App.dmg 3000
+    run_installer --dry-run
+    [ "$status" -eq 0 ] || return 1
+    run_installer --dry-run --json
+    [ "$status" -eq 0 ] || return 1
+    [ "$(oplog | grep -c '# ========== installer-dry-run run=.* session started')" -eq 2 ] || return 1
+    [ "$(oplog | grep -c '# ========== installer-dry-run run=.* session ended')" -eq 2 ] || return 1
+
+    # An error exit after the session began still closes it: a failing scan
+    # ends the JSON preview through `exit`, and only the EXIT trap can end it.
+    mkdir -p "$HOME/bin"
+    printf '#!/bin/sh\necho "fd: boom" >&2\nexit 2\n' > "$HOME/bin/fd"
+    chmod +x "$HOME/bin/fd"
+    mkdir -p "$HOME/Library/Logs/mole"
+    : > "$HOME/Library/Logs/mole/operations.log"
+    run --separate-stderr env HOME="$HOME" TMPDIR="$HOME/tmp" MOLE_TEST_NO_AUTH=1 PATH="$HOME/bin:$PATH" \
+        "$PROJECT_ROOT/mole" installer --dry-run --json < /dev/null
+    [ "$status" -ne 0 ] || return 1
+    local id
+    id=$(oplog | sed -n 's/^# ========== installer-dry-run run=\([^ ]*\) session started.*/\1/p')
+    [[ "$id" =~ ^[0-9]+-[0-9]+-[0-9]+-[0-9]+$ ]] || return 1
+    oplog | grep -F "# ========== installer-dry-run run=$id session started" > /dev/null || return 1
+    oplog | grep -F "# ========== installer-dry-run run=$id session ended" > /dev/null
+}
+
+@test "mo history shows an installer session with its run id next to marker-less installer rows" {
+    mkdir -p "$HOME/Library/Logs/mole"
+    printf '%s\n' '[2026-05-02 10:00:01] [installer] TRASHED /tmp/old.dmg (1KB)' \
+        > "$HOME/Library/Logs/mole/operations.log"
+    make_installer Downloads/App.dmg 3000
+    make_plan || return 1
+    plan_item_id "$HOME/Downloads/App.dmg" > "$HOME/select.txt" || return 1
+    run_installer --apply "$PLAN_ID" --select "$HOME/select.txt"
+    [ "$status" -eq 0 ] || return 1
+    local id
+    id=$(printf '%s\n' "$output" | sed -n 's/^Run id: //p')
+    run env HOME="$HOME" MOLE_TEST_NO_AUTH=1 "$PROJECT_ROOT/mole" history --json
+    [ "$status" -eq 0 ] || return 1
+    printf '%s' "$output" | python3 -c '
+import json, sys
+id = sys.argv[1]
+s = [x for x in json.load(sys.stdin)["sessions"] if x["command"] == "installer"]
+mine = [x for x in s if x["run_id"] == id]
+assert len(mine) == 1 and mine[0]["items"] == 1, s
+assert any(x["run_id"] == "" for x in s), s
+' "$id"
 }
 
 @test "installer --apply refuses an unknown, expired or cross-command plan and an id not in it" {

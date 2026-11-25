@@ -17,10 +17,11 @@ for entry in "${MOLE_COMMANDS[@]}"; do
     command_names+=("${entry%%:*}")
 done
 command_words="${command_names[*]}"
-clean_option_words="--dry-run -n --external --whitelist --debug --help -h"
+clean_option_words="--dry-run -n --external --whitelist --json --apply --select --trash --debug --help -h"
 analyze_option_words="--json --help -h"
 history_option_words="--json --limit --help -h"
-purge_option_words="--paths --dry-run -n --yes --include-empty --debug --help -h"
+purge_option_words="--paths --dry-run -n --yes --include-empty --json --apply --select --trash --debug --help -h"
+installer_option_words="--dry-run -n --json --apply --select --trash --debug --help -h"
 
 emit_zsh_subcommands() {
     for entry in "${MOLE_COMMANDS[@]}"; do
@@ -40,6 +41,10 @@ emit_fish_completions() {
     printf 'complete -f -c %s -n "__fish_seen_subcommand_from clean" -l dry-run -s n -d "Preview cleanup without making changes"\n' "$cmd"
     printf 'complete -c %s -n "__fish_seen_subcommand_from clean" -l external -r -a "(__fish_complete_directories)" -d "Clean OS metadata from an external volume"\n' "$cmd"
     printf 'complete -f -c %s -n "__fish_seen_subcommand_from clean" -l whitelist -d "Manage protected paths"\n' "$cmd"
+    printf 'complete -f -c %s -n "__fish_seen_subcommand_from clean" -l json -d "Print the dry-run plan as JSON"\n' "$cmd"
+    printf 'complete -f -c %s -n "__fish_seen_subcommand_from clean" -l apply -r -d "Apply a reviewed plan by id"\n' "$cmd"
+    printf 'complete -c %s -n "__fish_seen_subcommand_from clean" -l select -r -F -d "File listing the item ids to keep"\n' "$cmd"
+    printf 'complete -f -c %s -n "__fish_seen_subcommand_from clean" -l trash -d "Move items to the Trash"\n' "$cmd"
     printf 'complete -f -c %s -n "__fish_seen_subcommand_from clean" -l debug -d "Show detailed logs"\n' "$cmd"
     printf 'complete -f -c %s -n "__fish_seen_subcommand_from clean" -l help -s h -d "Show help"\n' "$cmd"
     printf 'complete -f -c %s -n "__fish_seen_subcommand_from analyze analyse" -l json -d "Output analysis as JSON"\n' "$cmd"
@@ -52,8 +57,19 @@ emit_fish_completions() {
     printf 'complete -f -c %s -n "__fish_seen_subcommand_from purge" -l dry-run -s n -d "Preview purge actions without making changes"\n' "$cmd"
     printf 'complete -f -c %s -n "__fish_seen_subcommand_from purge" -l include-empty -d "Show zero-size project artifact directories"\n' "$cmd"
     printf 'complete -f -c %s -n "__fish_seen_subcommand_from purge" -l yes -d "Confirm unattended cleanup of eligible artifacts"\n' "$cmd"
+    printf 'complete -f -c %s -n "__fish_seen_subcommand_from purge" -l json -d "Print the dry-run plan as JSON"\n' "$cmd"
+    printf 'complete -f -c %s -n "__fish_seen_subcommand_from purge" -l apply -r -d "Apply a reviewed plan by id"\n' "$cmd"
+    printf 'complete -c %s -n "__fish_seen_subcommand_from purge" -l select -r -F -d "File listing the item ids to keep"\n' "$cmd"
+    printf 'complete -f -c %s -n "__fish_seen_subcommand_from purge" -l trash -d "Move items to the Trash"\n' "$cmd"
     printf 'complete -f -c %s -n "__fish_seen_subcommand_from purge" -l debug -d "Show detailed logs"\n' "$cmd"
     printf 'complete -f -c %s -n "__fish_seen_subcommand_from purge" -l help -s h -d "Show help"\n' "$cmd"
+    printf 'complete -f -c %s -n "__fish_seen_subcommand_from installer" -l dry-run -s n -d "Preview installer removal without making changes"\n' "$cmd"
+    printf 'complete -f -c %s -n "__fish_seen_subcommand_from installer" -l json -d "Print the dry-run plan as JSON"\n' "$cmd"
+    printf 'complete -f -c %s -n "__fish_seen_subcommand_from installer" -l apply -r -d "Apply a reviewed plan by id"\n' "$cmd"
+    printf 'complete -c %s -n "__fish_seen_subcommand_from installer" -l select -r -F -d "File listing the item ids to keep"\n' "$cmd"
+    printf 'complete -f -c %s -n "__fish_seen_subcommand_from installer" -l trash -d "Move items to the Trash"\n' "$cmd"
+    printf 'complete -f -c %s -n "__fish_seen_subcommand_from installer" -l debug -d "Show detailed logs"\n' "$cmd"
+    printf 'complete -f -c %s -n "__fish_seen_subcommand_from installer" -l help -s h -d "Show help"\n' "$cmd"
     printf '\n'
     local shell_name
     for shell_name in bash zsh fish; do
@@ -355,6 +371,9 @@ _mole_completions()
                     --external)
                         COMPREPLY=( \$(compgen -d -- "\$cur_word") )
                         ;;
+                    --select)
+                        COMPREPLY=( \$(compgen -f -- "\$cur_word") )
+                        ;;
                     *)
                         COMPREPLY=( \$(compgen -W "$clean_option_words" -- "\$cur_word") )
                         ;;
@@ -371,7 +390,18 @@ _mole_completions()
                 COMPREPLY=( \$(compgen -W "$history_option_words" -- "\$cur_word") )
                 ;;
             purge)
-                COMPREPLY=( \$(compgen -W "$purge_option_words" -- "\$cur_word") )
+                if [ "\$prev_word" = "--select" ]; then
+                    COMPREPLY=( \$(compgen -f -- "\$cur_word") )
+                else
+                    COMPREPLY=( \$(compgen -W "$purge_option_words" -- "\$cur_word") )
+                fi
+                ;;
+            installer)
+                if [ "\$prev_word" = "--select" ]; then
+                    COMPREPLY=( \$(compgen -f -- "\$cur_word") )
+                else
+                    COMPREPLY=( \$(compgen -W "$installer_option_words" -- "\$cur_word") )
+                fi
                 ;;
             completion)
                 COMPREPLY=( \$(compgen -W "bash zsh fish" -- "\$cur_word") )
@@ -404,6 +434,10 @@ EOF
         printf "                '-n[Preview cleanup without making changes]' \\\\\n"
         printf "                '--external[Clean OS metadata from an external volume]:path:_files -/' \\\\\n"
         printf "                '--whitelist[Manage protected paths]' \\\\\n"
+        printf "                '--json[Print the dry-run plan as JSON]' \\\\\n"
+        printf "                '--apply[Apply a reviewed plan by id]:plan id:' \\\\\n"
+        printf "                '--select[File listing the item ids to keep]:file:_files' \\\\\n"
+        printf "                '--trash[Move items to the Trash]' \\\\\n"
         printf "                '--debug[Show detailed logs]' \\\\\n"
         printf "                '(-h --help)'{-h,--help}'[Show help]'\n"
         printf '            ;;\n'
@@ -426,6 +460,21 @@ EOF
         printf "                '-n[Preview purge actions without making changes]' \\\\\n"
         printf "                '--include-empty[Show zero-size project artifact directories]' \\\\\n"
         printf "                '--yes[Confirm unattended cleanup of eligible artifacts]' \\\\\n"
+        printf "                '--json[Print the dry-run plan as JSON]' \\\\\n"
+        printf "                '--apply[Apply a reviewed plan by id]:plan id:' \\\\\n"
+        printf "                '--select[File listing the item ids to keep]:file:_files' \\\\\n"
+        printf "                '--trash[Move items to the Trash]' \\\\\n"
+        printf "                '--debug[Show detailed logs]' \\\\\n"
+        printf "                '(-h --help)'{-h,--help}'[Show help]'\n"
+        printf '            ;;\n'
+        printf '        installer)\n'
+        printf '            _arguments \\\n'
+        printf "                '--dry-run[Preview installer removal without making changes]' \\\\\n"
+        printf "                '-n[Preview installer removal without making changes]' \\\\\n"
+        printf "                '--json[Print the dry-run plan as JSON]' \\\\\n"
+        printf "                '--apply[Apply a reviewed plan by id]:plan id:' \\\\\n"
+        printf "                '--select[File listing the item ids to keep]:file:_files' \\\\\n"
+        printf "                '--trash[Move items to the Trash]' \\\\\n"
         printf "                '--debug[Show detailed logs]' \\\\\n"
         printf "                '(-h --help)'{-h,--help}'[Show help]'\n"
         printf '            ;;\n'

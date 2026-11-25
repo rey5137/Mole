@@ -275,6 +275,28 @@ PY
     python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); assert any(s["command"] == "clean" for s in d["sessions"]), d' <<< "$output"
 }
 
+@test "clean --apply prints its run id once and no plain, dry-run or log-off run does" {
+    plan_stub_toolchains
+    make_cache_fixture
+    run_plan_clean --dry-run --json
+    [ "$status" -eq 0 ] || return 1
+    printf '%s' "$output" > "$HOME/plan.json"
+    local plan_id id_a
+    plan_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["plan_id"])' "$HOME/plan.json")
+    id_a=$(plan_item_id "$HOME/plan.json" "$HOME/Library/Caches/AppA")
+    [[ -n "$id_a" ]] || return 1
+    printf '%s\n' "$id_a" > "$HOME/select.txt"
+    run_plan_clean --dry-run
+    [ "$(printf '%s\n' "$output" | grep -c '^Run id: ')" -eq 0 ] || return 1
+
+    run_plan_clean --apply "$plan_id" --select "$HOME/select.txt"
+    [ "$status" -eq 0 ] || return 1
+    [ "$(printf '%s\n' "$output" | grep -c '^Run id: ')" -eq 1 ] || return 1
+    local id
+    id=$(printf '%s\n' "$output" | sed -n 's/^Run id: //p')
+    grep -F "[clean run=$id] " "$HOME/Library/Logs/mole/operations.log" > /dev/null
+}
+
 @test "clean --apply runs a kept owner command and only that one" {
     plan_stub_toolchains
     run_plan_clean --dry-run --json

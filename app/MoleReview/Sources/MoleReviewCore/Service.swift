@@ -99,14 +99,14 @@ extension MoleService {
         "Couldn't tell this run apart from another mo \(command.rawValue), so no totals are shown."
     }
 
-    /// Runs `--apply` (never retried), then reads what happened. Mole prints no run id,
-    /// so the history session is the one real session of `command` (never its
-    /// `-dry-run` preview, never another command) that started after the process was
-    /// spawned and ended before it exited; none or several shows a note instead of a
-    /// guess, with skip reasons from the run's own output. With one session, its
-    /// `run_id` selects the rows of the operations log named by `history --json`.
-    /// A command that writes no run markers (installer) is read from the log rows it
-    /// wrote while the process ran (`History.windowSession`).
+    /// Runs `--apply` (never retried), then reads what happened. `--apply` prints its
+    /// own run id (`Run id: <id>`, log.sh `log_operation_print_run_id`), and the history
+    /// session is the one of `command` with that `run_id`. An older mo prints none; then
+    /// the session is the one real session of `command` (never its `-dry-run` preview,
+    /// never another command) that started after the process was spawned and ended
+    /// before it exited. None or several shows a note instead of a guess, with skip
+    /// reasons from the run's own output. With a session, its `run_id` selects the rows
+    /// of the operations log named by `history --json`.
     public static func runApply(_ command: MoleCommand = .clean, runner: MoleRunner, planId: String, selectFile: String,
                                 trash: Bool, planSkipped: [SkippedEntry], extraEnvironment: [String: String] = [:],
                                 onStderrLine: ((String) -> Void)? = nil) -> ApplyResult {
@@ -124,21 +124,15 @@ extension MoleService {
         let fromOutput = SkippedReport.group(stderr: res.stderrLines, planSkipped: planSkipped)
         let logPath = History.operationsLogPath(from: hist.stdout)
         let logText = logPath.flatMap { try? Data(contentsOf: URL(fileURLWithPath: $0)) }.map { String(decoding: $0, as: UTF8.self) }
-        if !command.writesRunMarkers {
-            let note = res.launchError ?? (res.cancelled ? "Cancelled; some items may already be removed." : nil)
-            guard let logText else {
-                notes.append("The operations log (\(logPath ?? "path unknown")) could not be read, so no totals are shown and skip reasons come from the run's output.")
-                return ApplyResult(exitCode: res.exitCode, session: nil, skipped: fromOutput, failureNote: note, notes: notes)
-            }
-            let rows = OperationRow.parse(logText, command: command.rawValue)
-                .filter { $0.runId == nil && History.inWindow($0.time, spawnedAt: spawnedAt, exitedAt: exitedAt) }
-            let session = History.windowSession(command.rawValue, rows: rows)
-            let skipped = rows.compactMap { r in r.action == "SKIPPED" ? r.skipped : nil }
-            return ApplyResult(exitCode: res.exitCode, session: session,
-                               skipped: SkippedReport.group(rows: skipped, planSkipped: planSkipped), failureNote: note)
+        let all = History.sessions(from: hist.stdout)
+        // The run names itself (`Run id: <id>`); an older mo prints nothing, so the window decides.
+        // A named run that history does not list is not guessed at.
+        let session: HistorySession?
+        if let id = History.runId(fromOutput: res.stdout) {
+            session = all.first { $0.command == command.rawValue && $0.runId == id }
+        } else {
+            session = History.attributed(all, command: command.rawValue, spawnedAt: spawnedAt, exitedAt: exitedAt)
         }
-        let session = History.attributed(History.sessions(from: hist.stdout), command: command.rawValue,
-                                         spawnedAt: spawnedAt, exitedAt: exitedAt)
         if let session, !session.runId.isEmpty {
             if let logText {
                 let rows = SkippedReport.rows(operationLog: logText, command: command.rawValue, runId: session.runId)
@@ -231,19 +225,17 @@ public enum History {
         return s >= spawnedAt.timeIntervalSince1970.rounded(.down) && s <= exitedAt.timeIntervalSince1970.rounded(.up)
     }
 
-    /// Totals of a run that wrote no session markers, from its own log rows. Nil when
-    /// the run wrote none. The size is the sum of the REMOVED/TRASHED rows' sizes (a
-    /// symlink is 0 bytes), or unknown ("") when one of them carries none.
-    public static func windowSession(_ command: String, rows: [OperationRow]) -> HistorySession? {
-        guard let first = rows.first else { return nil }
-        func n(_ a: String) -> Int { rows.filter { $0.action == a }.count }
-        let gone = rows.filter { $0.action == "REMOVED" || $0.action == "TRASHED" }
-        // A removed symlink logs `symlink` instead of a size (file_ops.sh `REMOVED ... symlink`): 0 bytes.
-        let sizes = gone.map { $0.detail == "symlink" ? 0 : $0.detail.flatMap(parseSize) }
-        let sizeText = sizes.contains(where: { $0 == nil }) ? "" : "\(sizes.reduce(Int64(0)) { $0 + $1! })B"
-        return HistorySession(command: command, runId: "", startedAt: first.time, endedAt: rows.last!.time,
-                              items: gone.count, sizeText: sizeText, removed: n("REMOVED"), trashed: n("TRASHED"),
-                              skipped: n("SKIPPED"), failed: n("FAILED"))
+    /// The id of the `Run id: <id>` line a reviewed `--apply` prints on stdout; nil when
+    /// there is none (an older mo, or MO_NO_OPLOG=1).
+    public static func runId(fromOutput data: Data) -> String? {
+        for line in String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline) {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("Run id: ") {
+                let id = t.dropFirst("Run id: ".count)
+                if !id.isEmpty, !id.contains(where: { $0.isWhitespace }) { return String(id) }
+            }
+        }
+        return nil
     }
 
     /// `1.20GB`, `512KB`, `3B` (history.sh's size text; decimal units like ByteCountFormatter's file style).

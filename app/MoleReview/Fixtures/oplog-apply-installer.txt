@@ -1,4 +1,4 @@
-[NOW] [installer] TRASHED /Users/sample/Downloads/Example App.dmg (3.00MB)
-[NOW] [installer] SKIPPED /Users/sample/Desktop/Tool Setup.pkg (changed since review)
+[NOW] [installer run=RUNID] TRASHED /Users/sample/Downloads/Example App.dmg (3.00MB)
+[NOW] [installer run=RUNID] SKIPPED /Users/sample/Desktop/Tool Setup.pkg (changed since review)
 [NOW] [installer-dry-run] SKIPPED /Users/sample/Downloads/Preview.dmg (whitelist)
 [NOW] [purge run=OTHERCMD] SKIPPED /Users/sample/www/other/dist (not in reviewed plan)

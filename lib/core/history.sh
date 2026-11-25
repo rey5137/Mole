@@ -136,7 +136,8 @@ history_reset_active_session() {
 # Identified runs can overlap even when they execute the same command. Older
 # records have no run id, so only their command can be used for attribution.
 # Open sessions wait here, with fields separated by \x1f. Marker-less legacy
-# commands (installer) still end at the next marker, as before.
+# rows (an installer log from before it wrote markers) still end at the next
+# marker, as before.
 declare -a HISTORY_PARKED_SESSIONS=()
 # Lookup aids for the parked list, so a log of runs that never wrote an end
 # marker is not rescanned for every new run: every parked identity as
