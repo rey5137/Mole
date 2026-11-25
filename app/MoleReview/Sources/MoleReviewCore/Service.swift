@@ -21,11 +21,11 @@ public enum MoleLocator {
     /// `Mole version X`); any other program that exits 0 is refused.
     public static func check(_ path: String, runner: MoleRunner? = nil, timeout: TimeInterval = 10) -> Result<String, MoleError> {
         guard FileManager.default.isExecutableFile(atPath: path) else {
-            return .failure(MoleError("Mole not found at \(path). Set the path in Settings."))
+            return .failure(MoleError("Mole not found at \(path). Set the path in Settings.", kind: .notFound))
         }
         let r = (runner ?? MoleRunner(executable: path)).run(arguments: ["--version"], timeout: timeout)
-        if r.cancelled { return .failure(MoleError("Cancelled.")) }
-        if r.timedOut { return .failure(MoleError("\(path) --version did not answer within \(Int(timeout)) s. Set the path in Settings.")) }
+        if r.cancelled { return .failure(MoleError("Cancelled.", kind: .cancelled)) }
+        if r.timedOut { return .failure(MoleError("\(path) --version did not answer within \(Int(timeout)) s. Set the path in Settings.", kind: .timeout)) }
         guard r.launchError == nil, r.exitCode == 0 else {
             return .failure(MoleError("\(path) --version failed (exit \(r.exitCode)). Set the path in Settings."))
         }
@@ -39,13 +39,52 @@ public enum MoleLocator {
 
 public struct MoleError: Error, Equatable, CustomStringConvertible {
     public let message: String
-    public init(_ m: String) { message = m }
+    public let kind: ScanFailure.Kind
+    public init(_ m: String, kind: ScanFailure.Kind = .other) { message = m; self.kind = kind }
     public var description: String { message }
+}
+
+/// Why a scan produced no plan, in words for the error card: `summary` is one plain
+/// sentence, `details` what Mole itself printed (for "Show details", never the headline).
+public struct ScanFailure: Equatable {
+    public enum Kind: Equatable { case killed, cancelled, timeout, notFound, planMismatch, noPlan, moleError, launch, other }
+    public let kind: Kind
+    public let summary: String
+    public let details: String
+    public init(_ kind: Kind, _ summary: String, details: String = "") {
+        self.kind = kind; self.summary = summary; self.details = details
+    }
+    public var text: String { details.isEmpty ? summary : summary + "\n" + details }
+
+    public static let cancelled = ScanFailure(.cancelled, "Scan cancelled. Nothing was changed.")
+
+    /// A stop by signal reaches the app as exit 128+N.
+    public static func exited(_ code: Int32, tail: String) -> ScanFailure {
+        switch code {
+        case 137:
+            return ScanFailure(.killed, "Mole was stopped by the system (exit 137), often because the Mac ran low on memory. Nothing was changed. Try again.", details: tail)
+        case 143, 129:
+            return ScanFailure(.killed, "Mole was stopped by a signal (exit \(code)). Nothing was changed.", details: tail)
+        case 130:
+            return ScanFailure(.cancelled, "Scan cancelled. Nothing was changed.", details: tail)
+        default:
+            return ScanFailure(.noPlan, "Mole stopped before it made a plan (exit \(code)). Nothing was changed.", details: tail)
+        }
+    }
+
+    public init(_ e: MoleError) {
+        switch e.kind {
+        case .notFound: self.init(.notFound, "Mole was not found. Set its path in Settings.", details: e.message)
+        case .timeout: self.init(.timeout, "Mole did not answer in time and was stopped. Nothing was changed.", details: e.message)
+        case .cancelled: self = .cancelled
+        default: self.init(e.kind, "Mole could not be started.", details: e.message)
+        }
+    }
 }
 
 public enum ScanOutcome: Equatable {
     case plan(Plan)
-    case failed(String)
+    case failed(ScanFailure)
     case cancelled
 }
 
@@ -60,16 +99,25 @@ public enum MoleService {
 
     /// A plan made by another command is refused: its ids name another command's items.
     public static func interpretScan(_ r: RunResult, command: MoleCommand) -> ScanOutcome {
-        if let e = r.launchError { return .failed(e) }
+        if let e = r.launchError {
+            return .failed(ScanFailure(e.contains("No such file") ? .notFound : .launch,
+                                       e.contains("No such file") ? "Mole was not found. Set its path in Settings." : "Mole could not be started.",
+                                       details: e))
+        }
         if r.cancelled { return .cancelled }
+        if r.timedOut { return .failed(ScanFailure(.timeout, "Mole did not finish in time and was stopped. Nothing was changed.", details: r.stderrTail)) }
         switch try? PlanDocument.decode(r.stdout) {
         case .plan(let p)?:
-            guard p.command == command.rawValue else { return .failed(planMismatch(p.command, command)) }
+            guard p.command == command.rawValue else {
+                return .failed(ScanFailure(.planMismatch, planMismatch(p.command, command)))
+            }
             return .plan(p)
-        case .error(let e)?: return .failed("\(e.code): \(e.message)")
+        case .error(let e)?:
+            if e.code == "cancelled" { return .failed(ScanFailure(.cancelled, "Scan cancelled. Nothing was changed.", details: e.message)) }
+            return .failed(ScanFailure(.moleError, "Mole could not make a plan: \(e.message.isEmpty ? e.code : e.message)",
+                                       details: e.code))
         case nil:
-            let tail = r.stderrTail
-            return .failed("Mole printed no plan (exit \(r.exitCode))." + (tail.isEmpty ? "" : "\n" + tail))
+            return .failed(ScanFailure.exited(r.exitCode, tail: r.stderrTail))
         }
     }
 
@@ -109,9 +157,10 @@ extension MoleService {
     /// of the operations log named by `history --json`.
     public static func runApply(_ command: MoleCommand = .clean, runner: MoleRunner, planId: String, selectFile: String,
                                 trash: Bool, planSkipped: [SkippedEntry], extraEnvironment: [String: String] = [:],
-                                onStderrLine: ((String) -> Void)? = nil) -> ApplyResult {
+                                onStderrLine: ((String) -> Void)? = nil, onStdoutLine: ((String) -> Void)? = nil) -> ApplyResult {
         let res = runner.run(arguments: applyArguments(command, planId: planId, selectFile: selectFile, trash: trash),
-                             extraEnvironment: extraEnvironment, onStderrLine: onStderrLine)
+                             extraEnvironment: extraEnvironment, onStderrLine: onStderrLine, onStdoutLine: onStdoutLine,
+                             collectStdoutLines: true)
         if res.spawnedAt == nil {
             let why = res.launchError ?? "Cancelled before cleaning started; nothing was cleaned."
             return ApplyResult(exitCode: res.exitCode, session: nil, skipped: [], failureNote: why)
@@ -121,7 +170,7 @@ extension MoleService {
         let spawnedAt = res.spawnedAt!, exitedAt = res.exitedAt ?? Date()
         var notes: [String] = []
         var groups: [SkippedGroup]
-        let fromOutput = SkippedReport.group(stderr: res.stderrLines, planSkipped: planSkipped)
+        let fromOutput = SkippedReport.group(stderr: res.stdoutLines + res.stderrLines, planSkipped: planSkipped)
         let logPath = History.operationsLogPath(from: hist.stdout)
         let logText = logPath.flatMap { try? Data(contentsOf: URL(fileURLWithPath: $0)) }.map { String(decoding: $0, as: UTF8.self) }
         let all = History.sessions(from: hist.stdout)

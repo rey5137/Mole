@@ -14,6 +14,6 @@ let package = Package(
         .target(name: "MoleReviewUI", dependencies: ["MoleReviewCore"]),
         .executableTarget(name: "MoleReview", dependencies: ["MoleReviewCore", "MoleReviewUI"]),
         .executableTarget(name: "MoleReviewSnapshots", dependencies: ["MoleReviewCore", "MoleReviewUI"]),
-        .executableTarget(name: "MoleReviewChecks", dependencies: ["MoleReviewCore"]),
+        .executableTarget(name: "MoleReviewChecks", dependencies: ["MoleReviewCore", "MoleReviewUI"]),
     ]
 )

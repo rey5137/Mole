@@ -1,5 +1,6 @@
 import Foundation
 import MoleReviewCore
+import MoleReviewUI
 
 // Plain-assert checks (no XCTest on Command Line Tools). Each prints its name; any failure exits 1.
 var failures = 0
@@ -134,7 +135,8 @@ func fakeEnv(stdout: String? = nil, stderr: String = "", exit: Int = 0, argv: St
 check("runner separates stdout and stderr, streams stderr lines") {
     var seen: [String] = []
     let r = MoleRunner(executable: fake).run(arguments: MoleService.scanArguments(.clean),
-                                             extraEnvironment: fakeEnv(stdout: "tricky.json", stderr: "line one\nline two")) { seen.append($0) }
+                                             extraEnvironment: fakeEnv(stdout: "tricky.json", stderr: "line one\nline two"),
+                                             onStderrLine: { seen.append($0) })
     let doc = try? PlanDocument.decode(r.stdout)
     return r.exitCode == 0 && r.stderrLines == ["line one", "line two"] && seen == r.stderrLines
         && doc != nil && !String(decoding: r.stdout, as: UTF8.self).contains("line one")
@@ -143,10 +145,10 @@ check("scan interprets plan, error document, and non-JSON with stderr tail") {
     let ok = MoleService.interpretScan(MoleRunner(executable: fake).run(arguments: MoleService.scanArguments(.clean), extraEnvironment: fakeEnv(stdout: "tricky.json")), command: .clean)
     guard case .plan = ok else { return false }
     let err = MoleService.interpretScan(MoleRunner(executable: fake).run(arguments: MoleService.scanArguments(.clean), extraEnvironment: fakeEnv(stdout: "error.json", exit: 130)), command: .clean)
-    guard case .failed(let m) = err, m.hasPrefix("cancelled:") else { return false }
+    guard case .failed(let m) = err, m.kind == .cancelled, m.details.contains("no plan was saved") else { return false }
     let junk = MoleService.interpretScan(MoleRunner(executable: fake).run(arguments: MoleService.scanArguments(.clean), extraEnvironment: fakeEnv(stderr: "boom happened", exit: 3)), command: .clean)
     guard case .failed(let m2) = junk else { return false }
-    return m2.contains("exit 3") && m2.contains("boom happened")
+    return m2.kind == .noPlan && m2.summary.contains("exit 3") && !m2.summary.contains("boom") && m2.details == "boom happened"
 }
 check("non-zero exit is surfaced") {
     MoleRunner(executable: fake).run(arguments: ["clean"], extraEnvironment: fakeEnv(exit: 7)).exitCode == 7
@@ -400,7 +402,7 @@ check("a plan made by another command is refused, never loaded") {
         MoleService.interpretScan(MoleRunner(executable: fake).run(arguments: MoleService.scanArguments(cmd),
                                                                    extraEnvironment: fakeEnv(stdout: file)), command: cmd)
     }
-    guard case .failed(let m) = scan("plan-sample.json", .purge), m.contains("`mo clean`"), m.contains("`mo purge`"),
+    guard case .failed(let m) = scan("plan-sample.json", .purge), m.kind == .planMismatch, m.summary.contains("`mo clean`"), m.summary.contains("`mo purge`"),
           case .failed = scan("purge-sample.json", .installer), case .failed = scan("installer-sample.json", .clean),
           case .plan(let p) = scan("purge-sample.json", .purge), p.command == "purge",
           case .plan = scan("installer-sample.json", .installer) else { return false }
@@ -488,5 +490,177 @@ check("header item counts: purge counts rows (a trim is one row), clean keeps it
     let c = ReviewState(plan: try plan("tricky.json"))
     return s.itemCounts == (2, 5) && c.itemCounts == (c.selectedItems, c.plan.totalItems) && c.itemCounts == (7, 7)
 }
+// MARK: live progress
+
+func line(_ t: String) -> ProgressLine { ProgressLine.parse(t) }
+check("progress line: section header, each item glyph, sized and unsized, indented detail, unknown") {
+    let sec = line("➤ App caches")
+    let done = line("  ✓ Sample media cache · 2608 items, 273.2MB")
+    let item = line("  ○ Chrome cache · 1.07GB dry")
+    let unsized = line("  ○ npm cache · would clean")
+    let warn = line("  ◎ Project caches · skipped 1 slow/incomplete root scan")
+    let review = line("  ⊙ Docker storage · Images 16.36GB, 9.741GB reclaimable")
+    let info = line("⚙ Apple Silicon | Free space: 79.92GB")
+    let detail = line("    glib 2.84.2 · 36.7MB")
+    let unknown = line("something Mole printed")
+    return sec.kind == .section && sec.text == "App caches" && sec.size == nil
+        && done.kind == .done && done.size == 273_200_000 && done.title == "Sample media cache" && done.meta == "2608 items, 273.2MB"
+        && item.kind == .item && item.size == 1_070_000_000 && item.countsAsItem
+        && unsized.kind == .item && unsized.size == nil && unsized.countsAsItem
+        && warn.kind == .warning && !warn.countsAsItem && review.kind == .review && review.size == nil
+        && info.kind == .info && info.size == nil
+        && detail.kind == .detail && detail.size == nil && !detail.countsAsItem
+        && unknown.kind == .text && unknown.text == "something Mole printed" && unknown.raw == "something Mole printed"
+        && line("○ DRY RUN MODE, No project artifacts will be removed").kind == .info
+        && !line("○ DRY RUN MODE, No project artifacts will be removed").countsAsItem
+        && line("").kind == .blank && line("=======").kind == .rule && line("━━━ Rust targets ━━━").kind == .section
+        && line("━━━ Rust targets ━━━").text == "Rust targets"
+}
+check("progress line: the size is taken out of the meta text so the size column does not repeat it") {
+    line("  ✓ Sample media cache · 2608 items, 273.2MB").metaWithoutSize == "2608 items"
+        && line("  ○ Helper cache · 602.4MB dry").metaWithoutSize == ""
+        && line("  ○ Homebrew cleanup · would free 118.8MB").metaWithoutSize == "would free"
+        && line("  ○ npm cache · would clean").metaWithoutSize == "would clean"
+}
+check("progress line: empty-section note does not count, colour codes and carriage returns are dropped") {
+    let nothing = line("  ✓ Nothing to clean")
+    let coloured = line("\u{1B}[0;32m✓\u{1B}[0m Trash · 2.5GB\u{1B}[0m")
+    return nothing.kind == .done && !nothing.countsAsItem && coloured.kind == .done && coloured.text == "Trash · 2.5GB"
+        && coloured.size == 2_500_000_000 && line("size 12MBx").size == nil && line("○ 5 items").size == nil
+}
+check("progress summary: current section, items and bytes from a real dry-run transcript") {
+    let text = try String(contentsOf: fixtures.appendingPathComponent("progress-clean.txt"), encoding: .utf8)
+    var s = ProgressSummary()
+    var lines: [ProgressLine] = []
+    for l in text.components(separatedBy: "\n") { let p = line(l); lines.append(p); s.add(p) }
+    // items: Trash, 2 done, helper cache, npm, Homebrew = 6; the Nothing-to-clean, warning, review and detail lines add none.
+    return s.section == "Virtualization" && s.items == 6 && s.bytes == 20_000 + 273_200_000 + 602_400_000 + 118_800_000
+        && lines.filter({ $0.kind == .section }).count == 4 && lines.contains { $0.kind == .rule }
+}
+check("line batcher: a flood of lines arrives in order in a few batches") {
+    let notified = NSLock()
+    var notes = 0
+    var got: [String] = []
+    let b = LineBatcher(interval: 0.05) { notified.lock(); notes += 1; notified.unlock() }
+    for i in 0..<5000 { b.add("l\(i)") }
+    usleep(150_000)
+    got += b.drain()
+    for i in 5000..<5010 { b.add("l\(i)") }
+    got += b.drain()
+    notified.lock(); defer { notified.unlock() }
+    return got == (0..<5010).map { "l\($0)" } && notes >= 1 && notes <= 3 && b.drain().isEmpty
+}
+check("line splitter: lines split across reads, a spinner's carriage-return rewrite keeps the last frame, CRLF drops the CR") {
+    let s = LineSplitter()
+    var out = s.feed(Data("ab".utf8))
+    out += s.feed(Data("c\nspin 1\rspin 2\rdone\nwin\r\npart".utf8))
+    if let rest = s.finish() { out.append(rest) }
+    return out == ["abc", "done", "win", "part"] && s.finish() == nil
+}
+check("scan stdout is not cut into lines unless asked; the splitter handles a large chunk in one pass") {
+    let r = MoleRunner(executable: fake).run(arguments: MoleService.scanArguments(.clean), extraEnvironment: fakeEnv(stdout: "tricky.json"))
+    let on = MoleRunner(executable: fake).run(arguments: MoleService.scanArguments(.clean), extraEnvironment: fakeEnv(stdout: "tricky.json"),
+                                              collectStdoutLines: true)
+    let big = Data((0..<200_000).map { "line \($0)\n" }.joined().utf8)
+    let t0 = Date()
+    let lines = LineSplitter().feed(big)
+    return r.stdoutLines.isEmpty && !r.stdout.isEmpty && !on.stdoutLines.isEmpty
+        && lines.count == 200_000 && lines.last == "line 199999" && Date().timeIntervalSince(t0) < 2
+}
+check("scan failure wording: only 137 blames memory; SIGTERM and SIGHUP say a signal stopped Mole") {
+    let k = ScanFailure.exited(137, tail: ""), t = ScanFailure.exited(143, tail: ""), h = ScanFailure.exited(129, tail: "")
+    return k.summary.contains("memory") && !t.summary.contains("memory") && !h.summary.contains("memory")
+        && t.summary.contains("signal (exit 143)") && h.summary.contains("signal (exit 129)")
+}
+check("empty-scan headline is per command") {
+    MoleCommand.allCases.map { $0.emptyTitle } == ["Nothing to clean", "No build folders found", "No installer files found"]
+}
+check("tab feed: thousands of lines keep the newest, ids stay unique and rising, the tally counts them all, blank lines are not rows") {
+    var t = TabState()
+    t.append(["➤ Section A"])
+    for i in 0..<20_000 { t.append(["  ○ Item \(i) · 1MB", ""]) }
+    let ids = t.entries.map { $0.id }
+    return t.progress.lines == 40_001 && t.progress.items == 20_000 && t.progress.bytes == 20_000_000_000
+        && t.entries.count <= TabState.keepLines + 1000 && t.entries.last?.line.title == "Item 19999"
+        && ids == ids.sorted() && Set(ids).count == ids.count && t.rawLog.count <= TabState.keepLines + 1000
+        && !t.entries.contains { $0.line.kind == .blank }
+        && t.rawDropped + t.rawLog.count == 40_001 && t.lineCountText.hasPrefix("last ") && t.lineCountText.hasSuffix("of 40001 lines")
+        && { var u = t; u.resetFeed(); return u.entries.isEmpty && u.progress == ProgressSummary() }()
+}
+check("apply: skip reasons come from the run's stdout too (an apply prints its summary there, not on stderr)") {
+    var env = applyEnv(oplog: try freshLog(), run: "R3", history: "history-ambiguous.json")
+    env["FAKE_MO_PROGRESS_FILE"] = fixtures.appendingPathComponent("progress-kept.txt").path
+    let res = apply(env)
+    return res.skipped.first?.names == ["~/a", "npm cache"] && res.skipped.first?.reason == "needs permanent delete"
+}
+check("apply streams stdout progress lines in order and still finds the run id") {
+    var env = applyEnv(oplog: try freshLog(), run: "R2")
+    env["FAKE_MO_PRINT_RUN_ID"] = "1"
+    env["FAKE_MO_PROGRESS_FILE"] = fixtures.appendingPathComponent("progress-clean.txt").path
+    let lock = NSLock()
+    var seen: [String] = []
+    let res = MoleService.runApply(runner: MoleRunner(executable: fake), planId: "p1", selectFile: "/tmp/s", trash: true,
+                                   planSkipped: [], extraEnvironment: env, onStdoutLine: { lock.lock(); seen.append($0); lock.unlock() })
+    let expected = try String(contentsOf: fixtures.appendingPathComponent("progress-clean.txt"), encoding: .utf8)
+        .components(separatedBy: "\n").dropLast()
+    lock.lock(); defer { lock.unlock() }
+    return seen.first == "Run id: R2" && Array(seen.dropFirst()) == Array(expected) && res.session?.runId == "R2" && res.notes.isEmpty
+}
+check("a scan keeps stdout whole for the JSON document while progress arrives on stderr") {
+    let lock = NSLock()
+    var err: [String] = [], out: [String] = []
+    let r = MoleRunner(executable: fake).run(arguments: MoleService.scanArguments(.clean),
+                                             extraEnvironment: fakeEnv(stdout: "tricky.json", stderr: "➤ Scan\n  ○ x · 1MB"),
+                                             onStderrLine: { lock.lock(); err.append($0); lock.unlock() },
+                                             onStdoutLine: { lock.lock(); out.append($0); lock.unlock() })
+    lock.lock(); defer { lock.unlock() }
+    guard case .plan? = try? PlanDocument.decode(r.stdout) else { return false }
+    return err == ["➤ Scan", "  ○ x · 1MB"] && out == r.stdoutLines && !out.isEmpty
+}
+
+// MARK: scan failure cards
+
+check("scan failure: killed (exit 137), cancelled, timeout, not found and no-plan each get their own plain sentence; Mole's output stays in details") {
+    func scan(_ r: RunResult) -> ScanFailure? { if case .failed(let f) = MoleService.interpretScan(r, command: .purge) { return f }; return nil }
+    var killed = RunResult(); killed.exitCode = 137; killed.stderrLines = ["○ DRY RUN MODE, No project artifacts will be removed"]
+    var timed = RunResult(); timed.timedOut = true; timed.exitCode = 143
+    var missing = RunResult(); missing.launchError = "Cannot run /x/mo: No such file or directory"; missing.exitCode = 127
+    var odd = RunResult(); odd.exitCode = 2; odd.stderrLines = ["boom"]
+    var sigint = RunResult(); sigint.exitCode = 130
+    guard let k = scan(killed), let t = scan(timed), let m = scan(missing), let o = scan(odd), let c = scan(sigint) else { return false }
+    var cancelled = RunResult(); cancelled.cancelled = true; cancelled.exitCode = 130
+    guard case .cancelled = MoleService.interpretScan(cancelled, command: .purge) else { return false }
+    return k.kind == .killed && k.summary.contains("137") && !k.summary.contains("DRY RUN") && k.details.contains("DRY RUN MODE")
+        && t.kind == .timeout && m.kind == .notFound && m.summary.contains("Settings")
+        && o.kind == .noPlan && o.summary.contains("exit 2") && o.details == "boom" && c.kind == .cancelled
+        && ScanFailure.cancelled.summary.contains("cancelled")
+}
+check("scan failure: the --version check maps a missing, silent or non-Mole path to a kind") {
+    guard case .failure(let e) = MoleLocator.check("/nonexistent/mo") else { return false }
+    let card = ScanFailure(e)
+    let slow = scratch.appendingPathComponent("slow-version.sh")
+    try "#!/bin/bash\nsleep 5\n".write(to: slow, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: slow.path)
+    guard case .failure(let e2) = MoleLocator.check(slow.path, timeout: 1) else { return false }
+    return e.kind == .notFound && card.kind == .notFound && card.summary.contains("Settings")
+        && e2.kind == .timeout && ScanFailure(e2).kind == .timeout
+}
+
+check("full disk access probe: a readable folder is granted, a refused one denied, a missing one unknown") {
+    let open = scratch.appendingPathComponent("fda-open")
+    let shut = scratch.appendingPathComponent("fda-shut")
+    try FileManager.default.createDirectory(at: open, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: shut, withIntermediateDirectories: true)
+    try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: shut.path)
+    defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: shut.path) }
+    let gone = scratch.appendingPathComponent("fda-gone").path
+    return FullDiskAccess.status(probes: [open.path]) == .granted
+        && FullDiskAccess.status(probes: [shut.path]) == .denied
+        && FullDiskAccess.status(probes: [gone, shut.path]) == .denied
+        && FullDiskAccess.status(probes: [gone]) == .unknown && FullDiskAccess.status(probes: []) == .unknown
+        && FullDiskAccess.defaultProbes(home: "/Users/sample") == ["/Users/sample/Library/Safari", "/Users/sample/Library/Containers/com.apple.Safari"]
+        && FullDiskAccess.settingsURL == "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+}
+
 if failures > 0 { print("\(failures) check(s) failed"); exit(1) }
 print("all checks passed")

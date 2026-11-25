@@ -1,0 +1,2 @@
+✓ Sample cache · 1.2MB
+Kept, needs a permanent delete · 2 items: ~/a, npm cache

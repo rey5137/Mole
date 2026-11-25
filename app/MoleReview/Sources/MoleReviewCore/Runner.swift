@@ -3,10 +3,13 @@ import Foundation
 public struct RunResult {
     public var stdout = Data()
     public var stderrLines: [String] = []
+    /// Every complete line of stdout, in order (also kept whole in `stdout`).
+    public var stdoutLines: [String] = []
     public var exitCode: Int32 = 0
     public var cancelled = false
     public var launchError: String?
     public var timedOut = false
+    public init() {}
     public var spawnedAt: Date?
     public var exitedAt: Date?
     public var stderrTail: String { stderrLines.suffix(8).joined(separator: "\n") }
@@ -19,8 +22,37 @@ private final class Locked<T> {
     func with<R>(_ body: (inout T) -> R) -> R { lock.lock(); defer { lock.unlock() }; return body(&value) }
 }
 
+/// Cuts a byte stream into lines. A `\r` rewrite (a spinner redrawing its line)
+/// keeps only the text after the last one.
+public final class LineSplitter {
+    private var buffer = Data()
+    public init() {}
+    /// Reads along the buffer and drops the consumed front once per call, not once per line.
+    public func feed(_ d: Data) -> [String] {
+        buffer.append(d)
+        var out: [String] = []
+        var pos = buffer.startIndex
+        while let nl = buffer[pos...].firstIndex(of: 0x0A) {
+            out.append(LineSplitter.decode(buffer[pos..<nl]))
+            pos = nl + 1
+        }
+        if pos > buffer.startIndex { buffer = Data(buffer[pos...]) }
+        return out
+    }
+    public func finish() -> String? {
+        defer { buffer = Data() }
+        return buffer.isEmpty ? nil : LineSplitter.decode(buffer)
+    }
+    private static func decode(_ d: Data) -> String {
+        var d = d
+        while d.last == 0x0D { d.removeLast() }
+        if let cr = d.lastIndex(of: 0x0D) { d = d.subdata(in: d.index(after: cr)..<d.endIndex) }
+        return String(decoding: d, as: UTF8.self)
+    }
+}
+
 /// Runs one `mo` command in its own process group: stdin /dev/null, no
-/// colour, stdout kept apart from stderr (streamed line by line). `cancel()`
+/// colour, stdout kept apart from stderr (both streamed line by line). `cancel()`
 /// sends SIGINT to the whole group, then SIGTERM after `termGraceSeconds` and
 /// SIGKILL 1.5 s later to anything still alive, so Mole's children stop too.
 public final class MoleRunner {
@@ -62,8 +94,13 @@ public final class MoleRunner {
     /// Blocks until the command ends. Call from a background thread.
     /// `timeout` stops a run that has not ended by then (SIGTERM to the group,
     /// SIGKILL 1.5 s later) and sets `timedOut`.
+    /// `onStdoutLine` is for runs whose stdout is progress text (`--apply`); a scan keeps its
+    /// stdout for the JSON document and passes none. Stdout is cut into lines only when
+    /// `onStdoutLine` is set or `collectStdoutLines` asks for `stdoutLines`: a plan's JSON is
+    /// many MB and nothing reads it by line. Both callbacks run on reader threads.
     public func run(arguments: [String], extraEnvironment: [String: String] = [:], timeout: TimeInterval? = nil,
-                    onStderrLine: ((String) -> Void)? = nil) -> RunResult {
+                    onStderrLine: ((String) -> Void)? = nil, onStdoutLine: ((String) -> Void)? = nil,
+                    collectStdoutLines: Bool = false) -> RunResult {
         if state.with({ $0.cancelled }) {
             var r = RunResult()
             r.cancelled = true
@@ -116,38 +153,41 @@ public final class MoleRunner {
 
         let out = Locked(Data())
         let lines = Locked([String]())
-        let partial = Locked(Data())
+        let outLines = Locked([String]())
+        let errSplit = Locked(LineSplitter())
+        let outSplit = Locked(LineSplitter())
         let group = DispatchGroup()
 
-        func emit(_ line: String) {
+        func emitErr(_ line: String) {
             lines.with { $0.append(line) }
             onStderrLine?(line)
         }
+        func emitOut(_ line: String) {
+            outLines.with { $0.append(line) }
+            onStdoutLine?(line)
+        }
+        let splitStdout = onStdoutLine != nil || collectStdoutLines
         group.enter()
         outPipe.fileHandleForReading.readabilityHandler = { h in
             let d = h.availableData
-            if d.isEmpty { h.readabilityHandler = nil; group.leave(); return }
+            if d.isEmpty {
+                h.readabilityHandler = nil
+                if splitStdout, let rest = outSplit.with({ $0.finish() }) { emitOut(rest) }
+                group.leave(); return
+            }
             out.with { $0.append(d) }
+            if splitStdout { for l in outSplit.with({ $0.feed(d) }) { emitOut(l) } }
         }
         group.enter()
         errPipe.fileHandleForReading.readabilityHandler = { h in
             let d = h.availableData
             if d.isEmpty {
                 h.readabilityHandler = nil
-                let rest = partial.with { p -> Data in let r = p; p = Data(); return r }
-                if !rest.isEmpty { emit(String(decoding: rest, as: UTF8.self)) }
+                if let rest = errSplit.with({ $0.finish() }) { emitErr(rest) }
                 group.leave()
                 return
             }
-            var complete: [Data] = []
-            partial.with { p in
-                p.append(d)
-                while let nl = p.firstIndex(of: 0x0A) {
-                    complete.append(p.subdata(in: p.startIndex..<nl))
-                    p.removeSubrange(p.startIndex...nl)
-                }
-            }
-            for l in complete { emit(String(decoding: l, as: UTF8.self)) }
+            for l in errSplit.with({ $0.feed(d) }) { emitErr(l) }
         }
 
         // Wait for the leader without reaping it: while it is a zombie its pid, and so
@@ -170,6 +210,7 @@ public final class MoleRunner {
         }
         result.stdout = out.with { $0 }
         result.stderrLines = lines.with { $0 }
+        result.stdoutLines = outLines.with { $0 }
         let wasSignalled = (status & 0x7f) != 0
         result.exitCode = wasSignalled ? 128 + (status & 0x7f) : (status >> 8) & 0xff
         result.cancelled = state.with { $0.cancelled }

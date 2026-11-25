@@ -8,7 +8,7 @@ public struct ContentView: View {
 
     public var body: some View {
         VStack(spacing: 0) {
-            TabBar()
+            TopBar()
             Divider()
             switch model.phase {
             case .idle: IdleView()
@@ -21,16 +21,16 @@ public struct ContentView: View {
     }
 }
 
-/// Clean / Purge / Installer. Each tab keeps its own plan, selection and result.
-struct TabBar: View {
+/// The window's top bar: the Clean / Purge / Installer switch (each tab keeps its own
+/// plan, selection and result) and the actions of the shown state.
+struct TopBar: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.renderStandIn) private var standIn
     private func label(_ c: MoleCommand) -> String {
         model.tabs[c]?.busy == true ? c.title + " •" : c.title
     }
     var body: some View {
-        HStack {
-            Spacer()
+        HStack(spacing: 12) {
             if standIn {
                 HStack(spacing: 2) {
                     ForEach(MoleCommand.allCases) { c in
@@ -45,16 +45,46 @@ struct TabBar: View {
                 }.pickerStyle(.segmented).labelsHidden().fixedSize()
             }
             Spacer()
-        }.padding(.vertical, 8)
+            switch model.phase {
+            case .idle:
+                Button("Scan") { model.scan() }.modifier(ButtonLook(prominent: true))
+            case .scanning, .applying:
+                Button("Cancel") { model.cancel() }.modifier(ButtonLook())
+            case .review:
+                Button("Rescan") { model.scan() }.modifier(ButtonLook())
+                Button("\(model.command.action) selected…") { model.showConfirm = true }
+                    .modifier(ButtonLook(prominent: true))
+                    .disabled(!model.canApply)
+            case .result:
+                Button("Scan again") { model.scan() }.modifier(ButtonLook(prominent: true))
+            }
+        }
+        .padding(.horizontal, 14).padding(.vertical, 8)
+        .background(Color.primary.opacity(0.04))
     }
 }
 
 extension MoleCommand {
     var blurb: String {
         switch self {
-        case .clean: return "Scan, tick what to clean, confirm. Nothing is deleted until you confirm."
-        case .purge: return "Find build folders (node_modules, target, dist…) in your purge paths, tick, confirm. Nothing is deleted until you confirm."
-        case .installer: return "Find installer files (.dmg, .pkg, .iso…) in Downloads and similar folders, tick, confirm. Nothing is deleted until you confirm."
+        case .clean: return "Caches, logs and leftovers Mole knows are safe to remove. Nothing is removed until you confirm."
+        case .purge: return "Build folders (node_modules, target, dist…) in your project paths. Nothing is removed until you confirm."
+        case .installer: return "Installer files (.dmg, .pkg, .iso…) in Downloads and similar folders. Nothing is removed until you confirm."
+        }
+    }
+    /// The empty-scan headline, in the tab's own words.
+    public var emptyTitle: String {
+        switch self {
+        case .clean: return "Nothing to clean"
+        case .purge: return "No build folders found"
+        case .installer: return "No installer files found"
+        }
+    }
+    var symbol: String {
+        switch self {
+        case .clean: return "sparkles"
+        case .purge: return "folder.badge.minus"
+        case .installer: return "shippingbox"
         }
     }
 }
@@ -62,54 +92,27 @@ extension MoleCommand {
 struct IdleView: View {
     @EnvironmentObject var model: AppModel
     var body: some View {
-        VStack(spacing: 12) {
-            Spacer()
-            Text("Mole Review: \(model.command.title)").font(.largeTitle)
-            Text(model.command.blurb)
-                .foregroundStyle(.secondary).multilineTextAlignment(.center)
-            if let e = model.errorText {
-                Text(e).foregroundStyle(.red).textSelection(.enabled).multilineTextAlignment(.center).padding(.horizontal)
-            }
-            Text("Mole: \(model.resolvedCommand)").font(.caption).foregroundStyle(.secondary)
-            Button("Scan") { model.scan() }.keyboardShortcut("r", modifiers: .command).modifier(ButtonLook(prominent: true))
-            Spacer()
-            LogView()
-        }.padding()
-    }
-}
-
-struct LogView: View {
-    @EnvironmentObject var model: AppModel
-    @State private var open = false
-    var body: some View {
-        DisclosureGroup("Details (\(model.log.count) lines)", isExpanded: $open) {
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(Array(model.log.enumerated()), id: \.offset) { i, l in
-                            Text(l).font(.system(.caption, design: .monospaced)).textSelection(.enabled).id(i)
-                        }
-                    }.frame(maxWidth: .infinity, alignment: .leading)
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 12) {
+                Image(systemName: model.command.symbol).font(.title).foregroundStyle(Color.accentColor).frame(width: 34)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(model.command.title).font(.title2.weight(.semibold))
+                    Text(model.command.blurb).font(.callout).foregroundStyle(.secondary)
                 }
-                .frame(height: 160)
-                .onChange(of: model.log.count) { n in if n > 0 { proxy.scrollTo(n - 1) } }
             }
-        }
-    }
-}
-
-struct ProgressPane: View {
-    @EnvironmentObject var model: AppModel
-    var body: some View {
-        VStack(spacing: 12) {
-            Spacer()
-            Spinner()
-            Text(model.phase == .scanning ? "Scanning…" : model.command.progress).font(.title2)
-            Text("Elapsed \(Format.countdown(model.elapsed))").foregroundStyle(.secondary)
-            Button("Cancel") { model.cancel() }.modifier(ButtonLook())
-            Spacer()
-            LogView()
-        }.padding()
+            if let f = model.failure { ErrorCard(failure: f, retry: { model.scan() }) }
+            if model.fullDiskAccess != .granted { FullDiskAccessCard() }
+            if model.failure == nil {
+                VStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass").font(.system(size: 34)).foregroundStyle(.tertiary)
+                    Text("Scan to see what can be removed").font(.headline)
+                    Text("The scan only looks; you review and tick the items next.").font(.callout).foregroundStyle(.secondary)
+                }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                Spacer()
+            }
+            if !model.rawLogIsEmpty { DetailsDisclosure() }
+        }.padding(20)
     }
 }
 
@@ -118,22 +121,31 @@ struct ReviewView: View {
     var body: some View {
         if let state = model.review {
             VStack(spacing: 0) {
-                HeaderBar(state: state)
-                Divider()
-                PlainList(selection: $model.focusedRow) {
-                    ForEach(state.plan.sections, id: \.id) { section in
-                        SectionView(section: section)
-                    }
-                    if !state.plan.skipped.isEmpty {
-                        DisclosureGroup("Skipped (\(state.plan.skipped.count))") {
-                            ForEach(Array(state.plan.skipped.enumerated()), id: \.offset) { _, s in
-                                Text("\(s.section) · \(s.name): \(s.reason)").font(.callout)
+                if let f = model.failure {
+                    ErrorCard(failure: f, retry: nil, dismiss: { model.failure = nil }).padding([.horizontal, .top], 14)
+                }
+                if state.plan.allItems.isEmpty {
+                    EmptyPlanView(state: state)
+                } else {
+                    SummaryBar(state: state)
+                    Divider()
+                    PlainList(selection: $model.focusedRow) {
+                        ForEach(state.plan.sections, id: \.id) { section in
+                            SectionView(section: section)
+                        }
+                        if !state.plan.skipped.isEmpty {
+                            DisclosureGroup("Skipped (\(state.plan.skipped.count))") {
+                                ForEach(Array(state.plan.skipped.enumerated()), id: \.offset) { _, s in
+                                    Text("\(s.section) · \(s.name): \(s.reason)").font(.callout)
+                                }
                             }
                         }
                     }
                 }
-                Divider()
-                LogView().padding(.horizontal).padding(.vertical, 4)
+                if !model.rawLogIsEmpty {
+                    Divider()
+                    DetailsDisclosure().padding(.horizontal, 14).padding(.vertical, 6)
+                }
             }
             .modifier(SearchField(text: searchBinding))
         }
@@ -143,13 +155,35 @@ struct ReviewView: View {
     }
 }
 
-struct HeaderBar: View {
+/// A scan that found nothing: say so, offer a rescan, and still list what was skipped.
+struct EmptyPlanView: View {
+    @EnvironmentObject var model: AppModel
+    let state: ReviewState
+    var body: some View {
+        VStack(spacing: 10) {
+            Spacer()
+            Image(systemName: "checkmark.circle").font(.system(size: 40)).foregroundStyle(.green)
+            Text(model.command.emptyTitle).font(.title3.weight(.semibold))
+            Text("Mole found nothing to remove in \(model.command.title). Nothing was changed.")
+                .font(.callout).foregroundStyle(.secondary)
+            Button("Rescan") { model.scan() }.modifier(ButtonLook())
+            if !state.plan.skipped.isEmpty {
+                Text("\(state.plan.skipped.count) skipped: " + state.plan.skipped.prefix(3).map { "\($0.name) (\($0.reason))" }.joined(separator: ", "))
+                    .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center).padding(.horizontal, 30)
+            }
+            Spacer()
+        }.frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+/// Totals and the plan's expiry. The actions live in the top bar.
+struct SummaryBar: View {
     @EnvironmentObject var model: AppModel
     let state: ReviewState
     var body: some View {
         let expired = state.isExpired(now: model.now)
         HStack(alignment: .firstTextBaseline, spacing: 16) {
-            VStack(alignment: .leading) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text("\(Format.bytes(state.selectedBytes)) of \(Format.bytes(state.plan.totalBytes)) selected").font(.headline)
                 Text("\(state.itemCounts.selected) of \(state.itemCounts.total) items" +
                      (state.plan.freeBytes.map { " · \(Format.bytes($0)) free" } ?? ""))
@@ -157,21 +191,22 @@ struct HeaderBar: View {
             }
             Spacer()
             if expired {
-                Text("Plan expired").foregroundStyle(.red)
-                Button("Scan again") { model.scan() }.modifier(ButtonLook())
+                Label("Plan expired, rescan to continue", systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout).foregroundStyle(.red)
             } else {
                 if let other = model.applyingCommand, other != model.command {
                     Text("Waiting for mo \(other.rawValue) to finish").font(.caption).foregroundStyle(.orange)
                 }
-                Text("Expires in \(Format.countdown(state.remaining(now: model.now)))").font(.caption).foregroundStyle(.secondary)
-                Button("Scan again") { model.scan() }.modifier(ButtonLook())
-                Button("\(model.command.action)…") { model.showConfirm = true }
-                    .modifier(ButtonLook(prominent: true))
-                    .disabled(!model.canApply)
+                Text("Expires in \(Format.countdown(state.remaining(now: model.now)))")
+                    .font(.caption).monospacedDigit().foregroundStyle(.secondary)
             }
-        }.padding()
+        }.padding(.horizontal, 16).padding(.vertical, 10)
     }
 }
+
+/// Width of the size column in the list, so sizes line up from the section header down.
+private let sizeColumn: CGFloat = 92
+private let countColumn: CGFloat = 70
 
 struct SectionView: View {
     @EnvironmentObject var model: AppModel
@@ -191,8 +226,11 @@ struct SectionView: View {
                         }
                         Text(section.name).font(.headline)
                         Spacer()
-                        Text(Format.bytes(section.bytes)).foregroundStyle(.secondary)
-                    }
+                        Text({ let n = section.items.filter { !$0.followsParent && state.isSupported($0) }.count; return "\(n) \(n == 1 ? "row" : "rows")" }()).font(.caption).foregroundStyle(.tertiary)
+                            .frame(width: countColumn, alignment: .trailing)
+                        Text(Format.bytes(section.bytes)).font(.callout.weight(.medium)).monospacedDigit()
+                            .foregroundStyle(.secondary).frame(width: sizeColumn, alignment: .trailing)
+                    }.frame(minHeight: 30)
                 }
             }
         }
@@ -212,6 +250,7 @@ struct TriCheckbox: View {
 struct ItemRow: View {
     @EnvironmentObject var model: AppModel
     let row: ReviewRow
+    @State private var hovering = false
 
     var body: some View {
         let item = row.item
@@ -237,10 +276,15 @@ struct ItemRow: View {
                 }
             }
             Spacer()
-            if item.count > 1 { Text("\(item.count) items").font(.caption).foregroundStyle(.secondary) }
+            Text(item.count > 1 ? "\(item.count) items" : "").font(.caption).foregroundStyle(.secondary)
+                .frame(width: countColumn, alignment: .trailing)
             Text(item.isCommand ? "command" : (item.sizeKnown ? Format.bytes(item.bytes) : "size unknown"))
-                .font(.callout).foregroundStyle(.secondary).frame(width: 90, alignment: .trailing)
+                .font(.callout).monospacedDigit().foregroundStyle(.secondary).frame(width: sizeColumn, alignment: .trailing)
         }
+        .frame(minHeight: 34)
+        .padding(.horizontal, 4)
+        .background(RoundedRectangle(cornerRadius: 5).fill(hovering ? Color.primary.opacity(0.07) : Color.clear))
+        .onHover { hovering = $0 }
         .contentShape(Rectangle())
         .tag(item.id)
         .contextMenu {
@@ -325,48 +369,6 @@ public struct ConfirmSheet: View {
     }
 }
 
-struct ResultView: View {
-    @EnvironmentObject var model: AppModel
-    var body: some View {
-        let r = model.result
-        VStack(alignment: .leading, spacing: 12) {
-            Text(r?.exitCode == 0 ? "Done" : "Finished with errors (exit \(r?.exitCode ?? -1))").font(.title)
-            if let n = r?.failureNote { Text(n).foregroundStyle(.red) }
-            if let s = r?.session {
-                let counts = "\(s.removed) removed, \(s.trashed) moved to Trash, \(s.skipped) skipped, \(s.failed) failed"
-                Text(s.sizeText.isEmpty ? counts : "\(s.sizeBytes.map(Format.bytes) ?? s.sizeText) over \(s.items) items: " + counts)
-            } else if (r?.notes ?? []).isEmpty {
-                Text("No history session matched this run; see Details.").foregroundStyle(.secondary)
-            }
-            ForEach(r?.notes ?? [], id: \.self) { Text($0).font(.callout).foregroundStyle(.orange) }
-            if let groups = r?.skipped, !groups.isEmpty {
-                Text("Skipped").font(.headline)
-                PlainList(selection: nil) {
-                    ForEach(groups, id: \.reason) { g in
-                        DisclosureGroup("\(g.reason) (\(g.names.count))") {
-                            ForEach(Array(g.names.enumerated()), id: \.offset) { _, n in Text(n).font(.callout).textSelection(.enabled) }
-                        }
-                    }
-                }
-            } else { Spacer() }
-            LogView()
-            HStack { Spacer(); Button("Scan again") { model.scan() }.modifier(ButtonLook(prominent: true)) }
-        }.padding()
-    }
-}
-
-public struct SettingsView: View {
-    @EnvironmentObject var model: AppModel
-    public init() {}
-    public var body: some View {
-        Form {
-            TextField("Mole command", text: model.$moleCommand, prompt: Text(model.resolvedCommand))
-            Text("Leave empty to use $MOLE_PATH, the checkout's mole, or mo in Homebrew or ~/.local/bin.")
-                .font(.caption).foregroundStyle(.secondary)
-        }
-        .padding().frame(width: 480)
-    }
-}
 
 // MARK: stand-ins for the snapshot renderer
 //

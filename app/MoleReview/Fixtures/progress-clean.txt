@@ -1,0 +1,29 @@
+Clean Your Mac
+
+◎ System caches need sudo, run sudo -v && mo clean --dry-run for full preview
+
+⚙ Apple Silicon | Free space: 80.00GB
+
+➤ User essentials
+  ○ Trash · would empty, 341 items
+
+➤ App caches
+  ✓ Sample app cache · 9 items, 20KB
+  ✓ Sample media cache · 2608 items, 273.2MB
+  ○ Sample helper cache · 602.4MB dry
+
+➤ Developer tools
+  ○ npm cache · would clean
+  ○ Homebrew cleanup · would free 118.8MB
+    glib 2.84.2 · 36.7MB
+    xz 5.8.1 · 2.4MB
+  ⊙ Sample toolchains · 3 · ~/.sample/toolchains
+  ◎ Project caches · skipped 1 slow/incomplete root scan
+
+➤ Virtualization
+  ✓ Nothing to clean
+
+======================================================================
+Dry run complete - no changes made
+Potential space: 13.45GB · 3597 items
+======================================================================
